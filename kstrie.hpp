@@ -143,10 +143,17 @@ struct ValueTraits {
 // ============================================================================
 
 struct NodeHeader {
+    // --- word 0 (8 bytes) ---
     uint32_t count;      // compact: entry count (excl EOS); bitmap: subtree count (incl EOS)
     uint16_t top_count;  // bitmap: popcount; compact: 0
     uint8_t  skip;       // shared prefix bytes
     uint8_t  flags;      // bit0: is_compact, bit1: has_eos
+
+    // --- word 1 (8 bytes) — stored u64 offsets for compact leaves ---
+    uint16_t idx_off;    // offset to idx1/idx2 region
+    uint16_t lens_off;   // offset to lens array
+    uint16_t suffix_off; // offset to packed suffixes
+    uint16_t values_off; // offset to values array
 
     [[nodiscard]] bool is_compact() const noexcept { return flags & 1; }
     [[nodiscard]] bool is_bitmap()  const noexcept { return !(flags & 1); }
@@ -155,7 +162,7 @@ struct NodeHeader {
     void set_compact(bool v) noexcept { if (v) flags |= 1; else flags &= ~uint8_t(1); }
     void set_eos(bool v)     noexcept { if (v) flags |= 2; else flags &= ~uint8_t(2); }
 };
-static_assert(sizeof(NodeHeader) == 8);
+static_assert(sizeof(NodeHeader) == 16);
 
 // ============================================================================
 // Layout helpers — §5, §7, §8
@@ -163,8 +170,9 @@ static_assert(sizeof(NodeHeader) == 8);
 
 inline constexpr std::size_t COMPACT_MAX   = 4096;
 inline constexpr std::size_t BITMAP256_U64 = 4;
-inline constexpr uint8_t     LEN_PTR       = 0;
-inline constexpr uint8_t     LEN_MAX       = 254;
+inline constexpr uint8_t     LEN_PTR       = 0;       // BIG: 8 inline + heap pointer
+inline constexpr uint8_t     LEN_MAX       = 16;      // max inline suffix length
+// lens 17..254 unused; 255 reserved
 
 inline constexpr std::size_t align8(std::size_t n) noexcept {
     return (n + 7) & ~std::size_t(7);
@@ -175,7 +183,7 @@ inline std::size_t prefix_u64(uint8_t skip) noexcept {
 }
 
 inline std::size_t header_and_prefix_u64(uint8_t skip) noexcept {
-    return 1 + prefix_u64(skip);
+    return 2 + prefix_u64(skip);
 }
 
 template <typename VST>
@@ -197,7 +205,7 @@ inline int idx2_count(uint32_t count) noexcept {
 }
 
 inline uint32_t effective_len(uint8_t raw_len) noexcept {
-    return raw_len == LEN_PTR ? 8 : raw_len;
+    return raw_len == LEN_PTR ? 16 : raw_len;  // BIG: 8 inline + 8 pointer
 }
 
 // ============================================================================
@@ -238,29 +246,36 @@ private:
     }
 
     // -- pointer-suffix heap block ------------------------------------------
+    // Heap layout: [uint16_t remaining_len][remaining suffix bytes...]
+    // The first 8 bytes of the suffix are stored inline in packed_suffixes.
+    // remaining_len = total_suffix_len - 8.
 
-    uint8_t* alloc_suffix_block(uint32_t length) {
+    uint8_t* alloc_suffix_block(uint32_t total_len) {
+        assert(total_len > 8);
+        uint16_t remaining = static_cast<uint16_t>(total_len - 8);
         byte_alloc_type ba(alloc_);
-        uint8_t* p = std::allocator_traits<byte_alloc_type>::allocate(ba, 4 + length);
-        std::memcpy(p, &length, 4);
+        uint8_t* p = std::allocator_traits<byte_alloc_type>::allocate(
+            ba, 2 + remaining);
+        std::memcpy(p, &remaining, 2);
         return p;
     }
 
     void dealloc_suffix_block(uint8_t* p) {
         if (!p) return;
-        uint32_t length;
-        std::memcpy(&length, p, 4);
+        uint16_t remaining;
+        std::memcpy(&remaining, p, 2);
         byte_alloc_type ba(alloc_);
-        std::allocator_traits<byte_alloc_type>::deallocate(ba, p, 4 + length);
+        std::allocator_traits<byte_alloc_type>::deallocate(
+            ba, p, 2 + remaining);
     }
 
     static const uint8_t* ptr_suffix_data(const uint8_t* heap) noexcept {
-        return heap + 4;
+        return heap + 2;
     }
 
-    static uint32_t ptr_suffix_length(const uint8_t* heap) noexcept {
-        uint32_t len;
-        std::memcpy(&len, heap, 4);
+    static uint16_t ptr_suffix_remaining(const uint8_t* heap) noexcept {
+        uint16_t len;
+        std::memcpy(&len, heap, 2);
         return len;
     }
 
@@ -274,10 +289,10 @@ private:
     }
 
     static uint8_t* node_prefix(uint64_t* n) noexcept {
-        return reinterpret_cast<uint8_t*>(n + 1);
+        return reinterpret_cast<uint8_t*>(n + 2);
     }
     static const uint8_t* node_prefix(const uint64_t* n) noexcept {
-        return reinterpret_cast<const uint8_t*>(n + 1);
+        return reinterpret_cast<const uint8_t*>(n + 2);
     }
 
     static VST& eos_slot(uint64_t* n, uint8_t skip) noexcept {
@@ -379,34 +394,48 @@ private:
     // §12.3  Suffix comparison
     // -----------------------------------------------------------------------
 
+    template <class T>
+    static int makecmp(T a, T b) noexcept { return (a > b) - (a < b); }
+
     // Compare stored suffix against search suffix. Returns <0, 0, >0.
-    // stored_raw_len: the lens[] byte. LEN_PTR means pointer dereference.
-    // stored_ptr: pointer into packed_suffixes at this entry's offset.
+    //
+    // Inline (1-16 bytes): all bytes at stored_ptr.
+    // BIG (≥17 bytes):     first 8 at stored_ptr, rest on heap via pointer at stored_ptr+8.
+    //
+    // First memcmp: ≤8 bytes (compiler inlines as fixed-width loads).
+    // Second memcmp: only if first 8 match AND both sides >8 — set up args once.
     static int suffix_compare(const uint8_t* stored_ptr, uint8_t stored_raw_len,
                               const uint8_t* search_ptr,
                               uint32_t search_len) noexcept {
-        const uint8_t* actual_ptr;
-        uint32_t actual_len;
+        uint32_t avail = (stored_raw_len == LEN_PTR) ? 9u : (uint32_t)stored_raw_len;
+        uint32_t len_min = avail < search_len ? avail : search_len;
+        uint32_t first = (len_min > 8) ? 8 : len_min;
 
-        if (stored_raw_len == LEN_PTR) {
-            // Dereference heap pointer
-            uint8_t* heap;
-            std::memcpy(&heap, stored_ptr, 8);
-            actual_ptr = ptr_suffix_data(heap);
-            actual_len = ptr_suffix_length(heap);
-        } else {
-            actual_ptr = stored_ptr;
-            actual_len = stored_raw_len;
+        int cmp = std::memcmp(stored_ptr, search_ptr, first);
+        if (cmp != 0) [[likely]] return cmp;
+
+        if (len_min <= 8) [[likely]] {
+            return makecmp(avail, search_len);
         }
 
-        uint32_t min_len = actual_len < search_len ? actual_len : search_len;
-        int cmp = 0;
-        if (min_len > 0)
-            cmp = std::memcmp(actual_ptr, search_ptr, min_len);
-        if (cmp != 0) return cmp;
-        if (actual_len < search_len) return -1;
-        if (actual_len > search_len) return  1;
-        return 0;
+        const uint8_t* tail_ptr;
+        uint32_t tail_len;
+
+        if (stored_raw_len != LEN_PTR) [[likely]] {
+            tail_ptr = stored_ptr + 8;
+            tail_len = stored_raw_len - 8;
+        } else {
+            uint8_t* heap;
+            std::memcpy(&heap, stored_ptr + 8, 8);
+            tail_len = ptr_suffix_remaining(heap);
+            tail_ptr = ptr_suffix_data(heap);
+        }
+
+        uint32_t search_tail = search_len - 8;
+        uint32_t n = tail_len < search_tail ? tail_len : search_tail;
+        cmp = std::memcmp(tail_ptr, search_ptr + 8, n);
+        if (cmp != 0) [[likely]] return cmp;
+        return makecmp(tail_len, search_tail);
     }
 
     // -----------------------------------------------------------------------
@@ -414,36 +443,27 @@ private:
     // -----------------------------------------------------------------------
 
     // Returns pointer to value slot if found, nullptr otherwise.
-    const VST* compact_find(const uint64_t* node, const NodeHeader& h,
+    const VST* compact_find(const uint64_t* node, NodeHeader h,
                             const uint8_t* search_suffix,
                             uint32_t search_len) const noexcept {
         uint32_t count = h.count;
         if (count == 0) return nullptr;
 
-        uint8_t skip = h.skip;
-        bool eos = h.has_eos();
-
-        const uint8_t* lens = compact_lens(node, skip, eos, count);
-        const uint8_t* suffixes = compact_suffixes(node, skip, eos, count);
-
-        // We need total_suffix_bytes to locate values array.
-        uint32_t total_sb = compute_total_suffix_bytes(lens, count);
-        const VST* values = compact_values(node, skip, eos, count, total_sb);
+        // Read region pointers directly from stored offsets — no computation
+        const uint8_t* lens     = reinterpret_cast<const uint8_t*>(node + h.lens_off);
+        const uint8_t* suffixes = reinterpret_cast<const uint8_t*>(node + h.suffix_off);
+        const VST*     values   = reinterpret_cast<const VST*>(node + h.values_off);
 
         // Index pointers (may be empty)
-        const uint32_t* idx = compact_idx(node, skip, eos);
         int i1c = idx1_count(count);
         int i2c = idx2_count(count);
+        const uint32_t* idx = reinterpret_cast<const uint32_t*>(node + h.idx_off);
         const uint32_t* idx1 = i1c > 0 ? idx : nullptr;
         const uint32_t* idx2 = i2c > 0 ? idx + i1c : nullptr;
 
         // ---- Tier 1: narrow to 256-entry block ----------------------------
         int block_256 = 0;
         if (idx1) {
-            // idx1[k] = cumulative byte offset of entry k*256
-            // We scan idx1 boundaries (comparing entry k*256) to find block.
-            // But idx1 stores byte offsets, not entry comparisons directly.
-            // We need to compare the suffix at each idx1 boundary.
             int n1 = i1c;
             block_256 = 0;
             for (int k = 1; k < n1; ++k) {
@@ -488,15 +508,14 @@ private:
         uint32_t byte_off;
         if (idx2) {
             byte_off = idx2[block_256 * 16 + block_16];
-        } else if (idx1 && block_256 > 0) {
-            // Accumulate from block boundary
-            byte_off = idx1[block_256];
-            for (uint32_t i = base_entry; i < start_entry; ++i)
-                byte_off += effective_len(lens[i]);
         } else {
-            // Accumulate from 0
             byte_off = 0;
-            for (uint32_t i = 0; i < start_entry; ++i)
+            uint32_t scan_from = 0;
+            if (idx1 && block_256 > 0) {
+                byte_off = idx1[block_256];
+                scan_from = base_entry;
+            }
+            for (uint32_t i = scan_from; i < start_entry; ++i)
                 byte_off += effective_len(lens[i]);
         }
 
@@ -512,7 +531,7 @@ private:
     }
 
     // Mutable version
-    VST* compact_find(uint64_t* node, const NodeHeader& h,
+    VST* compact_find(uint64_t* node, NodeHeader h,
                       const uint8_t* search_suffix,
                       uint32_t search_len) noexcept {
         return const_cast<VST*>(
@@ -526,13 +545,11 @@ private:
 
     // Returns pointer to value slot, or nullptr.
     const VST* find_impl(const uint8_t* key_data, uint32_t key_len) const noexcept {
-        if (!root_) return nullptr;
-
         const uint64_t* node = root_;
         uint32_t consumed = 0;
 
         for (;;) {
-            const NodeHeader& h = hdr(node);
+            const NodeHeader h = hdr(node);
 
             // --- Skip prefix ---
             if (h.skip > 0) {
@@ -660,6 +677,14 @@ public:
         return find(key) != nullptr;
     }
 
+    // Benchmark accessor
+    const VALUE* compact_find_bench(const uint64_t* node, NodeHeader h,
+                                     const uint8_t* suffix, uint32_t len) const {
+        const VST* slot = compact_find(node, h, suffix, len);
+        if (!slot) return nullptr;
+        return &VT::load(*slot);
+    }
+
     // -----------------------------------------------------------------------
     // Modifiers — stubs for now
     // -----------------------------------------------------------------------
@@ -670,14 +695,19 @@ public:
 
 private:
     void init_empty_root() {
-        // Minimal compact leaf: just a header, count=0, no EOS
-        root_ = alloc_node(1);
+        // Minimal compact leaf: just a 16B header, count=0, no EOS
+        root_ = alloc_node(2);
         NodeHeader& h = hdr(root_);
         h.count = 0;
         h.top_count = 0;
         h.skip = 0;
         h.flags = 0;
         h.set_compact(true);
+        // Offsets point past header; unused when count=0 but valid
+        h.idx_off    = 2;
+        h.lens_off   = 2;
+        h.suffix_off = 2;
+        h.values_off = 2;
     }
 
     void destroy_tree(uint64_t* node) {
@@ -692,28 +722,31 @@ private:
         if (h.is_compact()) {
             uint32_t count = h.count;
             if (count > 0) {
-                const uint8_t* lens = compact_lens(node, h.skip, h.has_eos(), count);
-                const uint8_t* suffixes = compact_suffixes(node, h.skip, h.has_eos(), count);
-                uint32_t total_sb = compute_total_suffix_bytes(lens, count);
-                VST* values = compact_values(node, h.skip, h.has_eos(), count, total_sb);
+                // Use stored offsets — no recomputation
+                const uint8_t* lens = reinterpret_cast<const uint8_t*>(
+                    node + h.lens_off);
+                const uint8_t* suffixes = reinterpret_cast<const uint8_t*>(
+                    node + h.suffix_off);
+                VST* values = const_cast<VST*>(reinterpret_cast<const VST*>(
+                    node + h.values_off));
 
-                // Free pointer suffixes
+                // Free pointer suffixes and values
                 uint32_t off = 0;
                 for (uint32_t i = 0; i < count; ++i) {
                     if (lens[i] == LEN_PTR) {
+                        // BIG: 8 inline bytes then 8-byte pointer
                         uint8_t* heap;
-                        std::memcpy(&heap, suffixes + off, 8);
+                        std::memcpy(&heap, suffixes + off + 8, 8);
                         dealloc_suffix_block(heap);
                     }
                     VT::destroy(values[i]);
                     off += effective_len(lens[i]);
                 }
             }
-            // dealloc node — need size
-            uint32_t total_sb = count > 0 ?
-                compute_total_suffix_bytes(
-                    compact_lens(node, h.skip, h.has_eos(), count), count) : 0;
-            dealloc_node(node, compact_size_u64(count, h.skip, h.has_eos(), total_sb));
+            // Dealloc node — compute size from stored offsets + value count
+            std::size_t node_u64 = h.values_off +
+                align8(count * sizeof(VST)) / 8;
+            dealloc_node(node, node_u64);
         } else {
             // Bitmap node — recurse children
             uint16_t tc = h.top_count;
