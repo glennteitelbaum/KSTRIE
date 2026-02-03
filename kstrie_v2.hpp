@@ -1024,17 +1024,159 @@ private:
     InsertResult bitmap_add_child(uint64_t* node, NodeHeader h, uint8_t byte,
                                   const uint8_t* key_data, uint32_t key_len,
                                   const VALUE& value, uint32_t consumed) {
-        // TODO: reallocate bitmap with new child slot, create child node
-        (void)node; (void)h; (void)byte; (void)key_data; (void)key_len;
-        (void)value; (void)consumed;
-        return {nullptr, false};
+        const Bitmap& old_bm = bm_bitmap(node, h.skip, h.has_eos());
+        const uint64_t* old_children = bm_children(node, h.skip, h.has_eos());
+        int old_top_count = old_bm.popcount();
+        int new_top_count = old_top_count + 1;
+        
+        // Find insertion slot
+        int insert_slot = old_bm.slot_for_insert(byte);
+        
+        // Create child node for remaining suffix
+        uint64_t* child;
+        const uint8_t* suffix = key_data + consumed;
+        uint32_t suffix_len = key_len - consumed;
+        
+        if (suffix_len == 0) {
+            child = create_eos_only_node(value);
+        } else {
+            child = create_leaf_with_entry(suffix, suffix_len, value);
+        }
+        
+        // Allocate new bitmap node
+        std::size_t new_node_u64 = data_offset_u64(h.skip, h.has_eos()) + 
+                                   BITMAP_U64 + new_top_count;
+        uint64_t* new_node = alloc_node(new_node_u64);
+        
+        // Copy header
+        NodeHeader& nh = hdr(new_node);
+        nh = h;
+        
+        // Copy prefix if any
+        if (h.skip > 0) {
+            std::memcpy(new_node + header_u64(), 
+                       node + header_u64(),
+                       prefix_u64(h.skip) * 8);
+        }
+        
+        // Copy EOS if any
+        if (h.has_eos()) {
+            const VST& old_eos = eos_slot(node, h.skip);
+            VST* new_eos = reinterpret_cast<VST*>(
+                new_node + header_and_prefix_u64(h.skip));
+            *new_eos = old_eos;
+        }
+        
+        // Set up bitmap with new bit
+        Bitmap& new_bm = *reinterpret_cast<Bitmap*>(
+            new_node + data_offset_u64(h.skip, h.has_eos()));
+        new_bm = old_bm;
+        new_bm.set_bit(byte);
+        
+        // Copy children with insertion
+        uint64_t* new_children = const_cast<uint64_t*>(
+            bm_children(new_node, h.skip, h.has_eos()));
+        
+        for (int i = 0; i < insert_slot; ++i) {
+            new_children[i] = old_children[i];
+        }
+        new_children[insert_slot] = reinterpret_cast<uint64_t>(child);
+        for (int i = insert_slot; i < old_top_count; ++i) {
+            new_children[i + 1] = old_children[i];
+        }
+        
+        // Deallocate old node
+        std::size_t old_node_u64 = data_offset_u64(h.skip, h.has_eos()) + 
+                                   BITMAP_U64 + old_top_count;
+        dealloc_node(node, old_node_u64);
+        
+        return {new_node, true};
     }
 
     // Add EOS value to node (reallocate with EOS slot)
     InsertResult add_eos_to_node(uint64_t* node, NodeHeader h, const VALUE& value) {
-        // TODO: reallocate node with has_eos=true, copy data
-        (void)node; (void)h; (void)value;
-        return {nullptr, false};
+        if (h.is_compact()) {
+            // Compact: [Header][prefix?][data] -> [Header][prefix?][EOS][data]
+            int ic = idx_count(h.count);
+            int W = calc_W(ic);
+            int ec = W > 0 ? W - 1 : 0;
+            
+            std::size_t old_data_off = data_offset_u64(h.skip, false);
+            std::size_t new_data_off = data_offset_u64(h.skip, true);
+            
+            std::size_t data_size = values_off(h.count, h.keys_bytes, ec) + 
+                                    align8(h.count * sizeof(VST));
+            
+            std::size_t new_node_u64 = new_data_off + (data_size + 7) / 8;
+            uint64_t* new_node = alloc_node(new_node_u64);
+            
+            // Copy header with has_eos set
+            NodeHeader& nh = hdr(new_node);
+            nh = h;
+            nh.flags |= 2;
+            
+            // Copy prefix
+            if (h.skip > 0) {
+                std::memcpy(new_node + header_u64(), 
+                           node + header_u64(),
+                           prefix_u64(h.skip) * 8);
+            }
+            
+            // Store EOS value
+            VST* eos = reinterpret_cast<VST*>(
+                new_node + header_and_prefix_u64(h.skip));
+            *eos = VT::store(value);
+            
+            // Copy data (hot, idx, keys, values)
+            if (h.count > 0) {
+                const uint8_t* old_data = reinterpret_cast<const uint8_t*>(node) + 
+                                          old_data_off * 8;
+                uint8_t* new_data = reinterpret_cast<uint8_t*>(new_node) + 
+                                    new_data_off * 8;
+                std::memcpy(new_data, old_data, data_size);
+            }
+            
+            dealloc_node(node, old_data_off + (data_size + 7) / 8);
+            return {new_node, true};
+            
+        } else {
+            // Bitmap: [Header][prefix?][bitmap][children] -> 
+            //         [Header][prefix?][EOS][bitmap][children]
+            const Bitmap& bm = bm_bitmap(node, h.skip, false);
+            int top_count = bm.popcount();
+            
+            std::size_t old_data_off = data_offset_u64(h.skip, false);
+            std::size_t new_data_off = data_offset_u64(h.skip, true);
+            std::size_t bitmap_and_children_u64 = BITMAP_U64 + top_count;
+            
+            std::size_t new_node_u64 = new_data_off + bitmap_and_children_u64;
+            uint64_t* new_node = alloc_node(new_node_u64);
+            
+            // Copy header with has_eos set
+            NodeHeader& nh = hdr(new_node);
+            nh = h;
+            nh.flags |= 2;
+            
+            // Copy prefix
+            if (h.skip > 0) {
+                std::memcpy(new_node + header_u64(), 
+                           node + header_u64(),
+                           prefix_u64(h.skip) * 8);
+            }
+            
+            // Store EOS value
+            VST* eos = reinterpret_cast<VST*>(
+                new_node + header_and_prefix_u64(h.skip));
+            *eos = VT::store(value);
+            
+            // Copy bitmap and children
+            std::memcpy(new_node + new_data_off, 
+                       node + old_data_off,
+                       bitmap_and_children_u64 * 8);
+            
+            dealloc_node(node, old_data_off + bitmap_and_children_u64);
+            return {new_node, true};
+        }
     }
 
     // Split node at prefix mismatch point
@@ -1058,9 +1200,21 @@ private:
 
     // Create an EOS-only node (no entries, just a value)
     uint64_t* create_eos_only_node(const VALUE& value) {
-        // TODO: allocate minimal compact node with has_eos=true, count=0
-        (void)value;
-        return nullptr;
+        // Layout: [Header: 8B][EOS value: align8(sizeof(VST))]
+        std::size_t node_u64 = header_u64() + eos_u64<VST>();
+        uint64_t* node = alloc_node(node_u64);
+        
+        NodeHeader& h = hdr(node);
+        h.keys_bytes = 0;
+        h.count = 0;
+        h.skip = 0;
+        h.flags = 0b11;  // is_compact=1, has_eos=1
+        
+        // Store EOS value
+        VST* eos = reinterpret_cast<VST*>(node + header_u64());
+        *eos = VT::store(value);
+        
+        return node;
     }
 };
 
