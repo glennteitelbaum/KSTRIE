@@ -991,25 +991,241 @@ private:
     std::pair<bool, int> compact_search_position(uint64_t* node, NodeHeader h,
                                                   const uint8_t* suffix,
                                                   uint32_t suffix_len) {
-        // TODO: implement using E-based search
-        (void)node; (void)h; (void)suffix; (void)suffix_len;
-        return {false, 0};
+        uint16_t count = h.count;
+        if (count == 0) return {false, 0};
+        
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(node) +
+                              data_offset_u64(h.skip, h.has_eos()) * 8;
+        
+        int ic = idx_count(count);
+        int W = calc_W(ic);
+        int ec = W > 0 ? W - 1 : 0;
+        
+        const E* hot = reinterpret_cast<const E*>(data + hot_off());
+        const E* idx = reinterpret_cast<const E*>(data + idx_off(ec));
+        const uint8_t* keys = data + keys_off(count, ec);
+        
+        E skey = make_search_key(suffix, suffix_len);
+        int idx_base = 0, idx_end = ic;
+        
+        if (ec > 0) {
+            // Branchless Eytzinger traversal
+            int i = 1;
+            while (i <= ec) {
+                i = 2*i + (hot[i] <= skey);
+            }
+            int window = i - ec - 1;
+            idx_base = window * ic / W;
+            idx_end = std::min(idx_base + 4, ic);
+        }
+        
+        // Linear scan idx entries to find block
+        int block = idx_base;
+        for (int k = idx_base; k < idx_end; ++k) {
+            if (!(idx[k] <= skey)) break;
+            block = k;
+        }
+        
+        // Linear scan keys in block
+        const uint8_t* kp = keys + e_offset(idx[block]);
+        int key_start = block * 8;
+        int scan_end = std::min(key_start + 8, (int)count);
+        
+        for (int i = key_start; i < scan_end; ++i) {
+            int cmp = key_cmp(kp, suffix, suffix_len);
+            if (cmp == 0) return {true, i};
+            if (cmp > 0) return {false, i};
+            kp = key_next(kp);
+        }
+        
+        return {false, scan_end};
     }
 
     // Update value at position in compact node
     void compact_update_value(uint64_t* node, NodeHeader h, int pos,
                               const VALUE& value) {
-        // TODO: implement
-        (void)node; (void)h; (void)pos; (void)value;
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(node) +
+                              data_offset_u64(h.skip, h.has_eos()) * 8;
+        int ic = idx_count(h.count);
+        int W = calc_W(ic);
+        int ec = W > 0 ? W - 1 : 0;
+        
+        VST* values = reinterpret_cast<VST*>(
+            const_cast<uint8_t*>(data) + values_off(h.count, h.keys_bytes, ec));
+        
+        VT::destroy(values[pos]);
+        values[pos] = VT::store(value);
     }
 
     // Insert suffix/value at position, return new node
     uint64_t* compact_insert_at(uint64_t* node, NodeHeader h,
                                 const uint8_t* suffix, uint32_t suffix_len,
                                 const VALUE& value, int pos) {
-        // TODO: allocate new node with count+1, copy with insertion
-        (void)node; (void)h; (void)suffix; (void)suffix_len; (void)value; (void)pos;
-        return nullptr;
+        uint16_t old_count = h.count;
+        uint16_t new_count = old_count + 1;
+        uint32_t new_keys_bytes = h.keys_bytes + 2 + suffix_len;
+        
+        int old_ic = idx_count(old_count);
+        int old_W = calc_W(old_ic);
+        int old_ec = old_W > 0 ? old_W - 1 : 0;
+        
+        int new_ic = idx_count(new_count);
+        int new_W = calc_W(new_ic);
+        int new_ec = new_W > 0 ? new_W - 1 : 0;
+        
+        // Old data pointers
+        const uint8_t* old_data = reinterpret_cast<const uint8_t*>(node) +
+                                  data_offset_u64(h.skip, h.has_eos()) * 8;
+        const uint8_t* old_keys = old_data + keys_off(old_count, old_ec);
+        const VST* old_values = reinterpret_cast<const VST*>(
+            old_data + values_off(old_count, h.keys_bytes, old_ec));
+        
+        // Calculate new node size
+        std::size_t new_data_size = values_off(new_count, new_keys_bytes, new_ec) +
+                                    align8(new_count * sizeof(VST));
+        std::size_t new_node_u64 = data_offset_u64(h.skip, h.has_eos()) +
+                                   (new_data_size + 7) / 8;
+        
+        uint64_t* new_node = alloc_node(new_node_u64);
+        
+        // Copy header
+        NodeHeader& nh = hdr(new_node);
+        nh = h;
+        nh.keys_bytes = new_keys_bytes;
+        nh.count = new_count;
+        
+        // Copy prefix
+        if (h.skip > 0) {
+            std::memcpy(new_node + header_u64(), node + header_u64(),
+                       prefix_u64(h.skip) * 8);
+        }
+        
+        // Copy EOS
+        if (h.has_eos()) {
+            const VST& old_eos = eos_slot(node, h.skip);
+            VST* new_eos = reinterpret_cast<VST*>(
+                new_node + header_and_prefix_u64(h.skip));
+            *new_eos = old_eos;
+        }
+        
+        // New data pointers
+        uint8_t* new_data = reinterpret_cast<uint8_t*>(new_node) +
+                            data_offset_u64(h.skip, h.has_eos()) * 8;
+        uint8_t* new_keys = new_data + keys_off(new_count, new_ec);
+        VST* new_values = reinterpret_cast<VST*>(
+            new_data + values_off(new_count, new_keys_bytes, new_ec));
+        
+        // Copy keys with insertion
+        const uint8_t* old_kp = old_keys;
+        uint8_t* new_kp = new_keys;
+        
+        // Copy keys before insertion point
+        for (int i = 0; i < pos; ++i) {
+            uint16_t klen = *reinterpret_cast<const uint16_t*>(old_kp);
+            uint32_t entry_size = 2 + klen;
+            std::memcpy(new_kp, old_kp, entry_size);
+            old_kp += entry_size;
+            new_kp += entry_size;
+        }
+        
+        // Insert new key
+        *reinterpret_cast<uint16_t*>(new_kp) = static_cast<uint16_t>(suffix_len);
+        std::memcpy(new_kp + 2, suffix, suffix_len);
+        new_kp += 2 + suffix_len;
+        
+        // Copy keys after insertion point
+        for (int i = pos; i < old_count; ++i) {
+            uint16_t klen = *reinterpret_cast<const uint16_t*>(old_kp);
+            uint32_t entry_size = 2 + klen;
+            std::memcpy(new_kp, old_kp, entry_size);
+            old_kp += entry_size;
+            new_kp += entry_size;
+        }
+        
+        // Copy values with insertion
+        for (int i = 0; i < pos; ++i) {
+            new_values[i] = old_values[i];
+        }
+        new_values[pos] = VT::store(value);
+        for (int i = pos; i < old_count; ++i) {
+            new_values[i + 1] = old_values[i];
+        }
+        
+        // Build idx array
+        E* new_idx = reinterpret_cast<E*>(new_data + idx_off(new_ec));
+        new_kp = new_keys;
+        uint32_t offset = 0;
+        
+        for (int i = 0; i < new_ic; ++i) {
+            int k = i * 8;
+            
+            // Get key at position k
+            const uint8_t* kp_at_k = new_keys;
+            uint32_t off_at_k = 0;
+            for (int j = 0; j < k; ++j) {
+                uint16_t klen = *reinterpret_cast<const uint16_t*>(kp_at_k);
+                kp_at_k += 2 + klen;
+                off_at_k += 2 + klen;
+            }
+            
+            uint16_t klen_at_k = *reinterpret_cast<const uint16_t*>(kp_at_k);
+            const uint8_t* kdata_at_k = kp_at_k + 2;
+            
+            // Build E prefix for key k
+            ES es;
+            es.setkey(reinterpret_cast<const char*>(kdata_at_k),
+                     static_cast<int>(klen_at_k));
+            E prefix_k = cvt(es);
+            prefix_k[1] &= ~uint64_t(0xFFFF);  // Clear offset for comparison
+            
+            // Walk back to find first key with same E prefix
+            int first_k = k;
+            uint32_t first_off = off_at_k;
+            const uint8_t* check_kp = new_keys;
+            uint32_t check_off = 0;
+            
+            for (int j = 0; j < k; ++j) {
+                uint16_t check_len = *reinterpret_cast<const uint16_t*>(check_kp);
+                const uint8_t* check_data = check_kp + 2;
+                
+                ES es2;
+                es2.setkey(reinterpret_cast<const char*>(check_data),
+                          static_cast<int>(check_len));
+                E prefix_j = cvt(es2);
+                prefix_j[1] &= ~uint64_t(0xFFFF);
+                
+                if (prefix_j == prefix_k) {
+                    if (j < first_k) {
+                        first_k = j;
+                        first_off = check_off;
+                    }
+                }
+                
+                check_kp += 2 + check_len;
+                check_off += 2 + check_len;
+            }
+            
+            // Store idx entry with walked-back offset
+            es.setoff(static_cast<uint16_t>(first_off));
+            new_idx[i] = cvt(es);
+        }
+        
+        // Build hot array
+        E* new_hot = reinterpret_cast<E*>(new_data + hot_off());
+        if (new_ec > 0) {
+            build_eyt(new_idx, new_ic, new_hot);
+        } else {
+            new_hot[0] = E{};
+        }
+        
+        // Deallocate old node
+        std::size_t old_data_size = values_off(old_count, h.keys_bytes, old_ec) +
+                                    align8(old_count * sizeof(VST));
+        std::size_t old_node_u64 = data_offset_u64(h.skip, h.has_eos()) +
+                                   (old_data_size + 7) / 8;
+        dealloc_node(node, old_node_u64);
+        
+        return new_node;
     }
 
     // Split full compact node to bitmap, insert new entry
