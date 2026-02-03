@@ -7,12 +7,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#ifdef KSTRIE_DEBUG
+#include <iostream>
+#endif
 
 namespace gteitelbaum {
 
@@ -278,8 +283,9 @@ struct ValueTraits {
 // ============================================================================
 
 struct NodeHeader {
-    uint32_t keys_bytes;    // total size of keys[] region (compact only)
+    uint16_t alloc_u64;     // allocation size in u64 units (max 512KB)
     uint16_t count;         // entry count (excl EOS), max 4096
+    uint16_t keys_bytes;    // total size of keys[] region (compact only), max 65535
     uint8_t  skip;          // 0=none, 1-254=byte count, 255=continuation (254 bytes + child)
     uint8_t  flags;         // bit0: is_compact, bit1: has_eos
 
@@ -296,6 +302,13 @@ struct NodeHeader {
 
     void set_compact(bool v) noexcept { if (v) flags |= 1; else flags &= ~uint8_t(1); }
     void set_eos(bool v)     noexcept { if (v) flags |= 2; else flags &= ~uint8_t(2); }
+    
+    // Copy from another header, preserving alloc_u64
+    void copy_from(const NodeHeader& src) noexcept {
+        uint16_t saved_alloc = alloc_u64;
+        *this = src;
+        alloc_u64 = saved_alloc;
+    }
 };
 static_assert(sizeof(NodeHeader) == 8);
 
@@ -336,8 +349,19 @@ inline E cvt(const ES& x) noexcept {
 inline E make_search_key(const uint8_t* k, uint32_t len) noexcept {
     ES es;
     es.setkey(reinterpret_cast<const char*>(k), static_cast<int>(len));
-    es.setoff(0xFFFF);  // max offset so search key >= any matching idx entry
+    es.setoff(0);  // offset 0 for prefix-only comparison
     return cvt(es);
+}
+
+// Extract just the 14-byte prefix from E for prefix-only comparison
+inline E e_prefix_only(E e) noexcept {
+    // Zero out the offset (low 16 bits of e[1])
+    if constexpr (std::endian::native == std::endian::little) {
+        e[1] &= ~uint64_t(0xFFFF);  // Clear high 16 bits (which are low bytes after byteswap)
+    } else {
+        e[1] &= ~uint64_t(0xFFFF);  // Clear low 16 bits
+    }
+    return e;
 }
 
 static_assert(sizeof(E) == 16);
@@ -487,6 +511,17 @@ private:
     using VST = typename VT::slot_type;
     using Bitmap = typename CHARMAP::Bitmap;
     static constexpr size_t BITMAP_U64 = CHARMAP::BITMAP_WORDS;
+    
+    // Compact node limits
+    static constexpr uint32_t COMPACT_MAX = 4096;        // Max entries
+    static constexpr size_t COMPACT_MAX_BYTES = 16384;   // Max node size (16KB)
+
+    // Result of checking compact node invariants
+    enum class CompressedResult {
+        OK,
+        TOO_BIG,      // Node exceeds 16KB
+        TOO_MANY      // Node exceeds 4096 entries
+    };
 
     using byte_alloc_type =
         typename std::allocator_traits<ALLOC>::template rebind_alloc<uint8_t>;
@@ -500,11 +535,18 @@ private:
     uint64_t* alloc_node(std::size_t u64_count) {
         uint64_t* p = std::allocator_traits<ALLOC>::allocate(alloc_, u64_count);
         std::memset(p, 0, u64_count * 8);
+        // Store allocation size in header
+        hdr(p).alloc_u64 = static_cast<uint16_t>(u64_count);
         return p;
     }
 
     void dealloc_node(uint64_t* p, std::size_t u64_count) {
         if (p) std::allocator_traits<ALLOC>::deallocate(alloc_, p, u64_count);
+    }
+
+    // Helper: deallocate using size stored in header
+    void free_node(uint64_t* p) {
+        if (p) dealloc_node(p, hdr(p).alloc_u64);
     }
 
     // -- header/prefix/eos accessors ----------------------------------------
@@ -560,11 +602,8 @@ private:
     // -- init ---------------------------------------------------------------
 
     void init_empty_root() {
-        // Minimal compact leaf: header + empty data region
-        // For count=0: data region has hot[0] (16 bytes), ic=0, keys_bytes=0
-        // values_off(0, 0, 0) = 16, data_size = 16
-        std::size_t data_size = values_off(0, 0, 0);  // 16 bytes
-        std::size_t n = header_u64() + (data_size + 7) / 8;
+        // Minimal compact leaf: header only (no data region when count=0)
+        std::size_t n = data_offset_u64(0, false);  // just header, no prefix, no eos
         root_ = alloc_node(n);
         NodeHeader& h = hdr(root_);
         h.count = 0;
@@ -580,51 +619,161 @@ private:
         const NodeHeader& h = hdr(node);
 
         if (h.is_compact()) {
-            // Compute ec from count
-            int ic = idx_count(h.count);
-            int W = calc_W(ic);
-            int ec = W > 0 ? W - 1 : 0;
-
             // Destroy values
-            const uint8_t* data = reinterpret_cast<const uint8_t*>(node) +
-                                  data_offset_u64(h.skip, h.has_eos()) * 8;
-            const VST* values = reinterpret_cast<const VST*>(
-                data + values_off(h.count, h.keys_bytes, ec));
-
-            for (uint16_t i = 0; i < h.count; ++i) {
-                VT::destroy(const_cast<VST&>(values[i]));
+            if (h.count > 0) {
+                int ic = idx_count(h.count);
+                int W = calc_W(ic);
+                int ec = W > 0 ? W - 1 : 0;
+                const uint8_t* data = reinterpret_cast<const uint8_t*>(node) +
+                                      data_offset_u64(h.skip, h.has_eos()) * 8;
+                const VST* values = reinterpret_cast<const VST*>(
+                    data + values_off(h.count, h.keys_bytes, ec));
+                for (uint16_t i = 0; i < h.count; ++i) {
+                    VT::destroy(const_cast<VST&>(values[i]));
+                }
             }
-
             // TODO: destroy BIG key heap blocks
-
-            // Destroy EOS value if present
             if (h.has_eos()) {
                 VT::destroy(const_cast<VST&>(eos_slot(node, h.skip)));
             }
-
-            // Compute node size and deallocate
-            std::size_t node_bytes = data_offset_u64(h.skip, h.has_eos()) * 8 +
-                                     values_off(h.count, h.keys_bytes, ec) +
-                                     align8(h.count * sizeof(VST));
-            dealloc_node(node, (node_bytes + 7) / 8);
         } else {
-            // Bitmap node
+            // Bitmap node - recurse into children
             const Bitmap& bm = bm_bitmap(node, h.skip, h.has_eos());
             const uint64_t* children = bm_children(node, h.skip, h.has_eos());
             int top_count = bm.popcount();
-
             for (int i = 0; i < top_count; ++i) {
                 destroy_tree(reinterpret_cast<uint64_t*>(children[i]));
             }
-
             if (h.has_eos()) {
                 VT::destroy(const_cast<VST&>(eos_slot(node, h.skip)));
             }
-
-            std::size_t node_u64 = data_offset_u64(h.skip, h.has_eos()) +
-                                   BITMAP_U64 + top_count;
-            dealloc_node(node, node_u64);
         }
+        free_node(node);
+    }
+
+    // -----------------------------------------------------------------------
+    // check_compress — Validate compact node invariants
+    // Returns TOO_BIG/TOO_MANY if split needed, asserts on bugs
+    // -----------------------------------------------------------------------
+    
+    CompressedResult check_compress(const uint64_t* node) const {
+        NodeHeader h = hdr(node);
+        
+        // Must be a compact node
+        assert(h.is_compact() && "check_compress called on bitmap node");
+        
+        // Check count limit
+        if (h.count > COMPACT_MAX) {
+            return CompressedResult::TOO_MANY;
+        }
+        
+        // Check size limit
+        int ic = idx_count(h.count);
+        int W = calc_W(ic);
+        int ec = W > 0 ? W - 1 : 0;
+        std::size_t data_size = values_off(h.count, h.keys_bytes, ec) +
+                                h.count * sizeof(VST);
+        std::size_t node_bytes = data_offset_u64(h.skip, h.has_eos()) * 8 + data_size;
+        if (node_bytes > COMPACT_MAX_BYTES) {
+            return CompressedResult::TOO_BIG;
+        }
+        
+        // ASSERT: count=1 must have EOS (single entry = skip+EOS)
+        assert(!(h.count == 1 && !h.has_eos()) && "MISSING_EOS: count=1 without EOS");
+        
+        // For count >= 2, check invariants
+        if (h.count >= 2) {
+            const uint8_t* data = reinterpret_cast<const uint8_t*>(node) +
+                                  data_offset_u64(h.skip, h.has_eos()) * 8;
+            const E* hot = reinterpret_cast<const E*>(data + hot_off());
+            const E* idx = reinterpret_cast<const E*>(data + idx_off(ec));
+            const uint8_t* keys = data + keys_off(h.count, ec);
+            
+            // Collect all keys for checking
+            std::vector<std::pair<const uint8_t*, uint16_t>> key_list;
+            key_list.reserve(h.count);
+            const uint8_t* kp = keys;
+            uint32_t cumulative_offset = 0;
+            
+            for (uint16_t i = 0; i < h.count; ++i) {
+                uint16_t klen = read_u16(kp);
+                const uint8_t* kdata = kp + 2;
+                key_list.push_back({kdata, klen});
+                
+                // ASSERT: Check idx entry at block boundary
+                if (i % 8 == 0) {
+                    int idx_i = i / 8;
+                    
+                    // Check offset matches
+                    uint16_t stored_offset = e_offset(idx[idx_i]);
+                    assert(stored_offset == cumulative_offset && "BAD_IDX: offset mismatch");
+                    
+                    // Check prefix matches (first 14 bytes of key)
+                    ES es;
+                    es.setkey(reinterpret_cast<const char*>(kdata), klen);
+                    es.setoff(cumulative_offset);
+                    E expected = cvt(es);
+                    E expected_prefix = e_prefix_only(expected);
+                    E stored_prefix = e_prefix_only(idx[idx_i]);
+                    assert(expected_prefix == stored_prefix && "BAD_IDX: prefix mismatch");
+                }
+                
+                cumulative_offset += 2 + klen;  // length field + key bytes
+                kp = key_next(kp);
+            }
+            
+            // ASSERT: Keys must be sorted
+            for (size_t i = 1; i < key_list.size(); ++i) {
+                auto [k1, len1] = key_list[i-1];
+                auto [k2, len2] = key_list[i];
+                uint32_t min_len = std::min(len1, len2);
+                int cmp = std::memcmp(k1, k2, min_len);
+                bool sorted = (cmp < 0) || (cmp == 0 && len1 < len2);
+                assert(sorted && "UNSORTED: keys not in order");
+            }
+            
+            // ASSERT: No shared prefix (LCP must be 0)
+            // If all keys share a common prefix, it should be in skip
+            if (h.count >= 2) {
+                auto [k0, len0] = key_list[0];
+                uint32_t lcp = len0;
+                for (size_t i = 1; i < key_list.size() && lcp > 0; ++i) {
+                    auto [ki, leni] = key_list[i];
+                    uint32_t max_cmp = std::min({lcp, static_cast<uint32_t>(leni)});
+                    uint32_t j = 0;
+                    while (j < max_cmp && k0[j] == ki[j]) ++j;
+                    lcp = j;
+                }
+                assert(lcp == 0 && "BAD_PREFIX: keys share common prefix that should be in skip");
+            }
+            
+            // ASSERT: Check hot array (Eytzinger layout)
+            if (ec > 0) {
+                // Rebuild expected hot array
+                E stack_buf[128];
+                E* boundaries = (ec <= 128) ? stack_buf : new E[ec];
+                for (int i = 0; i < ec; ++i) {
+                    int pos = (i + 1) * ic / W;
+                    boundaries[i] = idx[pos];
+                }
+                E expected_hot[128];
+                int k = 0;
+                std::function<void(int)> build_eyt_local = [&](int i) {
+                    if (i > ec) return;
+                    build_eyt_local(2*i);
+                    expected_hot[i] = boundaries[k++];
+                    build_eyt_local(2*i + 1);
+                };
+                build_eyt_local(1);
+                if (boundaries != stack_buf) delete[] boundaries;
+                
+                for (int i = 1; i <= ec; ++i) {
+                    assert(hot[i] == expected_hot[i] && "BAD_HOT: hot array mismatch");
+                }
+            }
+        }
+        
+        return CompressedResult::OK;
     }
 
     // -----------------------------------------------------------------------
@@ -651,32 +800,69 @@ private:
         const VST* values = reinterpret_cast<const VST*>(data + values_off(count, h.keys_bytes, ec));
 
         E skey = make_search_key(search, search_len);
+        E skey_prefix = e_prefix_only(skey);
         int idx_base = 0, idx_end = ic;
 
         if (ec > 0) {
             // Branchless Eytzinger traversal using 16-byte E comparison
+            // Use prefix-only comparison (ignore offset in low bits)
             int i = 1;
             while (i <= ec) {
-                i = 2*i + (hot[i] <= skey);
+                i = 2*i + (e_prefix_only(hot[i]) <= skey_prefix);
             }
             int window = i - ec - 1;
             idx_base = window * ic / W;
             idx_end = std::min(idx_base + 4, ic);
         }
 
-        // Linear scan idx entries (up to 4) using E comparison
+        // Linear scan idx entries - find last block where key could be
+        // Compare prefix only (ignore offset)
         int block = idx_base;
+        
+        #ifdef KSTRIE_DEBUG
+        std::cerr << "DEBUG compact_find: count=" << count << " ic=" << ic 
+                  << " ec=" << ec << " W=" << W << "\n";
+        std::cerr << "  search_len=" << search_len << " search='";
+        for (uint32_t j = 0; j < std::min(search_len, 20u); ++j)
+            std::cerr << (char)search[j];
+        std::cerr << "'\n";
+        std::cerr << "  idx_base=" << idx_base << " idx_end=" << idx_end << "\n";
+        #endif
+        
         for (int k = idx_base; k < idx_end; ++k) {
-            if (!(idx[k] <= skey)) break;
+            E idx_prefix = e_prefix_only(idx[k]);
+            
+            #ifdef KSTRIE_DEBUG
+            std::cerr << "  idx[" << k << "]: offset=" << e_offset(idx[k]) << "\n";
+            #endif
+            
+            if (!(idx_prefix <= skey_prefix)) break;
             block = k;
         }
+        
+        #ifdef KSTRIE_DEBUG
+        std::cerr << "  selected block=" << block << " offset=" << e_offset(idx[block]) << "\n";
+        #endif
 
         // Linear scan keys (up to 8)
         const uint8_t* kp = keys + e_offset(idx[block]);
         int key_start = block * 8;
         int scan_end = std::min(key_start + 8, (int)count);
 
+        #ifdef KSTRIE_DEBUG
+        std::cerr << "  key_start=" << key_start << " scan_end=" << scan_end << "\n";
+        #endif
+
         for (int i = key_start; i < scan_end; ++i) {
+            uint16_t klen = read_u16(kp);
+            
+            #ifdef KSTRIE_DEBUG
+            std::cerr << "  key[" << i << "]: len=" << klen << " '";
+            for (int j = 0; j < std::min((int)klen, 20); ++j)
+                std::cerr << (char)kp[2+j];
+            std::cerr << "'\n";
+            #endif
+            
             int cmp = key_cmp(kp, search, search_len);
             if (cmp == 0) return &values[i];
             if (cmp > 0) return nullptr;
@@ -952,15 +1138,26 @@ private:
         }
 
         // Key not found — insert at pos
-        if (h.count < COMPACT_MAX) {
-            // Room to insert
-            uint64_t* new_node = compact_insert_at(node, h, suffix, suffix_len, 
-                                                    value, pos);
+        uint64_t* new_node = compact_insert_at(node, h, suffix, suffix_len, 
+                                                value, pos);
+        
+        // Check if node needs splitting
+        CompressedResult result = check_compress(new_node);
+        
+        if (result == CompressedResult::OK) {
             return {new_node, true};
         }
-
-        // Node full — split to bitmap
-        return compact_split_to_bitmap(node, h, suffix, suffix_len, value);
+        
+        // Node too big or too many entries — split to bitmap
+        // First get the new header
+        NodeHeader new_h = hdr(new_node);
+        uint64_t* split_node = compact_split_to_bitmap_node(new_node, new_h);
+        
+        // Verify the split result - all children should be OK
+        // (The split creates bitmap node with compact children)
+        // We don't check bitmap nodes, but their compact children should be OK
+        
+        return {split_node, true};
     }
 
     // -----------------------------------------------------------------------
@@ -1017,23 +1214,24 @@ private:
         const uint8_t* keys = data + keys_off(count, ec);
         
         E skey = make_search_key(suffix, suffix_len);
+        E skey_prefix = e_prefix_only(skey);
         int idx_base = 0, idx_end = ic;
         
         if (ec > 0) {
-            // Branchless Eytzinger traversal
+            // Branchless Eytzinger traversal - use prefix-only comparison
             int i = 1;
             while (i <= ec) {
-                i = 2*i + (hot[i] <= skey);
+                i = 2*i + (e_prefix_only(hot[i]) <= skey_prefix);
             }
             int window = i - ec - 1;
             idx_base = window * ic / W;
             idx_end = std::min(idx_base + 4, ic);
         }
         
-        // Linear scan idx entries to find block
+        // Linear scan idx entries to find block - use prefix-only comparison
         int block = idx_base;
         for (int k = idx_base; k < idx_end; ++k) {
-            if (!(idx[k] <= skey)) break;
+            if (!(e_prefix_only(idx[k]) <= skey_prefix)) break;
             block = k;
         }
         
@@ -1068,10 +1266,78 @@ private:
         values[pos] = VT::store(value);
     }
 
+    // Compute LCP between new suffix and all existing keys
+    // Returns the minimum LCP length
+    // Returns 0 if node has EOS (cannot extend skip past EOS key)
+    uint32_t compute_lcp_with_existing(uint64_t* node, NodeHeader h,
+                                       const uint8_t* suffix, uint32_t suffix_len) {
+        // If node has EOS, there's a key equal to just the skip
+        // We cannot extend skip past this key, so LCP extension = 0
+        if (h.has_eos()) return 0;
+        
+        if (h.count == 0) return 0;
+        
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(node) +
+                              data_offset_u64(h.skip, h.has_eos()) * 8;
+        int ic = idx_count(h.count);
+        int W = calc_W(ic);
+        int ec = W > 0 ? W - 1 : 0;
+        
+        const uint8_t* keys = data + keys_off(h.count, ec);
+        
+        uint32_t lcp = suffix_len;  // Start with max possible
+        
+        const uint8_t* kp = keys;
+        for (uint16_t i = 0; i < h.count && lcp > 0; ++i) {
+            uint16_t klen = read_u16(kp);
+            const uint8_t* kdata = kp + 2;
+            
+            uint32_t max_cmp = std::min({lcp, static_cast<uint32_t>(klen), suffix_len});
+            uint32_t j = 0;
+            while (j < max_cmp && kdata[j] == suffix[j]) {
+                ++j;
+            }
+            lcp = j;
+            
+            kp = key_next(kp);
+        }
+        
+        return lcp;
+    }
+
     // Insert suffix/value at position, return new node
+    // Maintains invariant: single entry becomes skip+EOS with count=0
     uint64_t* compact_insert_at(uint64_t* node, NodeHeader h,
                                 const uint8_t* suffix, uint32_t suffix_len,
                                 const VALUE& value, int pos) {
+        // Special case: inserting into empty node (count=0, no EOS)
+        // Create skip+EOS node instead of count=1 node
+        if (h.count == 0 && !h.has_eos()) {
+            // Deallocate old empty node (count=0 means no data region)
+            std::size_t old_node_u64 = data_offset_u64(h.skip, false);
+            free_node(node);
+            
+            // Create new node with skip=old_skip+suffix, EOS=true
+            return create_leaf_with_entry(suffix, suffix_len, value);
+        }
+        
+        // Compute LCP between new suffix and existing keys
+        uint32_t lcp = compute_lcp_with_existing(node, h, suffix, suffix_len);
+        
+        // If LCP > 0, extend skip and strip prefix from all keys
+        if (lcp > 0) {
+            return compact_insert_with_extended_skip(node, h, suffix, suffix_len,
+                                                      value, pos, lcp);
+        }
+        
+        // No common prefix - simple insert
+        return compact_insert_at_simple(node, h, suffix, suffix_len, value, pos);
+    }
+    
+    // Insert without LCP extension (simple case)
+    uint64_t* compact_insert_at_simple(uint64_t* node, NodeHeader h,
+                                       const uint8_t* suffix, uint32_t suffix_len,
+                                       const VALUE& value, int pos) {
         uint16_t old_count = h.count;
         uint16_t new_count = old_count + 1;
         uint32_t new_keys_bytes = h.keys_bytes + 2 + suffix_len;
@@ -1093,7 +1359,7 @@ private:
         
         // Calculate new node size
         std::size_t new_data_size = values_off(new_count, new_keys_bytes, new_ec) +
-                                    align8(new_count * sizeof(VST));
+                                    new_count * sizeof(VST);
         std::size_t new_node_u64 = data_offset_u64(h.skip, h.has_eos()) +
                                    (new_data_size + 7) / 8;
         
@@ -1101,7 +1367,7 @@ private:
         
         // Copy header
         NodeHeader& nh = hdr(new_node);
-        nh = h;
+        nh.copy_from(h);
         nh.keys_bytes = new_keys_bytes;
         nh.count = new_count;
         
@@ -1126,31 +1392,57 @@ private:
         VST* new_values = reinterpret_cast<VST*>(
             new_data + values_off(new_count, new_keys_bytes, new_ec));
         
-        // Copy keys with insertion
+        // Allocate temp arrays for O(n) idx building
+        std::vector<uint32_t> offsets(new_count);
+        std::vector<E> prefixes(new_count);
+        std::vector<uint32_t> prefix_start(new_count);  // first key with same prefix
+        
+        // Copy keys with insertion, building offsets and prefixes
         const uint8_t* old_kp = old_keys;
         uint8_t* new_kp = new_keys;
+        uint32_t off = 0;
+        
+        auto process_key = [&](int i, const uint8_t* kdata, uint16_t klen) {
+            offsets[i] = off;
+            
+            // Build E prefix (without offset)
+            ES es;
+            es.setkey(reinterpret_cast<const char*>(kdata), static_cast<int>(klen));
+            es.setoff(0);
+            prefixes[i] = cvt(es);
+            
+            // Track prefix run start
+            if (i == 0 || prefixes[i] != prefixes[i-1]) {
+                prefix_start[i] = i;
+            } else {
+                prefix_start[i] = prefix_start[i-1];
+            }
+            
+            off += 2 + klen;
+        };
         
         // Copy keys before insertion point
         for (int i = 0; i < pos; ++i) {
             uint16_t klen = read_u16(old_kp);
-            uint32_t entry_size = 2 + klen;
-            std::memcpy(new_kp, old_kp, entry_size);
-            old_kp += entry_size;
-            new_kp += entry_size;
+            std::memcpy(new_kp, old_kp, 2 + klen);
+            process_key(i, new_kp + 2, klen);
+            old_kp += 2 + klen;
+            new_kp += 2 + klen;
         }
         
         // Insert new key
         write_u16(new_kp, static_cast<uint16_t>(suffix_len));
         std::memcpy(new_kp + 2, suffix, suffix_len);
+        process_key(pos, suffix, suffix_len);
         new_kp += 2 + suffix_len;
         
         // Copy keys after insertion point
         for (int i = pos; i < old_count; ++i) {
             uint16_t klen = read_u16(old_kp);
-            uint32_t entry_size = 2 + klen;
-            std::memcpy(new_kp, old_kp, entry_size);
-            old_kp += entry_size;
-            new_kp += entry_size;
+            std::memcpy(new_kp, old_kp, 2 + klen);
+            process_key(i + 1, new_kp + 2, klen);
+            old_kp += 2 + klen;
+            new_kp += 2 + klen;
         }
         
         // Copy values with insertion
@@ -1162,62 +1454,38 @@ private:
             new_values[i + 1] = old_values[i];
         }
         
-        // Build idx array
+        // Build idx array in O(ic) using precomputed data
         E* new_idx = reinterpret_cast<E*>(new_data + idx_off(new_ec));
-        new_kp = new_keys;
-        uint32_t offset = 0;
+        
+        #ifdef KSTRIE_DEBUG
+        std::cerr << "DEBUG compact_insert_at_simple: new_count=" << new_count 
+                  << " new_ic=" << new_ic << " new_ec=" << new_ec
+                  << " skip=" << (int)h.skip << " has_eos=" << h.has_eos() << "\n";
+        std::cerr << "  data_offset_u64=" << data_offset_u64(h.skip, h.has_eos())
+                  << " idx_off=" << idx_off(new_ec) 
+                  << " keys_off=" << keys_off(new_count, new_ec) << "\n";
+        #endif
         
         for (int i = 0; i < new_ic; ++i) {
             int k = i * 8;
+            uint32_t k_off = offsets[k];  // Offset to key at position k
             
-            // Get key at position k
-            const uint8_t* kp_at_k = new_keys;
-            uint32_t off_at_k = 0;
-            for (int j = 0; j < k; ++j) {
-                uint16_t klen = read_u16(kp_at_k);
-                kp_at_k += 2 + klen;
-                off_at_k += 2 + klen;
-            }
-            
+            // Get key data at position k for the E entry
+            const uint8_t* kp_at_k = new_keys + k_off;
             uint16_t klen_at_k = read_u16(kp_at_k);
-            const uint8_t* kdata_at_k = kp_at_k + 2;
             
-            // Build E prefix for key k
+            #ifdef KSTRIE_DEBUG
+            std::cerr << "  idx[" << i << "]: k=" << k << " k_off=" << k_off 
+                      << " klen=" << klen_at_k << " key='";
+            for (int j = 0; j < std::min((int)klen_at_k, 20); ++j) 
+                std::cerr << (char)kp_at_k[2+j];
+            std::cerr << "'\n";
+            #endif
+            
             ES es;
-            es.setkey(reinterpret_cast<const char*>(kdata_at_k),
+            es.setkey(reinterpret_cast<const char*>(kp_at_k + 2), 
                      static_cast<int>(klen_at_k));
-            E prefix_k = cvt(es);
-            prefix_k[1] &= ~uint64_t(0xFFFF);  // Clear offset for comparison
-            
-            // Walk back to find first key with same E prefix
-            int first_k = k;
-            uint32_t first_off = off_at_k;
-            const uint8_t* check_kp = new_keys;
-            uint32_t check_off = 0;
-            
-            for (int j = 0; j < k; ++j) {
-                uint16_t check_len = read_u16(check_kp);
-                const uint8_t* check_data = check_kp + 2;
-                
-                ES es2;
-                es2.setkey(reinterpret_cast<const char*>(check_data),
-                          static_cast<int>(check_len));
-                E prefix_j = cvt(es2);
-                prefix_j[1] &= ~uint64_t(0xFFFF);
-                
-                if (prefix_j == prefix_k) {
-                    if (j < first_k) {
-                        first_k = j;
-                        first_off = check_off;
-                    }
-                }
-                
-                check_kp += 2 + check_len;
-                check_off += 2 + check_len;
-            }
-            
-            // Store idx entry with walked-back offset
-            es.setoff(static_cast<uint16_t>(first_off));
+            es.setoff(static_cast<uint16_t>(k_off));  // Store offset to position k
             new_idx[i] = cvt(es);
         }
         
@@ -1231,10 +1499,191 @@ private:
         
         // Deallocate old node
         std::size_t old_data_size = values_off(old_count, h.keys_bytes, old_ec) +
-                                    align8(old_count * sizeof(VST));
+                                    old_count * sizeof(VST);
         std::size_t old_node_u64 = data_offset_u64(h.skip, h.has_eos()) +
                                    (old_data_size + 7) / 8;
-        dealloc_node(node, old_node_u64);
+        free_node(node);
+        
+        return new_node;
+    }
+
+    // Insert with LCP extension - extends skip and strips LCP from all keys
+    uint64_t* compact_insert_with_extended_skip(uint64_t* node, NodeHeader h,
+                                                const uint8_t* suffix, uint32_t suffix_len,
+                                                const VALUE& value, int pos,
+                                                uint32_t lcp) {
+        // Collect all entries, stripping LCP
+        std::vector<BucketEntry> entries;
+        entries.reserve(h.count + 1);
+        
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(node) +
+                              data_offset_u64(h.skip, h.has_eos()) * 8;
+        int ic = idx_count(h.count);
+        int W = calc_W(ic);
+        int ec = W > 0 ? W - 1 : 0;
+        
+        const uint8_t* keys = data + keys_off(h.count, ec);
+        const VST* old_values = reinterpret_cast<const VST*>(
+            data + values_off(h.count, h.keys_bytes, ec));
+        
+        // Collect existing entries, strip LCP
+        VST* new_eos_slot = nullptr;
+        VST eos_value{};
+        
+        const uint8_t* kp = keys;
+        for (uint16_t i = 0; i < h.count; ++i) {
+            uint16_t klen = read_u16(kp);
+            const uint8_t* kdata = kp + 2;
+            
+            if (klen == lcp) {
+                // This entry becomes EOS after stripping
+                new_eos_slot = &eos_value;
+                eos_value = old_values[i];
+            } else {
+                entries.push_back({kdata + lcp, klen - lcp, old_values[i]});
+            }
+            kp = key_next(kp);
+        }
+        
+        // Add new entry, stripped of LCP
+        if (suffix_len == lcp) {
+            // New entry becomes EOS
+            new_eos_slot = &eos_value;
+            eos_value = VT::store(value);
+        } else {
+            entries.push_back({suffix + lcp, suffix_len - lcp, VT::store(value)});
+        }
+        
+        // Sort entries (new entry might not be in order after stripping)
+        std::sort(entries.begin(), entries.end(),
+            [](const BucketEntry& a, const BucketEntry& b) {
+                uint32_t min_len = std::min(a.len, b.len);
+                int cmp = std::memcmp(a.suffix, b.suffix, min_len);
+                if (cmp != 0) return cmp < 0;
+                return a.len < b.len;
+            });
+        
+        // Build new prefix = old prefix + LCP bytes from suffix
+        uint8_t new_skip = h.skip + static_cast<uint8_t>(lcp);
+        bool has_eos = h.has_eos() || (new_eos_slot != nullptr);
+        
+        // Calculate new node size
+        uint32_t new_keys_bytes = 0;
+        for (const auto& e : entries) {
+            new_keys_bytes += 2 + e.len;
+        }
+        
+        uint16_t new_count = static_cast<uint16_t>(entries.size());
+        int new_ic = idx_count(new_count);
+        int new_W = calc_W(new_ic);
+        int new_ec = new_W > 0 ? new_W - 1 : 0;
+        
+        std::size_t new_data_size = values_off(new_count, new_keys_bytes, new_ec) +
+                                    new_count * sizeof(VST);
+        std::size_t new_node_u64 = data_offset_u64(new_skip, has_eos) +
+                                   (new_data_size + 7) / 8;
+        
+        uint64_t* new_node = alloc_node(new_node_u64);
+        
+        // Set header
+        NodeHeader& nh = hdr(new_node);
+        nh.keys_bytes = new_keys_bytes;
+        nh.count = new_count;
+        nh.skip = new_skip;
+        nh.flags = 1 | (has_eos ? 2 : 0);  // is_compact=1
+        
+        // Copy old prefix + LCP extension
+        uint8_t* new_prefix = reinterpret_cast<uint8_t*>(new_node + header_u64());
+        if (h.skip > 0) {
+            const uint8_t* old_prefix = reinterpret_cast<const uint8_t*>(node + header_u64());
+            std::memcpy(new_prefix, old_prefix, h.skip);
+        }
+        std::memcpy(new_prefix + h.skip, suffix, lcp);
+        
+        // Store EOS
+        if (has_eos) {
+            VST* eos = reinterpret_cast<VST*>(new_node + header_and_prefix_u64(new_skip));
+            if (new_eos_slot) {
+                *eos = eos_value;
+            } else {
+                *eos = eos_slot(node, h.skip);  // Copy from old node
+            }
+        }
+        
+        // Build data region
+        uint8_t* new_data = reinterpret_cast<uint8_t*>(new_node) +
+                            data_offset_u64(new_skip, has_eos) * 8;
+        
+        // Precompute offsets and prefixes
+        std::vector<uint32_t> offsets(new_count);
+        std::vector<E> prefixes(new_count);
+        std::vector<uint32_t> prefix_start(new_count);
+        
+        uint32_t off = 0;
+        for (uint16_t i = 0; i < new_count; ++i) {
+            offsets[i] = off;
+            
+            ES es;
+            es.setkey(reinterpret_cast<const char*>(entries[i].suffix),
+                     static_cast<int>(entries[i].len));
+            es.setoff(0);
+            prefixes[i] = cvt(es);
+            
+            if (i == 0 || prefixes[i] != prefixes[i-1]) {
+                prefix_start[i] = i;
+            } else {
+                prefix_start[i] = prefix_start[i-1];
+            }
+            
+            off += 2 + entries[i].len;
+        }
+        
+        // Build keys array
+        uint8_t* new_keys = new_data + keys_off(new_count, new_ec);
+        uint8_t* kp_out = new_keys;
+        for (const auto& e : entries) {
+            write_u16(kp_out, static_cast<uint16_t>(e.len));
+            std::memcpy(kp_out + 2, e.suffix, e.len);
+            kp_out += 2 + e.len;
+        }
+        
+        // Build idx array
+        E* new_idx = reinterpret_cast<E*>(new_data + idx_off(new_ec));
+        for (int i = 0; i < new_ic; ++i) {
+            int k = i * 8;
+            uint32_t k_off = offsets[k];
+            
+            ES es;
+            es.setkey(reinterpret_cast<const char*>(entries[k].suffix),
+                     static_cast<int>(entries[k].len));
+            es.setoff(static_cast<uint16_t>(k_off));
+            new_idx[i] = cvt(es);
+        }
+        
+        // Build hot array
+        E* new_hot = reinterpret_cast<E*>(new_data + hot_off());
+        if (new_ec > 0) {
+            build_eyt(new_idx, new_ic, new_hot);
+        } else {
+            new_hot[0] = E{};
+        }
+        
+        // Copy values
+        VST* new_values = reinterpret_cast<VST*>(
+            new_data + values_off(new_count, new_keys_bytes, new_ec));
+        for (uint16_t i = 0; i < new_count; ++i) {
+            new_values[i] = entries[i].slot;
+        }
+        
+        // Deallocate old node
+        int old_ic = idx_count(h.count);
+        int old_W = calc_W(old_ic);
+        int old_ec = old_W > 0 ? old_W - 1 : 0;
+        std::size_t old_data_size = values_off(h.count, h.keys_bytes, old_ec) +
+                                    h.count * sizeof(VST);
+        std::size_t old_node_u64 = data_offset_u64(h.skip, h.has_eos()) +
+                                   (old_data_size + 7) / 8;
+        free_node(node);
         
         return new_node;
     }
@@ -1243,6 +1692,29 @@ private:
     InsertResult compact_split_to_bitmap(uint64_t* node, NodeHeader h,
                                          const uint8_t* suffix, uint32_t suffix_len,
                                          const VALUE& value) {
+        // This is the legacy function - redirect to the new flow
+        // First insert, then check and split if needed
+        auto [found, pos] = compact_search_position(node, h, suffix, suffix_len);
+        if (found) {
+            compact_update_value(node, h, pos, value);
+            return {node, false};
+        }
+        
+        uint64_t* new_node = compact_insert_at(node, h, suffix, suffix_len, value, pos);
+        NodeHeader new_h = hdr(new_node);
+        
+        CompressedResult result = check_compress(new_node);
+        if (result == CompressedResult::OK) {
+            return {new_node, true};
+        }
+        
+        uint64_t* split_node = compact_split_to_bitmap_node(new_node, new_h);
+        return {split_node, true};
+    }
+
+    // Split an existing compact node into a bitmap node
+    // Called when check_compress returns TOO_BIG or TOO_MANY
+    uint64_t* compact_split_to_bitmap_node(uint64_t* node, NodeHeader h) {
         // Get existing data pointers
         const uint8_t* data = reinterpret_cast<const uint8_t*>(node) +
                               data_offset_u64(h.skip, h.has_eos()) * 8;
@@ -1251,98 +1723,148 @@ private:
         int ec = W > 0 ? W - 1 : 0;
         
         const uint8_t* keys = data + keys_off(h.count, ec);
-        const VST* values = reinterpret_cast<const VST*>(
+        const VST* old_values = reinterpret_cast<const VST*>(
             data + values_off(h.count, h.keys_bytes, ec));
         
-        // Use fixed-size arrays (max entries per bucket = COMPACT_MAX+1/alphabet_size)
-        // For safety, use vectors
-        std::vector<BucketEntry> buckets[256];
-        std::vector<VST> bucket_eos[256];  // EOS values for each bucket
+        // Step 1: Collect all entries into a single vector
+        std::vector<BucketEntry> all_entries;
+        all_entries.reserve(h.count);
         
-        // Bucket existing entries by first byte
         const uint8_t* kp = keys;
         for (uint16_t i = 0; i < h.count; ++i) {
             uint16_t klen = read_u16(kp);
             const uint8_t* kdata = kp + 2;
-            
-            uint8_t first_byte = kdata[0];
-            if (klen == 1) {
-                // After stripping first byte, becomes EOS
-                bucket_eos[first_byte].push_back(values[i]);
-            } else {
-                buckets[first_byte].push_back({kdata + 1, static_cast<uint32_t>(klen - 1), values[i]});
-            }
+            all_entries.push_back({kdata, klen, old_values[i]});
             kp = key_next(kp);
         }
         
-        // Add new entry
-        uint8_t new_first = suffix[0];
-        if (suffix_len == 1) {
-            bucket_eos[new_first].push_back(VT::store(value));
-        } else {
-            buckets[new_first].push_back({suffix + 1, suffix_len - 1, VT::store(value)});
+        // Step 2: Compute LCP (longest common prefix) of all entries
+        uint32_t lcp = 0;
+        if (!all_entries.empty()) {
+            lcp = all_entries[0].len;
+            for (size_t i = 1; i < all_entries.size() && lcp > 0; ++i) {
+                uint32_t max_cmp = std::min(lcp, all_entries[i].len);
+                uint32_t j = 0;
+                while (j < max_cmp && all_entries[0].suffix[j] == all_entries[i].suffix[j]) {
+                    ++j;
+                }
+                lcp = j;
+            }
         }
         
-        // Build bitmap and count children
+        // Step 3: Strip LCP and bucket by first remaining byte
+        std::vector<BucketEntry> buckets[256];
+        std::vector<VST> bucket_eos[256];
+        
+        // Handle entries that exactly matched LCP (they become parent EOS)
+        bool has_new_eos = false;
+        VST new_eos_slot{};
+        
+        for (auto& e : all_entries) {
+            if (e.len == lcp) {
+                // Entry exhausted by LCP - becomes parent EOS
+                has_new_eos = true;
+                new_eos_slot = e.slot;
+            } else {
+                uint8_t first = e.suffix[lcp];
+                uint32_t remaining = e.len - lcp - 1;
+                if (remaining == 0) {
+                    bucket_eos[first].push_back(e.slot);
+                } else {
+                    buckets[first].push_back({e.suffix + lcp + 1, remaining, e.slot});
+                }
+            }
+        }
+        
+        // Step 4: Count buckets and SORT them
         Bitmap bm{};
         int top_count = 0;
         for (int b = 0; b < 256; ++b) {
             if (!buckets[b].empty() || !bucket_eos[b].empty()) {
                 bm.set_bit(static_cast<uint8_t>(b));
                 top_count++;
+                
+                // Sort the bucket entries
+                if (buckets[b].size() > 1) {
+                    std::sort(buckets[b].begin(), buckets[b].end(),
+                        [](const BucketEntry& a, const BucketEntry& b) {
+                            uint32_t min_len = std::min(a.len, b.len);
+                            int cmp = std::memcmp(a.suffix, b.suffix, min_len);
+                            if (cmp != 0) return cmp < 0;
+                            return a.len < b.len;
+                        });
+                }
             }
         }
         
-        // Allocate new bitmap node
-        std::size_t new_node_u64 = data_offset_u64(h.skip, h.has_eos()) + 
+        // Step 5: Create new node
+        // New skip = old skip + lcp
+        uint8_t new_skip = h.skip + static_cast<uint8_t>(lcp);
+        bool has_parent_eos = h.has_eos() || has_new_eos;
+        
+        // Allocate bitmap node
+        std::size_t new_node_u64 = data_offset_u64(new_skip, has_parent_eos) + 
                                    BITMAP_U64 + top_count;
         uint64_t* new_node = alloc_node(new_node_u64);
         
-        // Copy header (converted to bitmap)
+        // Set header
         NodeHeader& nh = hdr(new_node);
         nh.keys_bytes = 0;
-        nh.count = h.count + 1;
-        nh.skip = h.skip;
-        nh.flags = h.has_eos() ? 2 : 0;  // is_compact=0, preserve has_eos
+        nh.count = 0;  // bitmap nodes don't use count
+        nh.skip = new_skip;
+        nh.flags = has_parent_eos ? 2 : 0;  // is_compact=0
         
-        // Copy prefix if any
+        // Copy/extend prefix
+        uint8_t* new_prefix = reinterpret_cast<uint8_t*>(new_node + header_u64());
         if (h.skip > 0) {
-            std::memcpy(new_node + header_u64(), node + header_u64(), 
-                       prefix_u64(h.skip) * 8);
+            const uint8_t* old_prefix = reinterpret_cast<const uint8_t*>(node + header_u64());
+            std::memcpy(new_prefix, old_prefix, h.skip);
+        }
+        // Add LCP bytes from first entry
+        if (lcp > 0 && !all_entries.empty()) {
+            std::memcpy(new_prefix + h.skip, all_entries[0].suffix, lcp);
         }
         
-        // Copy parent EOS if any (this is different from bucket EOS)
-        if (h.has_eos()) {
-            const VST& old_eos = eos_slot(node, h.skip);
-            VST* new_eos = reinterpret_cast<VST*>(
-                new_node + header_and_prefix_u64(h.skip));
-            *new_eos = old_eos;
+        // Store EOS if present
+        if (has_parent_eos) {
+            VST* eos = reinterpret_cast<VST*>(new_node + header_and_prefix_u64(new_skip));
+            if (has_new_eos) {
+                *eos = new_eos_slot;
+            } else {
+                *eos = eos_slot(node, h.skip);  // Copy from old node
+            }
         }
         
         // Set bitmap
         Bitmap& new_bm = *reinterpret_cast<Bitmap*>(
-            new_node + data_offset_u64(h.skip, h.has_eos()));
+            new_node + data_offset_u64(new_skip, has_parent_eos));
         new_bm = bm;
         
-        // Create children
+        // Step 6: Create children
         uint64_t* children = const_cast<uint64_t*>(
-            bm_children(new_node, h.skip, h.has_eos()));
+            bm_children(new_node, new_skip, has_parent_eos));
         
         int slot = 0;
         for (int b = 0; b < 256; ++b) {
             if (buckets[b].empty() && bucket_eos[b].empty()) continue;
             
             uint64_t* child;
-            bool has_eos = !bucket_eos[b].empty();
-            auto& entries = buckets[b];
+            bool child_has_eos = !bucket_eos[b].empty();
             
-            if (entries.empty()) {
+            if (buckets[b].empty()) {
                 // EOS-only child
                 child = create_eos_only_node_from_slot(bucket_eos[b][0]);
             } else {
-                // Build compact node from entries
-                child = create_compact_from_entries(entries, 
-                    has_eos ? &bucket_eos[b][0] : nullptr);
+                // Create compact node - entries already stripped of LCP+bucket_byte
+                child = create_compact_from_entries(buckets[b],
+                    child_has_eos ? &bucket_eos[b][0] : nullptr);
+                
+                // Verify child is OK
+                if (hdr(child).is_compact()) {
+                    CompressedResult child_result = check_compress(child);
+                    assert(child_result == CompressedResult::OK && 
+                           "SPLIT_CHILD_BAD: child after split is not OK");
+                }
             }
             
             children[slot++] = reinterpret_cast<uint64_t>(child);
@@ -1350,14 +1872,13 @@ private:
         
         // Deallocate old node (don't destroy values, they were moved)
         std::size_t old_data_size = values_off(h.count, h.keys_bytes, ec) +
-                                    align8(h.count * sizeof(VST));
+                                    h.count * sizeof(VST);
         std::size_t old_node_u64 = data_offset_u64(h.skip, h.has_eos()) + 
                                    (old_data_size + 7) / 8;
-        dealloc_node(node, old_node_u64);
+        free_node(node);
         
-        return {new_node, true};
+        return new_node;
     }
-
     // Add new child to bitmap node for given byte
     InsertResult bitmap_add_child(uint64_t* node, NodeHeader h, uint8_t byte,
                                   const uint8_t* key_data, uint32_t key_len,
@@ -1388,7 +1909,7 @@ private:
         
         // Copy header
         NodeHeader& nh = hdr(new_node);
-        nh = h;
+        nh.copy_from(h);
         
         // Copy prefix if any
         if (h.skip > 0) {
@@ -1426,7 +1947,7 @@ private:
         // Deallocate old node
         std::size_t old_node_u64 = data_offset_u64(h.skip, h.has_eos()) + 
                                    BITMAP_U64 + old_top_count;
-        dealloc_node(node, old_node_u64);
+        free_node(node);
         
         return {new_node, true};
     }
@@ -1443,14 +1964,14 @@ private:
             std::size_t new_data_off = data_offset_u64(h.skip, true);
             
             std::size_t data_size = values_off(h.count, h.keys_bytes, ec) + 
-                                    align8(h.count * sizeof(VST));
+                                    h.count * sizeof(VST);
             
             std::size_t new_node_u64 = new_data_off + (data_size + 7) / 8;
             uint64_t* new_node = alloc_node(new_node_u64);
             
             // Copy header with has_eos set
             NodeHeader& nh = hdr(new_node);
-            nh = h;
+            nh.copy_from(h);
             nh.flags |= 2;
             
             // Copy prefix
@@ -1474,7 +1995,7 @@ private:
                 std::memcpy(new_data, old_data, data_size);
             }
             
-            dealloc_node(node, old_data_off + (data_size + 7) / 8);
+            free_node(node);
             return {new_node, true};
             
         } else {
@@ -1492,7 +2013,7 @@ private:
             
             // Copy header with has_eos set
             NodeHeader& nh = hdr(new_node);
-            nh = h;
+            nh.copy_from(h);
             nh.flags |= 2;
             
             // Copy prefix
@@ -1512,7 +2033,7 @@ private:
                        node + old_data_off,
                        bitmap_and_children_u64 * 8);
             
-            dealloc_node(node, old_data_off + bitmap_and_children_u64);
+            free_node(node);
             return {new_node, true};
         }
     }
@@ -1522,6 +2043,13 @@ private:
                               const uint8_t* key_data, uint32_t key_len,
                               const VALUE& value, uint32_t consumed,
                               uint32_t match_len) {
+        // If node is compact, stay compact
+        if (h.is_compact()) {
+            return compact_split_on_prefix(node, h, key_data, key_len, 
+                                           value, consumed, match_len);
+        }
+        
+        // Bitmap node - split as before
         const uint8_t* old_prefix = node_prefix(node);
         uint32_t old_skip = h.skip_bytes();
         uint32_t remaining_key = key_len - consumed;
@@ -1545,7 +2073,7 @@ private:
         // Set up parent header
         NodeHeader& ph = hdr(parent);
         ph.keys_bytes = 0;
-        ph.count = 0;  // Will be updated later
+        ph.count = 0;
         ph.skip = parent_skip;
         ph.flags = parent_has_eos ? 2 : 0;  // is_bitmap=0
         
@@ -1594,63 +2122,269 @@ private:
             pchildren[new_slot] = reinterpret_cast<uint64_t>(new_child);
         }
         
-        // Free original node
-        destroy_tree(node);
+        // Free original node ONLY (not children - they were moved to clone)
+        const Bitmap& bm = bm_bitmap(node, h.skip, h.has_eos());
+        int top_count = bm.popcount();
+        std::size_t node_u64 = data_offset_u64(h.skip, h.has_eos()) +
+                               BITMAP_U64 + top_count;
+        free_node(node);
         
         return {parent, true};
+    }
+    
+    // Split compact node at prefix mismatch - stays compact
+    InsertResult compact_split_on_prefix(uint64_t* node, NodeHeader h,
+                                         const uint8_t* key_data, uint32_t key_len,
+                                         const VALUE& value, uint32_t consumed,
+                                         uint32_t match_len) {
+        const uint8_t* old_prefix = node_prefix(node);
+        uint32_t old_skip = h.skip_bytes();
+        
+        // Gather all entries with old_prefix[match_len:] prepended
+        std::vector<BucketEntry> entries;
+        entries.reserve(h.count + 2);  // existing + maybe old EOS + new
+        
+        // Suffix to prepend to all existing keys: old_prefix[match_len:]
+        const uint8_t* prepend = old_prefix + match_len;
+        uint32_t prepend_len = old_skip - match_len;
+        
+        // Get existing data
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(node) +
+                              data_offset_u64(h.skip, h.has_eos()) * 8;
+        int ic = idx_count(h.count);
+        int W = calc_W(ic);
+        int ec = W > 0 ? W - 1 : 0;
+        
+        const uint8_t* keys = data + keys_off(h.count, ec);
+        const VST* old_values = reinterpret_cast<const VST*>(
+            data + values_off(h.count, h.keys_bytes, ec));
+        
+        // Allocate buffers for prepended keys
+        std::vector<std::vector<uint8_t>> key_buffers;
+        key_buffers.reserve(h.count + 2);
+        
+        // Add existing entries with prepended prefix
+        const uint8_t* kp = keys;
+        for (uint16_t i = 0; i < h.count; ++i) {
+            uint16_t klen = read_u16(kp);
+            const uint8_t* kdata = kp + 2;
+            
+            key_buffers.emplace_back(prepend_len + klen);
+            std::memcpy(key_buffers.back().data(), prepend, prepend_len);
+            std::memcpy(key_buffers.back().data() + prepend_len, kdata, klen);
+            
+            entries.push_back({key_buffers.back().data(), 
+                              prepend_len + klen, old_values[i]});
+            kp = key_next(kp);
+        }
+        
+        // If old node had EOS, it becomes an entry with key = prepend
+        if (h.has_eos()) {
+            key_buffers.emplace_back(prepend, prepend + prepend_len);
+            entries.push_back({key_buffers.back().data(),
+                              prepend_len, eos_slot(node, h.skip)});
+        }
+        
+        // Add new entry: key_data[consumed+match_len:]
+        uint32_t new_suffix_len = key_len - consumed - match_len;
+        if (new_suffix_len > 0) {
+            entries.push_back({key_data + consumed + match_len, 
+                              new_suffix_len, VT::store(value)});
+        }
+        
+        // Check if new key becomes EOS (exhausted at match_len)
+        bool new_is_eos = (new_suffix_len == 0);
+        VST new_eos_slot{};
+        if (new_is_eos) {
+            new_eos_slot = VT::store(value);
+        }
+        
+        // Compute LCP of all entries
+        uint32_t lcp = entries.empty() ? 0 : entries[0].len;
+        for (size_t i = 1; i < entries.size() && lcp > 0; ++i) {
+            uint32_t max_cmp = std::min(lcp, entries[i].len);
+            uint32_t j = 0;
+            while (j < max_cmp && entries[0].suffix[j] == entries[i].suffix[j]) {
+                ++j;
+            }
+            lcp = j;
+        }
+        
+        // Handle entries exhausted by LCP (become EOS)
+        bool has_eos = new_is_eos;
+        VST eos_value = new_eos_slot;
+        
+        std::vector<BucketEntry> final_entries;
+        for (auto& e : entries) {
+            if (e.len == lcp) {
+                has_eos = true;
+                eos_value = e.slot;
+            } else {
+                final_entries.push_back({e.suffix + lcp, e.len - lcp, e.slot});
+            }
+        }
+        
+        // Sort entries
+        std::sort(final_entries.begin(), final_entries.end(),
+            [](const BucketEntry& a, const BucketEntry& b) {
+                uint32_t min_len = std::min(a.len, b.len);
+                int cmp = std::memcmp(a.suffix, b.suffix, min_len);
+                if (cmp != 0) return cmp < 0;
+                return a.len < b.len;
+            });
+        
+        // Build new node
+        // New skip = old_prefix[0:match_len] + lcp bytes from entries
+        uint32_t new_skip = match_len + lcp;
+        
+        uint32_t new_keys_bytes = 0;
+        for (const auto& e : final_entries) {
+            new_keys_bytes += 2 + e.len;
+        }
+        
+        uint16_t new_count = static_cast<uint16_t>(final_entries.size());
+        int new_ic = idx_count(new_count);
+        int new_W = calc_W(new_ic);
+        int new_ec = new_W > 0 ? new_W - 1 : 0;
+        
+        std::size_t new_data_size = values_off(new_count, new_keys_bytes, new_ec) +
+                                    new_count * sizeof(VST);
+        std::size_t new_node_u64 = data_offset_u64(static_cast<uint8_t>(new_skip), has_eos) +
+                                   (new_data_size + 7) / 8;
+        
+        uint64_t* new_node = alloc_node(new_node_u64);
+        
+        // Set header
+        NodeHeader& nh = hdr(new_node);
+        nh.keys_bytes = new_keys_bytes;
+        nh.count = new_count;
+        nh.skip = static_cast<uint8_t>(new_skip);
+        nh.flags = 1 | (has_eos ? 2 : 0);  // is_compact=1
+        
+        // Copy prefix: old_prefix[0:match_len] + entries[0].suffix[0:lcp]
+        uint8_t* new_prefix_ptr = reinterpret_cast<uint8_t*>(new_node + header_u64());
+        if (match_len > 0) {
+            std::memcpy(new_prefix_ptr, old_prefix, match_len);
+        }
+        if (lcp > 0 && !entries.empty()) {
+            std::memcpy(new_prefix_ptr + match_len, entries[0].suffix, lcp);
+        }
+        
+        // Store EOS
+        if (has_eos) {
+            VST* eos = reinterpret_cast<VST*>(
+                new_node + header_and_prefix_u64(static_cast<uint8_t>(new_skip)));
+            *eos = eos_value;
+        }
+        
+        // Build data region
+        uint8_t* new_data = reinterpret_cast<uint8_t*>(new_node) +
+                            data_offset_u64(static_cast<uint8_t>(new_skip), has_eos) * 8;
+        
+        // Precompute offsets and prefixes
+        std::vector<uint32_t> offsets(new_count);
+        std::vector<E> prefixes(new_count);
+        std::vector<uint32_t> prefix_start(new_count);
+        
+        uint32_t off = 0;
+        for (uint16_t i = 0; i < new_count; ++i) {
+            offsets[i] = off;
+            
+            ES es;
+            es.setkey(reinterpret_cast<const char*>(final_entries[i].suffix),
+                     static_cast<int>(final_entries[i].len));
+            es.setoff(0);
+            prefixes[i] = cvt(es);
+            
+            if (i == 0 || prefixes[i] != prefixes[i-1]) {
+                prefix_start[i] = i;
+            } else {
+                prefix_start[i] = prefix_start[i-1];
+            }
+            
+            off += 2 + final_entries[i].len;
+        }
+        
+        // Build keys array
+        uint8_t* new_keys = new_data + keys_off(new_count, new_ec);
+        uint8_t* kp_out = new_keys;
+        for (const auto& e : final_entries) {
+            write_u16(kp_out, static_cast<uint16_t>(e.len));
+            std::memcpy(kp_out + 2, e.suffix, e.len);
+            kp_out += 2 + e.len;
+        }
+        
+        // Build idx array
+        E* new_idx = reinterpret_cast<E*>(new_data + idx_off(new_ec));
+        for (int i = 0; i < new_ic; ++i) {
+            int k = i * 8;
+            uint32_t k_off = offsets[k];
+            
+            ES es;
+            es.setkey(reinterpret_cast<const char*>(final_entries[k].suffix),
+                     static_cast<int>(final_entries[k].len));
+            es.setoff(static_cast<uint16_t>(k_off));
+            new_idx[i] = cvt(es);
+        }
+        
+        // Build hot array
+        E* new_hot = reinterpret_cast<E*>(new_data + hot_off());
+        if (new_ec > 0) {
+            build_eyt(new_idx, new_ic, new_hot);
+        } else {
+            new_hot[0] = E{};
+        }
+        
+        // Copy values
+        VST* new_values = reinterpret_cast<VST*>(
+            new_data + values_off(new_count, new_keys_bytes, new_ec));
+        for (uint16_t i = 0; i < new_count; ++i) {
+            new_values[i] = final_entries[i].slot;
+        }
+        
+        // Deallocate old node - must match allocation formula
+        std::size_t old_data_size = (h.count > 0) ?
+            (values_off(h.count, h.keys_bytes, ec) + h.count * sizeof(VST)) : 0;
+        std::size_t old_node_u64 = data_offset_u64(h.skip, h.has_eos()) +
+                                   (old_data_size + 7) / 8;
+        free_node(node);
+        
+        return {new_node, true};
     }
 
     // Create a compact leaf with a single entry
     uint64_t* create_leaf_with_entry(const uint8_t* suffix, uint32_t suffix_len,
                                      const VALUE& value) {
-        uint16_t count = 1;
-        uint32_t keys_bytes = 2 + suffix_len;
+        // Put entire suffix into skip, with EOS=true and count=0
+        // This maximizes skip compression
+        // For count=0: just header + prefix + eos slot, no data region
+        uint8_t skip = static_cast<uint8_t>(suffix_len);
         
-        int ic = idx_count(count);  // 1
-        int W = calc_W(ic);         // 0
-        int ec = W > 0 ? W - 1 : 0; // 0
-        
-        std::size_t data_size = values_off(count, keys_bytes, ec) + 
-                                align8(count * sizeof(VST));
-        std::size_t node_u64 = header_u64() + (data_size + 7) / 8;
-        
+        std::size_t node_u64 = data_offset_u64(skip, true);  // header + prefix + eos
         uint64_t* node = alloc_node(node_u64);
         
         NodeHeader& nh = hdr(node);
-        nh.keys_bytes = keys_bytes;
-        nh.count = count;
-        nh.skip = 0;
-        nh.flags = 1;  // is_compact=1
+        nh.keys_bytes = 0;
+        nh.count = 0;
+        nh.skip = skip;
+        nh.flags = 0b11;  // is_compact=1, has_eos=1
         
-        uint8_t* data = reinterpret_cast<uint8_t*>(node) + header_u64() * 8;
+        // Copy suffix into skip prefix
+        if (suffix_len > 0) {
+            std::memcpy(node + header_u64(), suffix, suffix_len);
+        }
         
-        // Hot array (slot 0 unused for ec=0)
-        E* hot = reinterpret_cast<E*>(data + hot_off());
-        hot[0] = E{};
-        
-        // Idx array
-        E* idx = reinterpret_cast<E*>(data + idx_off(ec));
-        ES es;
-        es.setkey(reinterpret_cast<const char*>(suffix), static_cast<int>(suffix_len));
-        es.setoff(0);
-        idx[0] = cvt(es);
-        
-        // Keys: [uint16_t len][bytes]
-        uint8_t* keys = data + keys_off(count, ec);
-        write_u16(keys, static_cast<uint16_t>(suffix_len));
-        std::memcpy(keys + 2, suffix, suffix_len);
-        
-        // Values
-        VST* values = reinterpret_cast<VST*>(data + values_off(count, keys_bytes, ec));
-        values[0] = VT::store(value);
+        // Store EOS value
+        VST* eos = reinterpret_cast<VST*>(node + header_and_prefix_u64(skip));
+        *eos = VT::store(value);
         
         return node;
     }
 
     // Create an EOS-only node (no entries, just a value)
     uint64_t* create_eos_only_node(const VALUE& value) {
-        // Layout: [Header: 8B][EOS value: align8(sizeof(VST))]
-        std::size_t node_u64 = header_u64() + eos_u64<VST>();
+        // For count=0 EOS-only node: just header + eos slot, no data region
+        std::size_t node_u64 = data_offset_u64(0, true);  // header + eos
         uint64_t* node = alloc_node(node_u64);
         
         NodeHeader& h = hdr(node);
@@ -1668,7 +2402,8 @@ private:
     
     // Helper: create EOS-only node from existing slot (no copy)
     uint64_t* create_eos_only_node_from_slot(VST slot) {
-        std::size_t node_u64 = header_u64() + eos_u64<VST>();
+        // For count=0 EOS-only node: just header + eos slot, no data region
+        std::size_t node_u64 = data_offset_u64(0, true);  // header + eos
         uint64_t* node = alloc_node(node_u64);
         
         NodeHeader& h = hdr(node);
@@ -1693,86 +2428,149 @@ private:
     // Helper: create compact node from entries (already sorted)
     uint64_t* create_compact_from_entries(const std::vector<BucketEntry>& entries,
                                           const VST* eos_slot) {
-        uint16_t count = static_cast<uint16_t>(entries.size());
-        bool has_eos = (eos_slot != nullptr);
+        if (entries.empty()) {
+            // EOS-only node
+            bool has_eos = (eos_slot != nullptr);
+            std::size_t node_u64 = data_offset_u64(0, has_eos);
+            uint64_t* node = alloc_node(node_u64);
+            
+            NodeHeader& nh = hdr(node);
+            nh.keys_bytes = 0;
+            nh.count = 0;
+            nh.skip = 0;
+            nh.flags = 1 | (has_eos ? 2 : 0);
+            
+            if (has_eos) {
+                VST* eos = reinterpret_cast<VST*>(node + header_u64());
+                *eos = *eos_slot;
+            }
+            return node;
+        }
         
-        // Calculate keys_bytes
+        // Step 1: Compute LCP of all entries (max skip)
+        uint32_t lcp = entries[0].len;
+        for (size_t i = 1; i < entries.size() && lcp > 0; ++i) {
+            uint32_t min_len = std::min(lcp, entries[i].len);
+            uint32_t match = 0;
+            while (match < min_len && 
+                   entries[0].suffix[match] == entries[i].suffix[match]) {
+                ++match;
+            }
+            lcp = match;
+        }
+        
+        // Cap at 255 (max skip)
+        if (lcp > 255) lcp = 255;
+        
+        // Step 2: Check if any entries become EOS after stripping LCP
+        bool has_eos = (eos_slot != nullptr);
+        VST internal_eos{};
+        for (const auto& e : entries) {
+            if (e.len == lcp) {
+                has_eos = true;
+                internal_eos = e.slot;
+                break;
+            }
+        }
+        
+        // Step 3: Count non-EOS entries and compute keys_bytes after stripping
+        uint16_t count = 0;
         uint32_t keys_bytes = 0;
         for (const auto& e : entries) {
-            keys_bytes += 2 + e.len;
+            if (e.len > lcp) {
+                count++;
+                keys_bytes += 2 + (e.len - lcp);
+            }
         }
+        
+        uint8_t skip = static_cast<uint8_t>(lcp);
         
         int ic = idx_count(count);
         int W = calc_W(ic);
         int ec = W > 0 ? W - 1 : 0;
         
-        std::size_t data_size = values_off(count, keys_bytes, ec) + 
-                                align8(count * sizeof(VST));
-        std::size_t node_u64 = data_offset_u64(0, has_eos) + (data_size + 7) / 8;
+        std::size_t data_size = (count > 0) ? 
+            (values_off(count, keys_bytes, ec) + count * sizeof(VST)) : 0;
+        std::size_t node_u64 = data_offset_u64(skip, has_eos) + (data_size + 7) / 8;
         
         uint64_t* node = alloc_node(node_u64);
         
         NodeHeader& nh = hdr(node);
         nh.keys_bytes = keys_bytes;
         nh.count = count;
-        nh.skip = 0;
+        nh.skip = skip;
         nh.flags = 1 | (has_eos ? 2 : 0);
+        
+        // Copy skip prefix
+        if (skip > 0) {
+            std::memcpy(node + header_u64(), entries[0].suffix, skip);
+        }
         
         // Store EOS if present
         if (has_eos) {
-            VST* eos = reinterpret_cast<VST*>(node + header_u64());
-            *eos = *eos_slot;
+            VST* eos = reinterpret_cast<VST*>(node + header_and_prefix_u64(skip));
+            *eos = eos_slot ? *eos_slot : internal_eos;
+        }
+        
+        if (count == 0) {
+            return node;
         }
         
         uint8_t* data = reinterpret_cast<uint8_t*>(node) + 
-                        data_offset_u64(0, has_eos) * 8;
+                        data_offset_u64(skip, has_eos) * 8;
+        
+        // Build stripped entries list (suffix after LCP)
+        std::vector<BucketEntry> stripped;
+        stripped.reserve(count);
+        for (const auto& e : entries) {
+            if (e.len > lcp) {
+                stripped.push_back({e.suffix + lcp, e.len - lcp, e.slot});
+            }
+        }
+        
+        // Precompute offsets, prefixes, and prefix_start in O(n)
+        std::vector<uint32_t> offsets(count);
+        std::vector<E> prefixes(count);
+        std::vector<uint32_t> prefix_start(count);
+        
+        uint32_t off = 0;
+        for (uint16_t i = 0; i < count; ++i) {
+            offsets[i] = off;
+            
+            ES es;
+            es.setkey(reinterpret_cast<const char*>(stripped[i].suffix),
+                     static_cast<int>(stripped[i].len));
+            es.setoff(0);
+            prefixes[i] = cvt(es);
+            
+            if (i == 0 || prefixes[i] != prefixes[i-1]) {
+                prefix_start[i] = i;
+            } else {
+                prefix_start[i] = prefix_start[i-1];
+            }
+            
+            off += 2 + stripped[i].len;
+        }
         
         // Build keys array
         uint8_t* keys = data + keys_off(count, ec);
         uint8_t* kp = keys;
-        for (const auto& e : entries) {
+        for (const auto& e : stripped) {
             write_u16(kp, static_cast<uint16_t>(e.len));
             std::memcpy(kp + 2, e.suffix, e.len);
             kp += 2 + e.len;
         }
         
-        // Build idx array
+        // Build idx array in O(ic) using precomputed data
         E* idx = reinterpret_cast<E*>(data + idx_off(ec));
-        uint32_t offset = 0;
         for (int i = 0; i < ic; ++i) {
             int k = i * 8;
-            // Walk back to find first key with same E prefix
+            uint32_t k_off = offsets[k];
+            
             ES es;
-            es.setkey(reinterpret_cast<const char*>(entries[k].suffix),
-                     static_cast<int>(entries[k].len));
-            E prefix = cvt(es);
-            prefix[1] &= ~uint64_t(0xFFFF);  // Clear offset bits for comparison
-            
-            int first_k = k;
-            uint32_t first_offset = offset;
-            // Compute offset for entry k
-            for (int j = 0; j < k; ++j) {
-                first_offset = 0;
-            }
-            // Actually need to track offsets properly
-            uint32_t off = 0;
-            for (int j = 0; j < k; ++j) {
-                off += 2 + entries[j].len;
-            }
-            
-            // Check if earlier entries have same prefix
-            while (first_k > 0) {
-                ES es2;
-                es2.setkey(reinterpret_cast<const char*>(entries[first_k - 1].suffix),
-                          static_cast<int>(entries[first_k - 1].len));
-                E prev_prefix = cvt(es2);
-                prev_prefix[1] &= ~uint64_t(0xFFFF);
-                if (prev_prefix != prefix) break;
-                first_k--;
-                off -= 2 + entries[first_k].len;
-            }
-            
-            es.setoff(static_cast<uint16_t>(off));
+            es.setkey(reinterpret_cast<const char*>(stripped[k].suffix),
+                     static_cast<int>(stripped[k].len));
+            es.setoff(static_cast<uint16_t>(k_off));
             idx[i] = cvt(es);
         }
         
@@ -1787,7 +2585,7 @@ private:
         // Copy values
         VST* values = reinterpret_cast<VST*>(data + values_off(count, keys_bytes, ec));
         for (uint16_t i = 0; i < count; ++i) {
-            values[i] = entries[i].slot;
+            values[i] = stripped[i].slot;
         }
         
         return node;
@@ -1804,14 +2602,14 @@ private:
             int ec = W > 0 ? W - 1 : 0;
             
             std::size_t old_data_size = values_off(h.count, h.keys_bytes, ec) +
-                                        align8(h.count * sizeof(VST));
+                                        h.count * sizeof(VST);
             
             std::size_t new_node_u64 = data_offset_u64(new_skip_byte, h.has_eos()) +
                                        (old_data_size + 7) / 8;
             uint64_t* new_node = alloc_node(new_node_u64);
             
             NodeHeader& nh = hdr(new_node);
-            nh = h;
+            nh.copy_from(h);
             nh.skip = new_skip_byte;
             
             // Copy new prefix
@@ -1846,7 +2644,7 @@ private:
             uint64_t* new_node = alloc_node(new_node_u64);
             
             NodeHeader& nh = hdr(new_node);
-            nh = h;
+            nh.copy_from(h);
             nh.skip = new_skip_byte;
             
             // Copy new prefix
