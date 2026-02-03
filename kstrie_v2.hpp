@@ -382,11 +382,8 @@ inline std::size_t values_off(uint16_t N, uint32_t keys_bytes, int ec) noexcept 
 
 // Get offset from E (stored in low 16 bits of k[1])
 inline uint16_t e_offset(const E& e) noexcept {
-    if constexpr (std::endian::native == std::endian::little) {
-        return static_cast<uint16_t>(std::byteswap(e[1]) & 0xFFFF);
-    } else {
-        return static_cast<uint16_t>(e[1] & 0xFFFF);
-    }
+    // After cvt(), offset is in low 16 bits of e[1] (cvt already handled endianness)
+    return static_cast<uint16_t>(e[1] & 0xFFFF);
 }
 
 // ============================================================================
@@ -396,21 +393,32 @@ inline uint16_t e_offset(const E& e) noexcept {
 template <class T>
 static int makecmp(T a, T b) noexcept { return (a < b) ? -1 : (a > b) ? 1 : 0; }
 
+// Unaligned uint16_t access helpers
+static uint16_t read_u16(const uint8_t* p) noexcept {
+    uint16_t v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+static void write_u16(uint8_t* p, uint16_t v) noexcept {
+    std::memcpy(p, &v, sizeof(v));
+}
+
 // Compare packed key against search key
 // keys[] format: [uint16_t len][bytes...]
 static int key_cmp(const uint8_t* kp, const uint8_t* search, uint32_t search_len) noexcept {
-    uint32_t klen = *reinterpret_cast<const uint16_t*>(kp);
+    uint16_t klen = read_u16(kp);
     const uint8_t* kdata = kp + 2;
     
     uint32_t min_len = (klen < search_len) ? klen : search_len;
     int cmp = std::memcmp(kdata, search, min_len);
     if (cmp != 0) [[likely]] return cmp;
-    return makecmp(klen, search_len);
+    return makecmp(static_cast<uint32_t>(klen), search_len);
 }
 
 // Advance to next key in packed keys[]
 static const uint8_t* key_next(const uint8_t* kp) noexcept {
-    uint16_t len = *reinterpret_cast<const uint16_t*>(kp);
+    uint16_t len = read_u16(kp);
     return kp + 2 + len;
 }
 
@@ -552,8 +560,11 @@ private:
     // -- init ---------------------------------------------------------------
 
     void init_empty_root() {
-        // Minimal compact leaf: header only, count=0
-        std::size_t n = header_u64();
+        // Minimal compact leaf: header + empty data region
+        // For count=0: data region has hot[0] (16 bytes), ic=0, keys_bytes=0
+        // values_off(0, 0, 0) = 16, data_size = 16
+        std::size_t data_size = values_off(0, 0, 0);  // 16 bytes
+        std::size_t n = header_u64() + (data_size + 7) / 8;
         root_ = alloc_node(n);
         NodeHeader& h = hdr(root_);
         h.count = 0;
@@ -1121,7 +1132,7 @@ private:
         
         // Copy keys before insertion point
         for (int i = 0; i < pos; ++i) {
-            uint16_t klen = *reinterpret_cast<const uint16_t*>(old_kp);
+            uint16_t klen = read_u16(old_kp);
             uint32_t entry_size = 2 + klen;
             std::memcpy(new_kp, old_kp, entry_size);
             old_kp += entry_size;
@@ -1129,13 +1140,13 @@ private:
         }
         
         // Insert new key
-        *reinterpret_cast<uint16_t*>(new_kp) = static_cast<uint16_t>(suffix_len);
+        write_u16(new_kp, static_cast<uint16_t>(suffix_len));
         std::memcpy(new_kp + 2, suffix, suffix_len);
         new_kp += 2 + suffix_len;
         
         // Copy keys after insertion point
         for (int i = pos; i < old_count; ++i) {
-            uint16_t klen = *reinterpret_cast<const uint16_t*>(old_kp);
+            uint16_t klen = read_u16(old_kp);
             uint32_t entry_size = 2 + klen;
             std::memcpy(new_kp, old_kp, entry_size);
             old_kp += entry_size;
@@ -1163,12 +1174,12 @@ private:
             const uint8_t* kp_at_k = new_keys;
             uint32_t off_at_k = 0;
             for (int j = 0; j < k; ++j) {
-                uint16_t klen = *reinterpret_cast<const uint16_t*>(kp_at_k);
+                uint16_t klen = read_u16(kp_at_k);
                 kp_at_k += 2 + klen;
                 off_at_k += 2 + klen;
             }
             
-            uint16_t klen_at_k = *reinterpret_cast<const uint16_t*>(kp_at_k);
+            uint16_t klen_at_k = read_u16(kp_at_k);
             const uint8_t* kdata_at_k = kp_at_k + 2;
             
             // Build E prefix for key k
@@ -1185,7 +1196,7 @@ private:
             uint32_t check_off = 0;
             
             for (int j = 0; j < k; ++j) {
-                uint16_t check_len = *reinterpret_cast<const uint16_t*>(check_kp);
+                uint16_t check_len = read_u16(check_kp);
                 const uint8_t* check_data = check_kp + 2;
                 
                 ES es2;
@@ -1243,14 +1254,6 @@ private:
         const VST* values = reinterpret_cast<const VST*>(
             data + values_off(h.count, h.keys_bytes, ec));
         
-        // Bucket structure: for each byte value, store entries
-        // Entry: {suffix_ptr (after first byte), suffix_len-1, value_slot, is_eos}
-        struct BucketEntry {
-            const uint8_t* suffix;
-            uint32_t len;
-            VST slot;
-        };
-        
         // Use fixed-size arrays (max entries per bucket = COMPACT_MAX+1/alphabet_size)
         // For safety, use vectors
         std::vector<BucketEntry> buckets[256];
@@ -1259,7 +1262,7 @@ private:
         // Bucket existing entries by first byte
         const uint8_t* kp = keys;
         for (uint16_t i = 0; i < h.count; ++i) {
-            uint16_t klen = *reinterpret_cast<const uint16_t*>(kp);
+            uint16_t klen = read_u16(kp);
             const uint8_t* kdata = kp + 2;
             
             uint8_t first_byte = kdata[0];
@@ -1267,7 +1270,7 @@ private:
                 // After stripping first byte, becomes EOS
                 bucket_eos[first_byte].push_back(values[i]);
             } else {
-                buckets[first_byte].push_back({kdata + 1, klen - 1, values[i]});
+                buckets[first_byte].push_back({kdata + 1, static_cast<uint32_t>(klen - 1), values[i]});
             }
             kp = key_next(kp);
         }
@@ -1634,7 +1637,7 @@ private:
         
         // Keys: [uint16_t len][bytes]
         uint8_t* keys = data + keys_off(count, ec);
-        *reinterpret_cast<uint16_t*>(keys) = static_cast<uint16_t>(suffix_len);
+        write_u16(keys, static_cast<uint16_t>(suffix_len));
         std::memcpy(keys + 2, suffix, suffix_len);
         
         // Values
@@ -1728,7 +1731,7 @@ private:
         uint8_t* keys = data + keys_off(count, ec);
         uint8_t* kp = keys;
         for (const auto& e : entries) {
-            *reinterpret_cast<uint16_t*>(kp) = static_cast<uint16_t>(e.len);
+            write_u16(kp, static_cast<uint16_t>(e.len));
             std::memcpy(kp + 2, e.suffix, e.len);
             kp += 2 + e.len;
         }
