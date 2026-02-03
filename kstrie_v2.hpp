@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cassert>
 #include <cstddef>
@@ -150,25 +151,47 @@ struct NodeHeader {
 static_assert(sizeof(NodeHeader) == 8);
 
 // ============================================================================
-// IdxEntry — 16 bytes
+// E — 16-byte comparable key (for both hot and idx arrays)
 // ============================================================================
 
-// IdxEntry: 16 bytes, one per 8 keys
-struct IdxEntry {
-    union {
-        struct {
-            uint16_t len;      // 0 = pointer
-            uint16_t offset;   // offset into keys[]
-            uint8_t* ptr;      // -> [uint16_t len][bytes...]
-        } big;
-        struct {
-            uint16_t len;      // 1-12 = inline length
-            uint16_t offset;   // offset into keys[]
-            uint8_t key[12];
-        } small;
-    };
+// E: Comparison uses std::array's lexicographic <=
+// k[0]: bytes 0-7 (big-endian for comparison)
+// k[1]: bytes 8-13 in high 48 bits, offset in low 16 bits
+using E = std::array<uint64_t, 2>;
+
+// For building entries in natural byte order
+struct ES {
+    std::array<char, 16> D;
+    
+    void setkey(const char* k, int len) noexcept {
+        std::memset(D.data(), 0, 16);
+        std::memcpy(D.data(), k, std::min(len, 14));
+    }
+    
+    void setoff(uint16_t off) noexcept {
+        D[14] = static_cast<char>(off >> 8);
+        D[15] = static_cast<char>(off & 0xFF);
+    }
 };
-static_assert(sizeof(IdxEntry) == 16);
+
+inline E cvt(const ES& x) noexcept {
+    E ret;
+    std::memcpy(&ret, &x, 16);
+    if constexpr (std::endian::native == std::endian::little) {
+        ret[0] = std::byteswap(ret[0]);
+        ret[1] = std::byteswap(ret[1]);
+    }
+    return ret;
+}
+
+inline E make_search_key(const uint8_t* k, uint32_t len) noexcept {
+    ES es;
+    es.setkey(reinterpret_cast<const char*>(k), static_cast<int>(len));
+    es.setoff(0xFFFF);  // max offset so search key >= any matching idx entry
+    return cvt(es);
+}
+
+static_assert(sizeof(E) == 16);
 
 // ============================================================================
 // Layout constants
@@ -176,8 +199,6 @@ static_assert(sizeof(IdxEntry) == 16);
 
 inline constexpr std::size_t COMPACT_MAX   = 4096;
 inline constexpr std::size_t BITMAP256_U64 = 4;
-inline constexpr uint16_t    LEN_PTR       = 0;       // key > 12 bytes (pointer)
-inline constexpr uint16_t    LEN_MAX       = 12;      // max inline length
 
 inline constexpr std::size_t align8(std::size_t n) noexcept {
     return (n + 7) & ~std::size_t(7);
@@ -195,9 +216,9 @@ inline constexpr int idx_count(uint16_t N) noexcept {
 inline constexpr std::size_t hot_off() noexcept { return 0; }
 
 // Idx array offset: after hot array
-// ec = W - 1, hot uses (ec + 1) * 8 bytes
+// ec = W - 1, hot uses (ec + 1) * 16 bytes (E is 16 bytes)
 inline std::size_t idx_off(int ec) noexcept {
-    return (ec + 1) * 8;
+    return (ec + 1) * 16;
 }
 
 // Keys offset: after idx array
@@ -210,30 +231,21 @@ inline std::size_t values_off(uint16_t N, uint32_t keys_bytes, int ec) noexcept 
     return keys_off(N, ec) + align8(keys_bytes);
 }
 
+// Get offset from E (stored in low 16 bits of k[1])
+inline uint16_t e_offset(const E& e) noexcept {
+    if constexpr (std::endian::native == std::endian::little) {
+        return static_cast<uint16_t>(std::byteswap(e[1]) & 0xFFFF);
+    } else {
+        return static_cast<uint16_t>(e[1] & 0xFFFF);
+    }
+}
+
 // ============================================================================
 // Comparison helpers
 // ============================================================================
 
 template <class T>
 static int makecmp(T a, T b) noexcept { return (a < b) ? -1 : (a > b) ? 1 : 0; }
-
-// Compare IdxEntry against search key
-static int idx_cmp(const IdxEntry& e, const uint8_t* search, uint32_t search_len) noexcept {
-    const uint8_t* kp;
-    uint32_t klen = e.small.len;
-    
-    if (klen == 0) [[unlikely]] {
-        klen = *reinterpret_cast<const uint16_t*>(e.big.ptr);
-        kp = e.big.ptr + 2;
-    } else {
-        kp = e.small.key;
-    }
-    
-    uint32_t min_len = (klen < search_len) ? klen : search_len;
-    int cmp = std::memcmp(kp, search, min_len);
-    if (cmp != 0) [[likely]] return cmp;
-    return makecmp(klen, search_len);
-}
 
 // Compare packed key against search key
 // keys[] format: [uint16_t len][bytes...]
@@ -265,17 +277,8 @@ inline int calc_W(int ic) noexcept {
     return std::bit_ceil(static_cast<unsigned>(w));
 }
 
-// Convert first 8 bytes of key to big-endian uint64_t for branchless comparison
-inline uint64_t make_key8(const uint8_t* key, uint32_t len) noexcept {
-    uint64_t v = 0;
-    int n = std::min(len, 8u);
-    for (int i = 0; i < n; ++i) v = (v << 8) | key[i];
-    v <<= (8 - n) * 8;  // Right-pad with zeros
-    return v;
-}
-
 // Build Eytzinger tree recursively (1-indexed)
-inline void build_eyt_rec(const uint64_t* b, int n, uint64_t* hot, int i, int& k) noexcept {
+inline void build_eyt_rec(const E* b, int n, E* hot, int i, int& k) noexcept {
     if (i > n) return;
     build_eyt_rec(b, n, hot, 2*i, k);
     hot[i] = b[k++];
@@ -284,28 +287,19 @@ inline void build_eyt_rec(const uint64_t* b, int n, uint64_t* hot, int i, int& k
 
 // Build Eytzinger hot array from idx entries
 // Returns ec (= W - 1), hot is 1-indexed [1..ec]
-template <typename IdxEntryT>
-inline int build_eyt(const IdxEntryT* idx, int ic, uint64_t* hot) noexcept {
+inline int build_eyt(const E* idx, int ic, E* hot) noexcept {
     int W = calc_W(ic);
     if (W == 0) return 0;
     int ec = W - 1;
     
     // Boundaries: idx[(i+1) * ic / W] for i in [0, ec)
     // Use stack for small ec, otherwise allocate
-    uint64_t stack_buf[128];
-    uint64_t* boundaries = (ec <= 128) ? stack_buf : new uint64_t[ec];
+    E stack_buf[128];
+    E* boundaries = (ec <= 128) ? stack_buf : new E[ec];
     
     for (int i = 0; i < ec; ++i) {
         int pos = (i + 1) * ic / W;
-        const uint8_t* kp;
-        uint32_t klen = idx[pos].small.len;
-        if (klen == 0) {
-            klen = *reinterpret_cast<const uint16_t*>(idx[pos].big.ptr);
-            kp = idx[pos].big.ptr + 2;
-        } else {
-            kp = idx[pos].small.key;
-        }
-        boundaries[i] = make_key8(kp, klen);
+        boundaries[i] = idx[pos];
     }
     
     int k = 0;
@@ -471,7 +465,7 @@ private:
 
     // -----------------------------------------------------------------------
     // compact_find — Eytzinger hot array + linear scan
-    // Layout: [hot: (ec+1)×8B][idx: ic×16B][keys][values]
+    // Layout: [hot: (ec+1)×16B][idx: ic×16B][keys][values]
     // -----------------------------------------------------------------------
 
     const VST* compact_find(const uint64_t* node, NodeHeader h,
@@ -487,16 +481,16 @@ private:
         int W = calc_W(ic);
         int ec = W > 0 ? W - 1 : 0;
 
-        const uint64_t* hot = reinterpret_cast<const uint64_t*>(data + hot_off());
-        const IdxEntry* idx = reinterpret_cast<const IdxEntry*>(data + idx_off(ec));
+        const E* hot = reinterpret_cast<const E*>(data + hot_off());
+        const E* idx = reinterpret_cast<const E*>(data + idx_off(ec));
         const uint8_t* keys = data + keys_off(count, ec);
         const VST* values = reinterpret_cast<const VST*>(data + values_off(count, h.keys_bytes, ec));
 
+        E skey = make_search_key(search, search_len);
         int idx_base = 0, idx_end = ic;
 
         if (ec > 0) {
-            // Branchless Eytzinger traversal
-            uint64_t skey = make_key8(search, search_len);
+            // Branchless Eytzinger traversal using 16-byte E comparison
             int i = 1;
             while (i <= ec) {
                 i = 2*i + (hot[i] <= skey);
@@ -506,15 +500,15 @@ private:
             idx_end = std::min(idx_base + 4, ic);
         }
 
-        // Linear scan idx entries (up to 4)
+        // Linear scan idx entries (up to 4) using E comparison
         int block = idx_base;
         for (int k = idx_base; k < idx_end; ++k) {
-            if (idx_cmp(idx[k], search, search_len) > 0) break;
+            if (!(idx[k] <= skey)) break;
             block = k;
         }
 
         // Linear scan keys (up to 8)
-        const uint8_t* kp = keys + idx[block].small.offset;
+        const uint8_t* kp = keys + e_offset(idx[block]);
         int key_start = block * 8;
         int scan_end = std::min(key_start + 8, (int)count);
 

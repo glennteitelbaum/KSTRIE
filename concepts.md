@@ -44,9 +44,9 @@ A flat, sorted array of key suffixes and values. Used when entry count ≤ 4096.
 ├─────────────────────────────────────────────────┤
 │ eos_value (if has_eos)                          │
 ├─────────────────────────────────────────────────┤
-│ hot[ec+1] : uint64_t    ← Eytzinger boundaries  │
+│ hot[ec+1] : E (16B each) ← Eytzinger boundaries │
 ├─────────────────────────────────────────────────┤
-│ idx[ic] : IdxEntry (16B each)                   │
+│ idx[ic] : E (16B each)                          │
 ├─────────────────────────────────────────────────┤
 │ keys[] : packed [u16 len][bytes...]             │
 ├─────────────────────────────────────────────────┤
@@ -142,30 +142,31 @@ The compact node capacity of 4096 entries is chosen for several reasons:
 
 ## 5. Three-Tier Search Architecture
 
-Search within a compact node uses three levels of indexing:
+Search within a compact node uses three levels of indexing, all based on a unified 16-byte **E** structure:
+
+```cpp
+using E = std::array<uint64_t, 2>;
+
+// Layout (big-endian for comparison):
+// k[0]: bytes 0-7 of key
+// k[1]: bytes 8-13 in high 48 bits, offset in low 16 bits
+```
+
+Both hot and idx arrays use the same E type, enabling consistent 16-byte lexicographic comparison via `std::array`'s built-in `<=` operator.
 
 ### Tier 1: Eytzinger Hot Array (log₂(ec) comparisons)
 
-Branchless binary search on 8-byte key prefixes narrows to a **window** of ~4 idx entries.
+Branchless binary search on 16-byte key prefixes narrows to a **window** of ~4 idx entries.
 
-### Tier 2: IdxEntry Linear Scan (≤4 comparisons)
+### Tier 2: Idx Linear Scan (≤4 comparisons)
 
-Each IdxEntry (16 bytes) contains:
-```cpp
-struct IdxEntry {
-    uint16_t len;        // Key length (0 = pointer to heap)
-    uint16_t offset;     // Byte offset into keys[]
-    uint8_t  key[12];    // First 12 bytes of key (inline)
-};
-```
-
-One IdxEntry per 8 keys. Linear scan identifies the correct 8-key block.
+One E per 8 keys. Same 16-byte comparison identifies the correct 8-key block. The offset (low 16 bits of k[1]) points to the key data.
 
 ### Tier 3: Key Linear Scan (≤8 comparisons)
 
 Full key comparison against packed keys in `keys[]` array.
 
-**Total comparisons**: O(log M) + O(4) + O(8) ≈ 7 + 4 + 8 = 19 for N=4096 (where M = max suffix length at this node)
+**Total comparisons**: O(log N) + O(4) + O(8) ≈ 7 + 4 + 8 = 19 for N=4096
 
 ---
 
@@ -232,29 +233,75 @@ For `ec = 2^k - 1` (complete tree):
 
 ---
 
-## 7. Branchless Key Comparison
+## 7. Branchless 16-Byte Key Comparison
 
-The Eytzinger hot array stores **8-byte key prefixes** as big-endian `uint64_t`:
+Both hot and idx arrays use the **E** structure — a 16-byte comparable key stored as `std::array<uint64_t, 2>`.
+
+### 7.1 Building E from Key Bytes
 
 ```cpp
-uint64_t make_key8(const uint8_t* key, uint32_t len) {
-    uint64_t v = 0;
-    int n = min(len, 8u);
-    for (int i = 0; i < n; ++i) v = (v << 8) | key[i];
-    v <<= (8 - n) * 8;  // Right-pad with zeros
-    return v;
+struct ES {
+    std::array<char, 16> D;
+    
+    void setkey(const char* k, int len) noexcept {
+        memset(D.data(), 0, 16);
+        memcpy(D.data(), k, min(len, 14));
+    }
+    
+    void setoff(uint16_t off) noexcept {
+        D[14] = off >> 8;
+        D[15] = off & 0xFF;
+    }
+};
+
+E cvt(const ES& x) noexcept {
+    E ret;
+    memcpy(&ret, &x, 16);
+    if constexpr (std::endian::native == std::endian::little) {
+        ret[0] = std::byteswap(ret[0]);
+        ret[1] = std::byteswap(ret[1]);
+    }
+    return ret;
 }
 ```
 
-This enables integer comparison instead of `memcmp`:
+On x86-64, `cvt()` compiles to two `movbe` (move with byte swap) instructions — load and swap in one operation.
+
+### 7.2 Comparison
+
+`std::array<uint64_t, 2>` provides lexicographic `<=` out of the box:
+
 ```cpp
-i = 2*i + (hot[i] <= skey);  // Single instruction comparison
+i = 2*i + (hot[i] <= skey);
 ```
 
+Assembly for `a <= b` where both are `std::array<uint64_t, 2>`:
+```asm
+cmp     rdi, rdx      ; a[0] vs b[0]
+setb    al            ; al = (a[0] < b[0])
+je      .L5           ; if equal, check second element
+ret
+.L5:
+cmp     rcx, rsi      ; b[1] vs a[1]  
+setnb   al            ; al = (a[1] <= b[1])
+ret
+```
+
+One conditional branch, but highly predictable — either first 8 bytes usually match or they don't.
+
+### 7.3 Why 16 Bytes?
+
+With 8-byte hot keys, a degenerate case exists: if all keys share the same first 8 bytes (e.g., all start with "ABCDEFGH"), Eytzinger can't distinguish them and always lands in the wrong window.
+
+With 16 bytes (14 key bytes + 2 offset bytes):
+- Keys must share first 14 bytes to degenerate — extremely rare
+- The offset breaks ties deterministically
+- hot array grows from ~1KB to ~2KB at N=4096 — still fits L1 cache
+
 **Cache behavior:**
-- hot array is ~1KB for N=4096
+- hot array is ~2KB for N=4096
 - Accessed sequentially (indices 1, 2/3, 4-7, 8-15, ...)
-- Prefetcher handles this well; typically 1-2 cache misses total
+- Prefetcher handles this well; typically 2-3 cache misses total
 
 ---
 
@@ -363,9 +410,9 @@ struct NodeHeader {
 1. Header (8 bytes)
 2. Skip prefix (0 to 254 bytes, 8-byte aligned)
 3. EOS value slot (if present)
-4. Hot array: `(ec + 1) × 8` bytes
-5. Idx array: `ic × 16` bytes
-6. Keys: variable, 8-byte aligned
+4. Hot array: `(ec + 1) × 16` bytes (E entries)
+5. Idx array: `ic × 16` bytes (E entries)
+6. Keys: variable, packed as `[uint16_t len][bytes...]`, 8-byte aligned
 7. Values: `N × sizeof(value_slot_type)`, 8-byte aligned
 
 **Bitmap node regions (in order):**
