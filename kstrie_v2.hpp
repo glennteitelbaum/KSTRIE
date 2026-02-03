@@ -183,14 +183,23 @@ inline constexpr int idx_count(uint16_t N) noexcept {
     return N > 0 ? (N + 7) / 8 : 0;  // Always at least 1 if N > 0
 }
 
-inline constexpr std::size_t idx_off() noexcept { return 0; }
+// Hot array offset (always 0, hot is first)
+inline constexpr std::size_t hot_off() noexcept { return 0; }
 
-inline constexpr std::size_t keys_off(uint16_t N) noexcept {
-    return idx_count(N) * 16;
+// Idx array offset: after hot array
+// ec = W - 1, hot uses (ec + 1) * 8 bytes
+inline std::size_t idx_off(int ec) noexcept {
+    return (ec + 1) * 8;
 }
 
-inline constexpr std::size_t values_off(uint16_t N, uint32_t keys_bytes) noexcept {
-    return keys_off(N) + align8(keys_bytes);
+// Keys offset: after idx array
+inline std::size_t keys_off(uint16_t N, int ec) noexcept {
+    return idx_off(ec) + idx_count(N) * 16;
+}
+
+// Values offset: after keys array (aligned)
+inline std::size_t values_off(uint16_t N, uint32_t keys_bytes, int ec) noexcept {
+    return keys_off(N, ec) + align8(keys_bytes);
 }
 
 // ============================================================================
@@ -198,7 +207,7 @@ inline constexpr std::size_t values_off(uint16_t N, uint32_t keys_bytes) noexcep
 // ============================================================================
 
 template <class T>
-static int makecmp(T a, T b) noexcept { return (a > b) - (a < b); }
+static int makecmp(T a, T b) noexcept { return (a < b) ? -1 : (a > b) ? 1 : 0; }
 
 // Compare IdxEntry against search key
 static int idx_cmp(const IdxEntry& e, const uint8_t* search, uint32_t search_len) noexcept {
@@ -234,6 +243,68 @@ static int key_cmp(const uint8_t* kp, const uint8_t* search, uint32_t search_len
 static const uint8_t* key_next(const uint8_t* kp) noexcept {
     uint16_t len = *reinterpret_cast<const uint16_t*>(kp);
     return kp + 2 + len;
+}
+
+// ============================================================================
+// Eytzinger layout helpers
+// ============================================================================
+
+// W = next_power_of_2(ceil(ic/4)), ec = W - 1
+// Returns 0 if ic <= 4 (no Eytzinger needed)
+inline int calc_W(int ic) noexcept {
+    if (ic <= 4) return 0;
+    int w = (ic + 3) / 4;  // ceil(ic/4)
+    return std::bit_ceil(static_cast<unsigned>(w));
+}
+
+// Convert first 8 bytes of key to big-endian uint64_t for branchless comparison
+inline uint64_t make_key8(const uint8_t* key, uint32_t len) noexcept {
+    uint64_t v = 0;
+    int n = std::min(len, 8u);
+    for (int i = 0; i < n; ++i) v = (v << 8) | key[i];
+    v <<= (8 - n) * 8;  // Right-pad with zeros
+    return v;
+}
+
+// Build Eytzinger tree recursively (1-indexed)
+inline void build_eyt_rec(const uint64_t* b, int n, uint64_t* hot, int i, int& k) noexcept {
+    if (i > n) return;
+    build_eyt_rec(b, n, hot, 2*i, k);
+    hot[i] = b[k++];
+    build_eyt_rec(b, n, hot, 2*i+1, k);
+}
+
+// Build Eytzinger hot array from idx entries
+// Returns ec (= W - 1), hot is 1-indexed [1..ec]
+template <typename IdxEntryT>
+inline int build_eyt(const IdxEntryT* idx, int ic, uint64_t* hot) noexcept {
+    int W = calc_W(ic);
+    if (W == 0) return 0;
+    int ec = W - 1;
+    
+    // Boundaries: idx[(i+1) * ic / W] for i in [0, ec)
+    // Use stack for small ec, otherwise allocate
+    uint64_t stack_buf[128];
+    uint64_t* boundaries = (ec <= 128) ? stack_buf : new uint64_t[ec];
+    
+    for (int i = 0; i < ec; ++i) {
+        int pos = (i + 1) * ic / W;
+        const uint8_t* kp;
+        uint32_t klen = idx[pos].small.len;
+        if (klen == 0) {
+            klen = *reinterpret_cast<const uint16_t*>(idx[pos].big.ptr);
+            kp = idx[pos].big.ptr + 2;
+        } else {
+            kp = idx[pos].small.key;
+        }
+        boundaries[i] = make_key8(kp, klen);
+    }
+    
+    int k = 0;
+    build_eyt_rec(boundaries, ec, hot, 1, k);
+    
+    if (boundaries != stack_buf) delete[] boundaries;
+    return ec;
 }
 
 // ============================================================================
@@ -341,11 +412,16 @@ private:
         const NodeHeader& h = hdr(node);
 
         if (h.is_compact()) {
+            // Compute ec from count
+            int ic = idx_count(h.count);
+            int W = calc_W(ic);
+            int ec = W > 0 ? W - 1 : 0;
+
             // Destroy values
             const uint8_t* data = reinterpret_cast<const uint8_t*>(node) +
                                   data_offset_u64(h.skip, h.has_eos()) * 8;
             const VST* values = reinterpret_cast<const VST*>(
-                data + values_off(h.count, h.keys_bytes));
+                data + values_off(h.count, h.keys_bytes, ec));
 
             for (uint16_t i = 0; i < h.count; ++i) {
                 VT::destroy(const_cast<VST&>(values[i]));
@@ -360,7 +436,7 @@ private:
 
             // Compute node size and deallocate
             std::size_t node_bytes = data_offset_u64(h.skip, h.has_eos()) * 8 +
-                                     values_off(h.count, h.keys_bytes) +
+                                     values_off(h.count, h.keys_bytes, ec) +
                                      align8(h.count * sizeof(VST));
             dealloc_node(node, (node_bytes + 7) / 8);
         } else {
@@ -384,43 +460,50 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // compact_find — hybrid4 binary search + linear scan, granularity 8
+    // compact_find — Eytzinger hot array + linear scan
+    // Layout: [hot: (ec+1)×8B][idx: ic×16B][keys][values]
     // -----------------------------------------------------------------------
 
     const VST* compact_find(const uint64_t* node, NodeHeader h,
                             const uint8_t* search,
                             uint32_t search_len) const noexcept {
         uint16_t count = h.count;
-        // Never -- if (count == 0) return nullptr;
+        if (count == 0) return nullptr;
 
         const uint8_t* data = reinterpret_cast<const uint8_t*>(node) +
                               data_offset_u64(h.skip, h.has_eos()) * 8;
 
         int ic = idx_count(count);
+        int W = calc_W(ic);
+        int ec = W > 0 ? W - 1 : 0;
 
-        const IdxEntry* idx = reinterpret_cast<const IdxEntry*>(data + idx_off());
-        const uint8_t* keys = data + keys_off(count);
-        const VST* values = reinterpret_cast<const VST*>(data + values_off(count, h.keys_bytes));
+        const uint64_t* hot = reinterpret_cast<const uint64_t*>(data + hot_off());
+        const IdxEntry* idx = reinterpret_cast<const IdxEntry*>(data + idx_off(ec));
+        const uint8_t* keys = data + keys_off(count, ec);
+        const VST* values = reinterpret_cast<const VST*>(data + values_off(count, h.keys_bytes, ec));
 
-        // Binary search idx down to 4
-        int lo = 0, hi = ic;
-        while (hi - lo > 4) {
-            int mid = (lo + hi) / 2;
-            int cmp = idx_cmp(idx[mid], search, search_len);
-            if (cmp <= 0) lo = mid + 1;
-            else hi = mid;
+        int idx_base = 0, idx_end = ic;
+
+        if (ec > 0) {
+            // Branchless Eytzinger traversal
+            uint64_t skey = make_key8(search, search_len);
+            int i = 1;
+            while (i <= ec) {
+                i = 2*i + (hot[i] <= skey);
+            }
+            int window = i - ec - 1;
+            idx_base = window * ic / W;
+            idx_end = std::min(idx_base + 4, ic);
         }
-        
-        // Linear scan remaining idx
-        int start = (lo > 0) ? lo - 1 : 0;
-        int block = start;
-        for (int k = start; k < hi; ++k) {
-            int cmp = idx_cmp(idx[k], search, search_len);
-            if (cmp > 0) break;
+
+        // Linear scan idx entries (up to 4)
+        int block = idx_base;
+        for (int k = idx_base; k < idx_end; ++k) {
+            if (idx_cmp(idx[k], search, search_len) > 0) break;
             block = k;
         }
 
-        // Linear scan ≤8 keys
+        // Linear scan keys (up to 8)
         const uint8_t* kp = keys + idx[block].small.offset;
         int key_start = block * 8;
         int scan_end = std::min(key_start + 8, (int)count);

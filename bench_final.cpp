@@ -1,4 +1,5 @@
-#include "kstrie_v2.hpp"
+#include <cstdint>
+#include <cstring>
 #include <chrono>
 #include <random>
 #include <algorithm>
@@ -6,145 +7,118 @@
 #include <iomanip>
 #include <map>
 #include <vector>
+#include <bit>
 
-using namespace gteitelbaum;
+inline constexpr std::size_t align8(std::size_t n) noexcept { return (n + 7) & ~std::size_t(7); }
 
-// Build compact leaf
-template <typename VST>
-std::pair<uint64_t*, size_t> build_leaf(int count, const std::vector<std::string>& keys,
-                                         std::allocator<uint64_t>& alloc) {
-    uint32_t keys_bytes = 0;
-    for (int i = 0; i < count; ++i)
-        keys_bytes += (keys[i].size() > 13) ? 14 : (1 + keys[i].size());
+struct IdxEntry {
+    uint16_t len;
+    uint16_t offset;    
+    uint8_t key[12];
+};
+
+template <class T> int makecmp(T a, T b) { return (a < b) ? -1 : (a > b) ? 1 : 0; }
+
+inline int idx_cmp(const IdxEntry& e, const uint8_t* search, uint32_t search_len) noexcept {
+    uint32_t klen = e.len;
+    uint32_t min_len = (klen < search_len) ? klen : search_len;
+    int cmp = std::memcmp(e.key, search, min_len);
+    if (cmp != 0) [[likely]] return cmp;
+    return makecmp(klen, search_len);
+}
+
+inline int key_cmp(const uint8_t* kp, const uint8_t* search, uint32_t search_len) noexcept {
+    uint32_t klen = *reinterpret_cast<const uint16_t*>(kp);
+    const uint8_t* kdata = kp + 2;
+    uint32_t min_len = (klen < search_len) ? klen : search_len;
+    int cmp = std::memcmp(kdata, search, min_len);
+    if (cmp != 0) [[likely]] return cmp;
+    return makecmp(klen, search_len);
+}
+
+inline const uint8_t* key_next(const uint8_t* kp) noexcept {
+    return kp + 2 + *reinterpret_cast<const uint16_t*>(kp);
+}
+
+inline constexpr int ic8(uint16_t N) noexcept { return (N + 7) / 8; }
+
+inline uint64_t make_key8(const uint8_t* key, uint32_t len) {
+    uint64_t v = 0;
+    int n = std::min(len, 8u);
+    for (int i = 0; i < n; ++i) v = (v << 8) | key[i];
+    v <<= (8 - n) * 8;
+    return v;
+}
+
+inline int calc_W(int ic) {
+    if (ic <= 4) return 0;
+    int w = (ic + 3) / 4;
+    return std::bit_ceil((unsigned)w);
+}
+
+void build_eyt_rec(const uint64_t* b, int n, uint64_t* hot, int i, int& k) {
+    if (i > n) return;
+    build_eyt_rec(b, n, hot, 2*i, k);
+    hot[i] = b[k++];
+    build_eyt_rec(b, n, hot, 2*i+1, k);
+}
+
+int build_eyt(const IdxEntry* idx, int ic, uint64_t* hot) {
+    int W = calc_W(ic);
+    if (W == 0) return 0;
+    int ec = W - 1;
     
-    int ic = idx_count(count);
-    
-    size_t header_bytes = 16;
-    size_t data_bytes = values_off(count, keys_bytes) + align8(count * sizeof(VST));
-    size_t total_bytes = header_bytes + data_bytes;
-    size_t total_u64 = (total_bytes + 7) / 8;
-    
-    uint64_t* node = alloc.allocate(total_u64);
-    std::memset(node, 0, total_u64 * 8);
-    
-    NodeHeader& h = *reinterpret_cast<NodeHeader*>(node);
-    h.count = count;
-    h.keys_bytes = keys_bytes;
-    h.skip = 0;
-    h.flags = 1;
-    
-    uint8_t* data = reinterpret_cast<uint8_t*>(node) + header_bytes;
-    
-    IdxEntry* idx = reinterpret_cast<IdxEntry*>(data);
-    uint8_t* keys_data = data + keys_off(count);
-    VST* values = reinterpret_cast<VST*>(data + values_off(count, keys_bytes));
-    
-    uint8_t* kp = keys_data;
-    for (int i = 0; i < count; ++i) {
-        const std::string& key = keys[i];
-        kp[0] = key.size();
-        std::memcpy(kp + 1, key.data(), key.size());
-        kp += 1 + key.size();
-        values[i] = static_cast<VST>(i);
+    std::vector<uint64_t> boundaries(ec);
+    for (int i = 0; i < ec; ++i) {
+        int pos = (i + 1) * ic / W;
+        boundaries[i] = make_key8(idx[pos].key, idx[pos].len);
     }
     
-    // idx[k] -> keys[k*8]
-    uint16_t offset = 0;
-    for (int i = 0; i < count; ++i) {
-        if (i % 8 == 0) {
-            int ix = i / 8;
-            idx[ix].len = keys[i].size() > 13 ? 0 : keys[i].size();
-            std::memset(idx[ix].key, 0, 13);
-            std::memcpy(idx[ix].key, keys[i].data(), std::min((size_t)13, keys[i].size()));
-            idx[ix].offset = offset;
+    int k = 0;
+    build_eyt_rec(boundaries.data(), ec, hot, 1, k);
+    return ec;
+}
+
+inline std::size_t idx_off(int ec) noexcept { return (ec + 1) * 8; }
+inline std::size_t keys_off(int ec, uint16_t N) noexcept { return idx_off(ec) + ic8(N) * 16; }
+inline std::size_t values_off(int ec, uint16_t N, uint32_t kb) noexcept { return keys_off(ec, N) + align8(kb); }
+
+template <typename VST>
+const VST* find_eyt(const uint8_t* data, uint16_t count, uint32_t kb,
+                    int ec, int W, const uint8_t* search, uint32_t search_len) {
+    int ic = ic8(count);
+    const uint64_t* hot = reinterpret_cast<const uint64_t*>(data);
+    const IdxEntry* idx = reinterpret_cast<const IdxEntry*>(data + idx_off(ec));
+    const uint8_t* keys = data + keys_off(ec, count);
+    const VST* values = reinterpret_cast<const VST*>(data + values_off(ec, count, kb));
+    
+    int idx_base = 0, idx_end = ic;
+    
+    if (ec > 0) {
+        uint64_t skey = make_key8(search, search_len);
+        int i = 1;
+        while (i <= ec) {
+            i = 2*i + (hot[i] <= skey);
         }
-        offset += (keys[i].size() > 13) ? 14 : (1 + keys[i].size());
+        int window = i - ec - 1;
+        idx_base = window * ic / W;
+        idx_end = std::min(idx_base + 4, ic);
     }
     
-    return {node, total_bytes};
-}
-
-// Find with compare counting
-template <typename VST>
-const VST* find_counted(const uint8_t* data, uint16_t count, uint32_t keys_bytes,
-                        const uint8_t* search, uint32_t search_len, int& cmp_count) {
-    cmp_count = 0;
-    if (count == 0) return nullptr;
-    
-    int ic = idx_count(count);
-    
-    const IdxEntry* idx = reinterpret_cast<const IdxEntry*>(data + idx_off());
-    const uint8_t* keys = data + keys_off(count);
-    const VST* values = reinterpret_cast<const VST*>(data + values_off(count, keys_bytes));
-    
-    int lo = 0, hi = ic;
-    while (hi - lo > 4) {
-        int mid = (lo + hi) / 2;
-        int cmp = idx_cmp(idx[mid], search, search_len);
-        cmp_count++;
-        if (cmp <= 0) lo = mid + 1;
-        else hi = mid;
-    }
-    
-    int start = (lo > 0) ? lo - 1 : 0;
-    int block = start;
-    for (int k = start; k < hi; ++k) {
-        int cmp = idx_cmp(idx[k], search, search_len);
-        cmp_count++;
-        if (cmp > 0) break;
+    int block = idx_base;
+    for (int k = idx_base; k < idx_end; ++k) {
+        if (idx_cmp(idx[k], search, search_len) > 0) break;
         block = k;
     }
     
     const uint8_t* kp = keys + idx[block].offset;
     int key_start = block * 8;
-    int scan_end = std::min(key_start + 8, (int)count);
+    int key_end = std::min(key_start + 8, (int)count);
     
-    for (int i = key_start; i < scan_end; ++i) {
-        int cmp = key_cmp(kp, search, search_len);
-        cmp_count++;
-        if (cmp == 0) return &values[i];
-        if (cmp > 0) return nullptr;
-        kp = key_next(kp);
-    }
-    return nullptr;
-}
-
-// Fast find (no counting)
-template <typename VST>
-const VST* find_fast(const uint8_t* data, uint16_t count, uint32_t keys_bytes,
-                     const uint8_t* search, uint32_t search_len) {
-    if (count == 0) return nullptr;
-    
-    int ic = idx_count(count);
-    
-    const IdxEntry* idx = reinterpret_cast<const IdxEntry*>(data + idx_off());
-    const uint8_t* keys = data + keys_off(count);
-    const VST* values = reinterpret_cast<const VST*>(data + values_off(count, keys_bytes));
-    
-    int lo = 0, hi = ic;
-    while (hi - lo > 4) {
-        int mid = (lo + hi) / 2;
-        int cmp = idx_cmp(idx[mid], search, search_len);
-        if (cmp <= 0) lo = mid + 1;
-        else hi = mid;
-    }
-    
-    int start = (lo > 0) ? lo - 1 : 0;
-    int block = start;
-    for (int k = start; k < hi; ++k) {
-        int cmp = idx_cmp(idx[k], search, search_len);
-        if (cmp > 0) break;
-        block = k;
-    }
-    
-    const uint8_t* kp = keys + idx[block].offset;
-    int key_start = block * 8;
-    int scan_end = std::min(key_start + 8, (int)count);
-    
-    for (int i = key_start; i < scan_end; ++i) {
-        int cmp = key_cmp(kp, search, search_len);
-        if (cmp == 0) return &values[i];
-        if (cmp > 0) return nullptr;
+    for (int i = key_start; i < key_end; ++i) {
+        int c = key_cmp(kp, search, search_len);
+        if (c == 0) return &values[i];
+        if (c > 0) return nullptr;
         kp = key_next(kp);
     }
     return nullptr;
@@ -152,106 +126,122 @@ const VST* find_fast(const uint8_t* data, uint16_t count, uint32_t keys_bytes,
 
 int main() {
     std::vector<int> sizes;
-    for (int n = 1; n <= 4096; n *= 2) sizes.push_back(n);
+    for (int n = 1; n <= 4096; n *= 2) { sizes.push_back(n); sizes.push_back(n + 1); }
     
-    std::cout << "kstrie vs std::map — powers of 2 from 1 to 4096\n";
-    std::cout << "Keys: random 4-12 byte strings\n\n";
-    
+    std::cout << "Eytzinger (u64 hot, complete tree) vs std::map\n\n";
     std::cout << std::setw(6) << "N" 
-              << std::setw(10) << "kstrie"
-              << std::setw(10) << "std::map"
-              << std::setw(8) << "ratio"
-              << std::setw(10) << "kst_B"
-              << std::setw(10) << "map_B"
-              << std::setw(8) << "mem_x"
-              << std::setw(8) << "cmps" << "\n";
-    std::cout << std::string(78, '-') << "\n";
+              << std::setw(9) << "eyt"
+              << std::setw(9) << "map"
+              << std::setw(8) << "eyt/map"
+              << std::setw(6) << "ic"
+              << std::setw(6) << "W"
+              << std::setw(6) << "ec"
+              << std::setw(8) << "eyt_B" << "\n";
+    std::cout << std::string(64, '-') << "\n";
 
     for (int N : sizes) {
         std::mt19937_64 rng(42);
         
         std::vector<std::string> keys;
-        keys.reserve(N);
         for (int i = 0; i < N; ++i) {
             int len = 4 + (rng() % 9);
             std::string s;
-            for (int j = 0; j < len; ++j)
-                s.push_back('a' + (rng() % 26));
+            for (int j = 0; j < len; ++j) s.push_back('a' + (rng() % 26));
             keys.push_back(std::move(s));
         }
         std::sort(keys.begin(), keys.end());
         keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-        int actual_n = keys.size();
+        int n = keys.size();
 
-        std::allocator<uint64_t> alloc;
-        auto [node, kst_bytes] = build_leaf<uint64_t>(actual_n, keys, alloc);
-        NodeHeader h = *reinterpret_cast<NodeHeader*>(node);
+        uint32_t kb = 0;
+        for (auto& k : keys) kb += 2 + k.size();
+
+        int ic = ic8(n);
+        int W = calc_W(ic);
         
-        const uint8_t* data = reinterpret_cast<const uint8_t*>(node) + 16;
+        std::vector<IdxEntry> idx_vec(std::max(1, ic));
+        {
+            uint16_t off = 0;
+            for (int i = 0; i < n; ++i) {
+                if (i % 8 == 0) {
+                    int ix = i / 8;
+                    idx_vec[ix].len = keys[i].size();
+                    idx_vec[ix].offset = off;
+                    std::memset(idx_vec[ix].key, 0, 12);
+                    std::memcpy(idx_vec[ix].key, keys[i].data(), std::min((size_t)12, keys[i].size()));
+                }
+                off += 2 + keys[i].size();
+            }
+        }
+        
+        std::vector<uint64_t> hot_vec(std::max(1, W));
+        int ec = build_eyt(idx_vec.data(), ic, hot_vec.data());
+        
+        size_t bytes = values_off(ec, n, kb) + align8(n * 8);
+        uint8_t* data = new uint8_t[bytes]();
+        std::memcpy(data, hot_vec.data(), (ec + 1) * 8);
+        std::memcpy(data + idx_off(ec), idx_vec.data(), ic * 16);
+        {
+            uint8_t* kd = data + keys_off(ec, n);
+            uint64_t* val = reinterpret_cast<uint64_t*>(data + values_off(ec, n, kb));
+            for (int i = 0; i < n; ++i) {
+                *reinterpret_cast<uint16_t*>(kd) = keys[i].size();
+                std::memcpy(kd + 2, keys[i].data(), keys[i].size());
+                kd += 2 + keys[i].size();
+                val[i] = i;
+            }
+        }
 
         std::map<std::string, uint64_t> m;
-        for (int i = 0; i < actual_n; ++i) m[keys[i]] = i;
-        
-        // Estimate std::map memory: ~88 bytes per node (key + value + RB overhead)
-        size_t avg_key_len = 0;
-        for (auto& k : keys) avg_key_len += k.size();
-        avg_key_len /= actual_n;
-        size_t map_bytes = actual_n * (48 + avg_key_len + 32);  // node overhead + key + string overhead
+        for (int i = 0; i < n; ++i) m[keys[i]] = i;
+
+        // Verify
+        for (int i = 0; i < n; ++i) {
+            auto* v = find_eyt<uint64_t>(data, n, kb, ec, W, (const uint8_t*)keys[i].data(), keys[i].size());
+            if (!v || *v != (uint64_t)i) { std::cout << "FAIL\n"; return 1; }
+        }
 
         std::vector<std::string> lookups;
-        for (int i = 0; i < 1000; ++i)
-            lookups.push_back(keys[rng() % actual_n]);
-
-        // Count average comparisons
-        int total_cmps = 0;
-        for (auto& k : lookups) {
-            int cmps = 0;
-            find_counted<uint64_t>(data, h.count, h.keys_bytes,
-                reinterpret_cast<const uint8_t*>(k.data()), k.size(), cmps);
-            total_cmps += cmps;
-        }
-        double avg_cmps = (double)total_cmps / lookups.size();
+        for (int i = 0; i < 1000; ++i) lookups.push_back(keys[rng() % n]);
 
         volatile uint64_t sink = 0;
+        const int REPS = 1000;
 
-        // Warmup
-        for (int rep = 0; rep < 100; ++rep)
+        for (int rep = 0; rep < 500; ++rep) {
             for (auto& k : lookups) {
-                auto* v = find_fast<uint64_t>(data, h.count, h.keys_bytes,
-                    reinterpret_cast<const uint8_t*>(k.data()), k.size());
-                if (v) sink += *v;
+                sink += *find_eyt<uint64_t>(data, n, kb, ec, W, (const uint8_t*)k.data(), k.size());
+                sink += m.find(k)->second;
             }
+        }
 
-        // Benchmark kstrie
-        auto t0 = std::chrono::high_resolution_clock::now();
-        for (int rep = 0; rep < 1000; ++rep)
-            for (auto& k : lookups) {
-                auto* v = find_fast<uint64_t>(data, h.count, h.keys_bytes,
-                    reinterpret_cast<const uint8_t*>(k.data()), k.size());
-                if (v) sink += *v;
-            }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double ns_kst = std::chrono::duration<double, std::nano>(t1 - t0).count() / 1e6;
+        double best_eyt = 1e9, best_map = 1e9;
+        
+        for (int run = 0; run < 5; ++run) {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (int rep = 0; rep < REPS; ++rep)
+                for (auto& k : lookups)
+                    sink += *find_eyt<uint64_t>(data, n, kb, ec, W, (const uint8_t*)k.data(), k.size());
+            auto t1 = std::chrono::high_resolution_clock::now();
+            best_eyt = std::min(best_eyt, std::chrono::duration<double, std::nano>(t1-t0).count() / (REPS * lookups.size()));
 
-        // Benchmark std::map
-        t0 = std::chrono::high_resolution_clock::now();
-        for (int rep = 0; rep < 1000; ++rep)
-            for (auto& k : lookups) {
-                auto it = m.find(k);
-                if (it != m.end()) sink += it->second;
-            }
-        t1 = std::chrono::high_resolution_clock::now();
-        double ns_map = std::chrono::duration<double, std::nano>(t1 - t0).count() / 1e6;
+            t0 = std::chrono::high_resolution_clock::now();
+            for (int rep = 0; rep < REPS; ++rep)
+                for (auto& k : lookups)
+                    sink += m.find(k)->second;
+            t1 = std::chrono::high_resolution_clock::now();
+            best_map = std::min(best_map, std::chrono::duration<double, std::nano>(t1-t0).count() / (REPS * lookups.size()));
+        }
 
-        std::cout << std::setw(6) << actual_n 
-                  << std::setw(8) << std::fixed << std::setprecision(1) << ns_kst << "ns"
-                  << std::setw(8) << ns_map << "ns"
-                  << std::setw(7) << std::setprecision(2) << ns_map/ns_kst << "x"
-                  << std::setw(10) << kst_bytes
-                  << std::setw(10) << map_bytes
-                  << std::setw(7) << std::setprecision(1) << (double)map_bytes/kst_bytes << "x"
-                  << std::setw(7) << std::setprecision(1) << avg_cmps << "\n";
+        std::cout << std::setw(6) << n 
+                  << std::setw(7) << std::fixed << std::setprecision(1) << best_eyt << "ns"
+                  << std::setw(7) << best_map << "ns"
+                  << std::setw(7) << std::setprecision(2) << best_map/best_eyt << "x"
+                  << std::setw(6) << ic
+                  << std::setw(6) << W
+                  << std::setw(6) << ec
+                  << std::setw(8) << bytes << "\n";
+
+        delete[] data;
     }
-
     return 0;
 }
