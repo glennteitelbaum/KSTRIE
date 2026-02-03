@@ -94,8 +94,9 @@ After:   Node with skip=20, prefix="https://example.com/"
 ```
 
 **Properties:**
-- Skip length has no maximum — stored as `uint32_t`
-- Prefix bytes stored immediately after header, 8-byte aligned
+- Skip prefix stored inline immediately after header
+- Length encoded with continuation: first byte is length (0-254), or 255 meaning "read next 2 bytes as uint16_t length"
+- Prefix bytes follow length, 8-byte aligned
 - Applied recursively during node splits
 - Dramatically reduces memory for keys with common prefixes (URLs, paths, etc.)
 
@@ -107,7 +108,7 @@ After:   Node with skip=20, prefix="https://example.com/"
 
 The compact node capacity of 4096 entries is chosen for several reasons:
 
-1. **Split distribution**: 4096 / 256 = 16 entries per child on average after split — optimal for the three-tier search
+1. **Split distribution**: When a compact node splits into a bitmap node, entries are distributed across up to 256 children (one per byte value). With 4096 entries: 4096 / 256 = 16 entries per child on average. This keeps children small enough for efficient linear scans.
 
 2. **Cache efficiency**: At 4096 entries with ~16-byte average keys:
    - hot array: ~1KB
@@ -117,7 +118,7 @@ The compact node capacity of 4096 entries is chosen for several reasons:
 
 3. **Search depth**: log₂(128) = 7 Eytzinger comparisons + 4 idx scans + 8 key scans = 19 comparisons max
 
-4. **Tiered structure**: 16 × 16 × 16 = 4096, matching the three-tier indexed search
+4. **Post-split child size**: After split, each child averages 16 entries — small enough that the three-tier search (Eytzinger → idx → keys) degenerates to simple linear scan, which is optimal for such small N.
 
 ---
 
@@ -146,7 +147,7 @@ One IdxEntry per 8 keys. Linear scan identifies the correct 8-key block.
 
 Full key comparison against packed keys in `keys[]` array.
 
-**Total comparisons**: O(log N) + O(4) + O(8) ≈ 7 + 4 + 8 = 19 for N=4096
+**Total comparisons**: O(log M) + O(4) + O(8) ≈ 7 + 4 + 8 = 19 for N=4096 (where M = max suffix length at this node)
 
 ---
 
@@ -332,7 +333,7 @@ All nodes are allocated as `uint64_t*` arrays, ensuring 8-byte alignment through
 
 **Compact node regions (in order):**
 1. Header (16 bytes)
-2. Skip prefix (8-byte aligned)
+2. Skip prefix: [length byte(s)][prefix bytes], 8-byte aligned total
 3. EOS value slot (if present)
 4. Hot array: `(ec + 1) × 8` bytes
 5. Idx array: `ic × 16` bytes
@@ -341,7 +342,7 @@ All nodes are allocated as `uint64_t*` arrays, ensuring 8-byte alignment through
 
 **Bitmap node regions (in order):**
 1. Header (16 bytes)
-2. Skip prefix (8-byte aligned)
+2. Skip prefix: [length byte(s)][prefix bytes], 8-byte aligned total
 3. EOS value slot (if present)
 4. Bitmap256 (32 bytes)
 5. Child pointers: `popcount × 8` bytes
@@ -350,12 +351,13 @@ All nodes are allocated as `uint64_t*` arrays, ensuring 8-byte alignment through
 
 ## 13. Performance Characteristics
 
-### Search: O(k + log N) where k = key length / average skip
+### Search: O(k + log M) where k = trie depth, M = max key length
 
 - Trie descent: O(k) node visits, each O(1) bitmap lookup
-- Compact node search: O(log N) Eytzinger + O(1) linear scans
+- Compact node search: O(log M) Eytzinger + O(1) linear scans
+- Note: N (entry count) does not appear — search time depends on key length, not dataset size
 
-### Insert: O(k + log N) amortized
+### Insert: O(k + log M) amortized
 
 - Same traversal cost as search
 - Node reallocation on insert (copy + insert in sorted position)
@@ -422,8 +424,10 @@ The current key is reconstructed by accumulating:
 |-----------|--------|--------|--------|---------|
 | `std::map` | O(log N) | O(log N) | High | Yes |
 | `std::unordered_map` | O(1) avg | O(1) avg | Medium | No |
-| Radix trie | O(k) | O(k) | Very High | Yes |
-| kstrie | O(k + log N) | O(k + log N) | Low | Yes |
+| Radix trie | O(M) | O(M) | Very High | Yes |
+| kstrie | O(k + log M) | O(k + log M) | Low | Yes |
+
+Where N = entry count, M = max key length, k = trie depth (reduced by skip compression).
 
 kstrie excels when:
 - Keys have common prefixes (URLs, file paths, identifiers)
