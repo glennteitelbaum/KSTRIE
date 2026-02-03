@@ -38,9 +38,9 @@ A flat, sorted array of key suffixes and values. Used when entry count ≤ 4096.
 
 ```
 ┌─────────────────────────────────────────────────┐
-│ NodeHeader (12B padded to 16B)                  │
+│ NodeHeader (8B)                                 │
 ├─────────────────────────────────────────────────┤
-│ prefix[skip] (if skip > 0)                      │
+│ prefix[skip_bytes] (if skip > 0)                │
 ├─────────────────────────────────────────────────┤
 │ eos_value (if has_eos)                          │
 ├─────────────────────────────────────────────────┤
@@ -65,9 +65,9 @@ A 256-way dispatch node using bitmap compression. Created when a compact node ex
 
 ```
 ┌─────────────────────────────────────────────────┐
-│ NodeHeader (12B padded to 16B)                  │
+│ NodeHeader (8B)                                 │
 ├─────────────────────────────────────────────────┤
-│ prefix[skip] (if skip > 0)                      │
+│ prefix[skip_bytes] (if skip > 0)                │
 ├─────────────────────────────────────────────────┤
 │ eos_value (if has_eos)                          │
 ├─────────────────────────────────────────────────┤
@@ -93,12 +93,30 @@ After:   Node with skip=20, prefix="https://example.com/"
          Keys store only ["a", "b", ...]
 ```
 
+**Encoding (uint8_t skip field):**
+- `skip = 0`: No prefix
+- `skip = 1-254`: Prefix is exactly `skip` bytes
+- `skip = 255`: Continuation — 254 bytes here, child node has more prefix
+
+**Continuation nodes:** For prefixes longer than 254 bytes (rare), a chain of continuation nodes is used:
+```
+Prefix of 400 bytes:
+  Node A: skip=255, prefix[0..253], child_ptr → Node B
+  Node B: skip=146, prefix[0..145], then normal data
+```
+
+Continuation nodes have:
+- `skip = 255` (continuation marker)
+- 254 bytes of prefix stored inline
+- Single child pointer immediately after prefix
+- No bitmap, no compact data — just prefix + pointer
+
 **Properties:**
-- Skip prefix stored inline immediately after header
-- Length encoded with continuation: first byte is length (0-254), or 255 meaning "read next 2 bytes as uint16_t length"
-- Prefix bytes follow length, 8-byte aligned
+- 254 bytes covers virtually all real-world prefixes (URLs, paths, identifiers)
+- Header is only 8 bytes total (skip is uint8_t, not uint32_t)
+- Prefix bytes stored immediately after header, 8-byte aligned
 - Applied recursively during node splits
-- Dramatically reduces memory for keys with common prefixes (URLs, paths, etc.)
+- Dramatically reduces memory for keys with common prefixes
 
 **Detection:** During split, if all entries share a common first byte, that byte becomes part of the skip prefix. This repeats until divergence.
 
@@ -331,9 +349,19 @@ EOS values are stored immediately after the prefix region, before the data array
 
 All nodes are allocated as `uint64_t*` arrays, ensuring 8-byte alignment throughout.
 
+**NodeHeader (8 bytes):**
+```cpp
+struct NodeHeader {
+    uint32_t keys_bytes;  // 4B - total keys[] region size
+    uint16_t count;       // 2B - entry count (excl EOS)
+    uint8_t  skip;        // 1B - 0=none, 1-254=bytes, 255=continuation
+    uint8_t  flags;       // 1B - bit0: is_compact, bit1: has_eos
+};
+```
+
 **Compact node regions (in order):**
-1. Header (16 bytes)
-2. Skip prefix: [length byte(s)][prefix bytes], 8-byte aligned total
+1. Header (8 bytes)
+2. Skip prefix (0 to 254 bytes, 8-byte aligned)
 3. EOS value slot (if present)
 4. Hot array: `(ec + 1) × 8` bytes
 5. Idx array: `ic × 16` bytes
@@ -341,11 +369,17 @@ All nodes are allocated as `uint64_t*` arrays, ensuring 8-byte alignment through
 7. Values: `N × sizeof(value_slot_type)`, 8-byte aligned
 
 **Bitmap node regions (in order):**
-1. Header (16 bytes)
-2. Skip prefix: [length byte(s)][prefix bytes], 8-byte aligned total
+1. Header (8 bytes)
+2. Skip prefix (0 to 254 bytes, 8-byte aligned)
 3. EOS value slot (if present)
 4. Bitmap256 (32 bytes)
 5. Child pointers: `popcount × 8` bytes
+
+**Continuation node (skip=255):**
+1. Header (8 bytes)
+2. Prefix (254 bytes, padded to 256 = 32 × 8)
+3. Child pointer (8 bytes)
+Total: 272 bytes per continuation node
 
 ---
 

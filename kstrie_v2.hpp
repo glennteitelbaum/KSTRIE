@@ -124,22 +124,30 @@ struct ValueTraits {
 };
 
 // ============================================================================
-// NodeHeader — 12 bytes (padded)
+// NodeHeader — 8 bytes
 // ============================================================================
 
 struct NodeHeader {
-    uint32_t keys_bytes;    // total size of keys[] region
-    uint32_t skip;          // shared prefix bytes
+    uint32_t keys_bytes;    // total size of keys[] region (compact only)
     uint16_t count;         // entry count (excl EOS), max 4096
+    uint8_t  skip;          // 0=none, 1-254=byte count, 255=continuation (254 bytes + child)
     uint8_t  flags;         // bit0: is_compact, bit1: has_eos
+
+    static constexpr uint8_t SKIP_CONTINUATION = 255;
+    static constexpr uint8_t SKIP_MAX_INLINE = 254;
 
     [[nodiscard]] bool is_compact() const noexcept { return flags & 1; }
     [[nodiscard]] bool is_bitmap()  const noexcept { return !(flags & 1); }
     [[nodiscard]] bool has_eos()    const noexcept { return (flags >> 1) & 1; }
+    [[nodiscard]] bool is_continuation() const noexcept { return skip == SKIP_CONTINUATION; }
+    [[nodiscard]] uint32_t skip_bytes() const noexcept { 
+        return skip == SKIP_CONTINUATION ? SKIP_MAX_INLINE : skip; 
+    }
 
     void set_compact(bool v) noexcept { if (v) flags |= 1; else flags &= ~uint8_t(1); }
     void set_eos(bool v)     noexcept { if (v) flags |= 2; else flags &= ~uint8_t(2); }
 };
+static_assert(sizeof(NodeHeader) == 8);
 
 // ============================================================================
 // IdxEntry — 16 bytes
@@ -354,14 +362,16 @@ private:
     }
 
     static constexpr std::size_t header_u64() noexcept {
-        return (sizeof(NodeHeader) + 7) / 8;  // 2 u64
+        return 1;  // 8 bytes = 1 u64
     }
 
-    static std::size_t prefix_u64(uint32_t skip) noexcept {
-        return skip > 0 ? (skip + 7) / 8 : 0;
+    static std::size_t prefix_u64(uint8_t skip) noexcept {
+        uint32_t skip_bytes = (skip == NodeHeader::SKIP_CONTINUATION) 
+            ? NodeHeader::SKIP_MAX_INLINE : skip;
+        return skip_bytes > 0 ? (skip_bytes + 7) / 8 : 0;
     }
 
-    static std::size_t header_and_prefix_u64(uint32_t skip) noexcept {
+    static std::size_t header_and_prefix_u64(uint8_t skip) noexcept {
         return header_u64() + prefix_u64(skip);
     }
 
@@ -374,21 +384,21 @@ private:
         return align8(sizeof(T)) / 8;
     }
 
-    static std::size_t data_offset_u64(uint32_t skip, bool has_eos) noexcept {
+    static std::size_t data_offset_u64(uint8_t skip, bool has_eos) noexcept {
         return header_and_prefix_u64(skip) + (has_eos ? eos_u64<VST>() : 0);
     }
 
-    static const VST& eos_slot(const uint64_t* n, uint32_t skip) noexcept {
+    static const VST& eos_slot(const uint64_t* n, uint8_t skip) noexcept {
         return *reinterpret_cast<const VST*>(n + header_and_prefix_u64(skip));
     }
 
     // -- bitmap node accessors ----------------------------------------------
 
-    static const Bitmap256& bm_bitmap(const uint64_t* n, uint32_t skip, bool has_eos) noexcept {
+    static const Bitmap256& bm_bitmap(const uint64_t* n, uint8_t skip, bool has_eos) noexcept {
         return *reinterpret_cast<const Bitmap256*>(n + data_offset_u64(skip, has_eos));
     }
 
-    static const uint64_t* bm_children(const uint64_t* n, uint32_t skip, bool has_eos) noexcept {
+    static const uint64_t* bm_children(const uint64_t* n, uint8_t skip, bool has_eos) noexcept {
         return n + data_offset_u64(skip, has_eos) + BITMAP256_U64;
     }
 
@@ -534,16 +544,24 @@ private:
         uint32_t consumed = 0;
 
         for (;;) {
-            const NodeHeader h = hdr(node);
+            NodeHeader h = hdr(node);
 
-            // --- Skip prefix ---
-            if (h.skip > 0) {
+            // --- Skip prefix (with continuation support) ---
+            while (h.skip > 0) {
+                uint32_t skip_bytes = h.skip_bytes();
                 uint32_t remaining = key_len - consumed;
-                if (remaining < h.skip)
+                if (remaining < skip_bytes)
                     return nullptr;
-                if (std::memcmp(key_data + consumed, node_prefix(node), h.skip) != 0)
+                if (std::memcmp(key_data + consumed, node_prefix(node), skip_bytes) != 0)
                     return nullptr;
-                consumed += h.skip;
+                consumed += skip_bytes;
+
+                if (!h.is_continuation()) break;
+                
+                // Continuation: follow child pointer for more prefix
+                node = *reinterpret_cast<const uint64_t* const*>(
+                    node + header_and_prefix_u64(h.skip));
+                h = hdr(node);
             }
 
             // --- EOS check ---
