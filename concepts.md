@@ -462,20 +462,55 @@ Compare to `std::map` with N=4096: ~12 pointer chases, ~12 branch mispredicts, ~
 
 ---
 
-## 14. Alphabet Mapping
+## 14. Character Mapping (char_map)
 
-An optional byte-to-byte mapping applied to all keys:
+kstrie uses compile-time character mapping to enable:
+1. **Case-insensitive keys**: "Foo" and "foo" are the same key
+2. **Restricted alphabets**: Smaller bitmaps for domain-specific keys
+3. **Custom collation**: Reverse ordering, character collapsing, etc.
+
+### 14.1 User-Provided Mapping
+
+Users provide a simple 256-byte array mapping input chars to output chars:
 
 ```cpp
-struct Alphabet {
-    uint8_t map[256];
-    
-    static Alphabet identity();          // No transformation
-    static Alphabet case_insensitive();  // A-Z → a-z
-};
+// Case-insensitive: A-Z and a-z both map to uppercase
+constexpr std::array<uint8_t, 256> UPPER_MAP = [](){
+    std::array<uint8_t, 256> m{};
+    for (int i = 0; i < 256; ++i) m[i] = '*';  // catchall
+    for (int i = 'A'; i <= 'Z'; ++i) m[i] = i;
+    for (int i = 'a'; i <= 'z'; ++i) m[i] = 'A' + (i - 'a');
+    for (int i = '0'; i <= '9'; ++i) m[i] = i;
+    m[' '] = ' '; m[','] = ','; m['-'] = '-'; m['.'] = '.'; m['\''] = '\'';
+    m[0] = 0;
+    return m;
+}();
+
+kstrie<int, char_map<UPPER_MAP>> trie;
 ```
 
-With case-insensitive alphabet, "Foo" and "foo" are the same key. The trie stores mapped bytes only; original case is not preserved.
+### 14.2 Compile-Time Optimization
+
+The `char_map` template computes at compile time:
+
+| Condition | BITMAP_WORDS | Mapping |
+|-----------|--------------|---------|
+| IS_IDENTITY (map[i] == i for all i) | 4 (32 bytes) | No mapping needed |
+| ≤ 64 unique values | 1 (8 bytes) | Remap to 1-based dense indices |
+| ≤ 128 unique values | 2 (16 bytes) | Remap to 1-based dense indices |
+| > 128 unique values | 4 (32 bytes) | Use user map as-is |
+
+**Example**: `UPPER_MAP` has 42 unique values (26 letters + 10 digits + 5 punctuation + catchall), so BITMAP_WORDS = 1. Bitmap nodes shrink from 32 bytes to 8 bytes.
+
+### 14.3 Pre-defined Maps
+
+```cpp
+using IdentityCharMap = char_map<IDENTITY_MAP>;       // Full 256-char, no transform
+using UpperCharMap = char_map<UPPER_MAP>;             // Case-insensitive
+using ReverseLowerCharMap = char_map<REVERSE_LOWER_MAP>;  // A->z, B->y, etc.
+```
+
+With restricted alphabets, if multiple input chars map to the same output, they are considered identical keys — this is the intended behavior for case-insensitivity, etc.
 
 ---
 

@@ -16,22 +16,36 @@
 namespace gteitelbaum {
 
 // ============================================================================
-// Bitmap256
+// BitmapN — templated on word count (1, 2, or 4)
 // ============================================================================
 
-struct Bitmap256 {
-    uint64_t words[4]{};
+template <size_t WORDS>
+struct BitmapN {
+    static_assert(WORDS == 1 || WORDS == 2 || WORDS == 4);
+    uint64_t words[WORDS]{};
 
     [[nodiscard]] bool has_bit(uint8_t idx) const noexcept {
-        return (words[idx >> 6] >> (idx & 63)) & 1;
+        if constexpr (WORDS == 1) {
+            return (words[0] >> idx) & 1;
+        } else {
+            return (words[idx >> 6] >> (idx & 63)) & 1;
+        }
     }
 
     void set_bit(uint8_t idx) noexcept {
-        words[idx >> 6] |= uint64_t(1) << (idx & 63);
+        if constexpr (WORDS == 1) {
+            words[0] |= uint64_t(1) << idx;
+        } else {
+            words[idx >> 6] |= uint64_t(1) << (idx & 63);
+        }
     }
 
     void clear_bit(uint8_t idx) noexcept {
-        words[idx >> 6] &= ~(uint64_t(1) << (idx & 63));
+        if constexpr (WORDS == 1) {
+            words[0] &= ~(uint64_t(1) << idx);
+        } else {
+            words[idx >> 6] &= ~(uint64_t(1) << (idx & 63));
+        }
     }
 
     [[nodiscard]] int find_slot(uint8_t idx) const noexcept {
@@ -40,13 +54,18 @@ struct Bitmap256 {
     }
 
     [[nodiscard]] int count_below(uint8_t idx) const noexcept {
-        int w = idx >> 6;
-        uint64_t mask = (uint64_t(1) << (idx & 63)) - 1;
-        int cnt = 0;
-        for (int i = 0; i < w; ++i)
-            cnt += std::popcount(words[i]);
-        cnt += std::popcount(words[w] & mask);
-        return cnt;
+        if constexpr (WORDS == 1) {
+            uint64_t mask = (uint64_t(1) << idx) - 1;
+            return std::popcount(words[0] & mask);
+        } else {
+            int w = idx >> 6;
+            uint64_t mask = (uint64_t(1) << (idx & 63)) - 1;
+            int cnt = 0;
+            for (int i = 0; i < w; ++i)
+                cnt += std::popcount(words[i]);
+            cnt += std::popcount(words[w] & mask);
+            return cnt;
+        }
     }
 
     [[nodiscard]] int slot_for_insert(uint8_t idx) const noexcept {
@@ -54,45 +73,174 @@ struct Bitmap256 {
     }
 
     [[nodiscard]] int popcount() const noexcept {
-        return std::popcount(words[0]) + std::popcount(words[1]) +
-               std::popcount(words[2]) + std::popcount(words[3]);
+        if constexpr (WORDS == 1) {
+            return std::popcount(words[0]);
+        } else if constexpr (WORDS == 2) {
+            return std::popcount(words[0]) + std::popcount(words[1]);
+        } else {
+            return std::popcount(words[0]) + std::popcount(words[1]) +
+                   std::popcount(words[2]) + std::popcount(words[3]);
+        }
     }
 
     [[nodiscard]] int find_next_set(int start) const noexcept {
+        constexpr int MAX_BITS = WORDS * 64;
         if (start < 0) start = 0;
-        if (start >= 256) return -1;
+        if (start >= MAX_BITS) return -1;
         int w = start >> 6;
         uint64_t masked = words[w] & (~uint64_t(0) << (start & 63));
         while (true) {
             if (masked) return w * 64 + std::countr_zero(masked);
-            if (++w >= 4) return -1;
+            if (++w >= static_cast<int>(WORDS)) return -1;
             masked = words[w];
         }
     }
 };
 
+// Backwards compatibility alias
+using Bitmap256 = BitmapN<4>;
+
 // ============================================================================
-// Alphabet
+// char_map — compile-time character mapping
 // ============================================================================
 
-struct Alphabet {
-    uint8_t map[256];
+// Identity map (default)
+inline constexpr std::array<uint8_t, 256> IDENTITY_MAP = [](){
+    std::array<uint8_t, 256> m{};
+    for (int i = 0; i < 256; ++i) m[i] = static_cast<uint8_t>(i);
+    return m;
+}();
 
-    static Alphabet identity() noexcept {
-        Alphabet a;
-        for (int i = 0; i < 256; ++i) a.map[i] = static_cast<uint8_t>(i);
-        return a;
+// Upper case: A-Z/a-z -> A-Z, preserves 0-9 and punctuation, else '*'
+inline constexpr std::array<uint8_t, 256> UPPER_MAP = [](){
+    std::array<uint8_t, 256> m{};
+    for (int i = 0; i < 256; ++i) m[i] = '*';
+    for (int i = 'A'; i <= 'Z'; ++i) m[i] = static_cast<uint8_t>(i);
+    for (int i = 'a'; i <= 'z'; ++i) m[i] = static_cast<uint8_t>('A' + (i - 'a'));
+    for (int i = '0'; i <= '9'; ++i) m[i] = static_cast<uint8_t>(i);
+    m[' '] = ' '; m[','] = ','; m['-'] = '-'; m['.'] = '.'; m['\''] = '\'';
+    m[0] = 0;  // Keep null as null
+    return m;
+}();
+
+// Reverse lower: A/a->z, B/b->y, ..., Z/z->a, preserves 0-9 and punctuation, else '*'
+inline constexpr std::array<uint8_t, 256> REVERSE_LOWER_MAP = [](){
+    std::array<uint8_t, 256> m{};
+    for (int i = 0; i < 256; ++i) m[i] = '*';
+    for (int i = 'A'; i <= 'Z'; ++i) m[i] = static_cast<uint8_t>('z' - (i - 'A'));
+    for (int i = 'a'; i <= 'z'; ++i) m[i] = static_cast<uint8_t>('z' - (i - 'a'));
+    for (int i = '0'; i <= '9'; ++i) m[i] = static_cast<uint8_t>(i);
+    m[' '] = ' '; m[','] = ','; m['-'] = '-'; m['.'] = '.'; m['\''] = '\'';
+    m[0] = 0;  // Keep null as null
+    return m;
+}();
+
+template <std::array<uint8_t, 256> USER_MAP>
+struct char_map {
+private:
+    // Check if map is identity
+    static constexpr bool compute_is_identity() {
+        return USER_MAP == IDENTITY_MAP;
     }
 
-    static Alphabet case_insensitive() noexcept {
-        Alphabet a = identity();
-        for (int i = 'A'; i <= 'Z'; ++i)
-            a.map[i] = static_cast<uint8_t>(i - 'A' + 'a');
-        return a;
+    // Count unique values in user map
+    static constexpr size_t compute_unique_count() {
+        std::array<bool, 256> seen{};
+        size_t n = 0;
+        for (int c = 0; c < 256; ++c) {
+            if (!seen[USER_MAP[c]]) {
+                seen[USER_MAP[c]] = true;
+                n++;
+            }
+        }
+        return n;
     }
 
-    uint8_t operator()(uint8_t c) const noexcept { return map[c]; }
+    // Gather sorted unique values
+    static constexpr auto gather_sorted_unique() {
+        std::array<uint8_t, 256> vals{};
+        std::array<bool, 256> seen{};
+        size_t n = 0;
+        
+        for (int c = 0; c < 256; ++c) {
+            uint8_t v = USER_MAP[c];
+            if (!seen[v]) {
+                seen[v] = true;
+                vals[n++] = v;
+            }
+        }
+        // Bubble sort (small n, compile time)
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                if (vals[j] < vals[i]) {
+                    auto t = vals[i]; vals[i] = vals[j]; vals[j] = t;
+                }
+            }
+        }
+        return std::pair{vals, n};
+    }
+
+    // Build value -> 1-based index map
+    static constexpr auto compute_value_to_index() {
+        auto [vals, n] = gather_sorted_unique();
+        std::array<uint8_t, 256> m{};
+        for (size_t i = 0; i < n; ++i) {
+            m[vals[i]] = static_cast<uint8_t>(i + 1);
+        }
+        return m;
+    }
+
+    // Build final char -> index map
+    static constexpr auto compute_char_to_index() {
+        auto v2i = compute_value_to_index();
+        std::array<uint8_t, 256> m{};
+        for (int c = 0; c < 256; ++c) {
+            m[c] = v2i[USER_MAP[c]];
+        }
+        return m;
+    }
+
+    // Build index -> canonical char map (for iteration)
+    static constexpr auto compute_index_to_char() {
+        auto [vals, n] = gather_sorted_unique();
+        std::array<uint8_t, 256> m{};
+        for (size_t i = 0; i < n; ++i) {
+            m[i + 1] = vals[i];
+        }
+        return m;
+    }
+
+public:
+    static constexpr bool IS_IDENTITY = compute_is_identity();
+    static constexpr size_t UNIQUE_COUNT = IS_IDENTITY ? 256 : compute_unique_count();
+    static constexpr size_t BITMAP_WORDS = 
+        IS_IDENTITY ? 4 :
+        (UNIQUE_COUNT <= 64) ? 1 : 
+        (UNIQUE_COUNT <= 128) ? 2 : 4;
+    static constexpr bool NEEDS_REMAP = !IS_IDENTITY && (BITMAP_WORDS < 4);
+    
+    static constexpr std::array<uint8_t, 256> CHAR_TO_INDEX = 
+        NEEDS_REMAP ? compute_char_to_index() : USER_MAP;
+    static constexpr std::array<uint8_t, 256> INDEX_TO_CHAR = 
+        NEEDS_REMAP ? compute_index_to_char() : USER_MAP;  // For identity, same map works
+    
+    static constexpr uint8_t to_index(uint8_t c) noexcept {
+        if constexpr (IS_IDENTITY) return c;
+        else return CHAR_TO_INDEX[c];
+    }
+    
+    static constexpr uint8_t from_index(uint8_t i) noexcept {
+        if constexpr (IS_IDENTITY) return i;
+        else return INDEX_TO_CHAR[i];
+    }
+    
+    using Bitmap = BitmapN<BITMAP_WORDS>;
 };
+
+// Default char map
+using IdentityCharMap = char_map<IDENTITY_MAP>;
+using UpperCharMap = char_map<UPPER_MAP>;
+using ReverseLowerCharMap = char_map<REVERSE_LOWER_MAP>;
 
 // ============================================================================
 // Value traits
@@ -313,7 +461,9 @@ inline int build_eyt(const E* idx, int ic, E* hot) noexcept {
 // kstrie
 // ============================================================================
 
-template <typename VALUE, typename ALLOC = std::allocator<uint64_t>>
+template <typename VALUE, 
+          typename CHARMAP = IdentityCharMap,
+          typename ALLOC = std::allocator<uint64_t>>
 class kstrie {
 public:
     using key_type       = std::string;
@@ -321,10 +471,13 @@ public:
     using value_type     = std::pair<const std::string, VALUE>;
     using size_type      = std::size_t;
     using allocator_type = ALLOC;
+    using char_map_type  = CHARMAP;
 
 private:
     using VT  = ValueTraits<VALUE>;
     using VST = typename VT::slot_type;
+    using Bitmap = typename CHARMAP::Bitmap;
+    static constexpr size_t BITMAP_U64 = CHARMAP::BITMAP_WORDS;
 
     using byte_alloc_type =
         typename std::allocator_traits<ALLOC>::template rebind_alloc<uint8_t>;
@@ -332,7 +485,6 @@ private:
     uint64_t* root_{};
     size_type size_{};
     [[no_unique_address]] ALLOC alloc_{};
-    Alphabet alphabet_{Alphabet::identity()};
 
     // -- node alloc ---------------------------------------------------------
 
@@ -388,12 +540,12 @@ private:
 
     // -- bitmap node accessors ----------------------------------------------
 
-    static const Bitmap256& bm_bitmap(const uint64_t* n, uint8_t skip, bool has_eos) noexcept {
-        return *reinterpret_cast<const Bitmap256*>(n + data_offset_u64(skip, has_eos));
+    static const Bitmap& bm_bitmap(const uint64_t* n, uint8_t skip, bool has_eos) noexcept {
+        return *reinterpret_cast<const Bitmap*>(n + data_offset_u64(skip, has_eos));
     }
 
     static const uint64_t* bm_children(const uint64_t* n, uint8_t skip, bool has_eos) noexcept {
-        return n + data_offset_u64(skip, has_eos) + BITMAP256_U64;
+        return n + data_offset_u64(skip, has_eos) + BITMAP_U64;
     }
 
     // -- init ---------------------------------------------------------------
@@ -445,7 +597,7 @@ private:
             dealloc_node(node, (node_bytes + 7) / 8);
         } else {
             // Bitmap node
-            const Bitmap256& bm = bm_bitmap(node, h.skip, h.has_eos());
+            const Bitmap& bm = bm_bitmap(node, h.skip, h.has_eos());
             const uint64_t* children = bm_children(node, h.skip, h.has_eos());
             int top_count = bm.popcount();
 
@@ -458,7 +610,7 @@ private:
             }
 
             std::size_t node_u64 = data_offset_u64(h.skip, h.has_eos()) +
-                                   BITMAP256_U64 + top_count;
+                                   BITMAP_U64 + top_count;
             dealloc_node(node, node_u64);
         }
     }
@@ -575,7 +727,7 @@ private:
             uint8_t byte = key_data[consumed];
             consumed++;
 
-            const Bitmap256& bm = bm_bitmap(node, h.skip, h.has_eos());
+            const Bitmap& bm = bm_bitmap(node, h.skip, h.has_eos());
             int slot = bm.find_slot(byte);
             if (slot < 0) return nullptr;
 
@@ -589,11 +741,15 @@ private:
             static_cast<const kstrie*>(this)->find_impl(key_data, key_len));
     }
 
-    // Map key through alphabet
+    // Map key through char_map
     uint32_t map_key(std::string_view key, uint8_t* buf) const noexcept {
         uint32_t len = static_cast<uint32_t>(key.size());
-        for (uint32_t i = 0; i < len; ++i)
-            buf[i] = alphabet_.map[static_cast<uint8_t>(key[i])];
+        if constexpr (CHARMAP::IS_IDENTITY) {
+            std::memcpy(buf, key.data(), len);
+        } else {
+            for (uint32_t i = 0; i < len; ++i)
+                buf[i] = CHARMAP::to_index(static_cast<uint8_t>(key[i]));
+        }
         return len;
     }
 
@@ -604,10 +760,6 @@ public:
 
     kstrie() { init_empty_root(); }
 
-    explicit kstrie(const Alphabet& alphabet) : alphabet_(alphabet) {
-        init_empty_root();
-    }
-
     ~kstrie() {
         if (root_) destroy_tree(root_);
     }
@@ -616,8 +768,7 @@ public:
     kstrie& operator=(const kstrie&) = delete;
 
     kstrie(kstrie&& o) noexcept
-        : root_(o.root_), size_(o.size_), alloc_(std::move(o.alloc_)),
-          alphabet_(o.alphabet_) {
+        : root_(o.root_), size_(o.size_), alloc_(std::move(o.alloc_)) {
         o.root_ = nullptr;
         o.size_ = 0;
     }
@@ -626,7 +777,7 @@ public:
         if (this != &o) {
             if (root_) destroy_tree(root_);
             root_ = o.root_; size_ = o.size_;
-            alloc_ = std::move(o.alloc_); alphabet_ = o.alphabet_;
+            alloc_ = std::move(o.alloc_);
             o.root_ = nullptr; o.size_ = 0;
         }
         return *this;
@@ -681,6 +832,270 @@ public:
     bool insert(std::string_view key, const VALUE& value);
     size_type erase(std::string_view key);
     void clear() noexcept;
+
+private:
+    // ===================================================================
+    // INSERT IMPLEMENTATION
+    // ===================================================================
+
+    // Result of insert operation
+    struct InsertResult {
+        uint64_t* node;     // possibly reallocated node
+        bool inserted;      // true if new key, false if updated existing
+    };
+
+    // -----------------------------------------------------------------------
+    // insert_impl — recursive trie descent
+    // -----------------------------------------------------------------------
+
+    InsertResult insert_impl(uint64_t* node, const uint8_t* key_data, 
+                             uint32_t key_len, const VALUE& value,
+                             uint32_t consumed) {
+        NodeHeader h = hdr(node);
+
+        // --- Handle skip prefix (with continuation) ---
+        while (h.skip > 0) {
+            uint32_t skip_bytes = h.skip_bytes();
+            uint32_t remaining = key_len - consumed;
+            const uint8_t* prefix = node_prefix(node);
+
+            if (remaining < skip_bytes) {
+                // Key exhausted within prefix — need to split
+                uint32_t match_len = 0;
+                while (match_len < remaining && 
+                       key_data[consumed + match_len] == prefix[match_len]) {
+                    match_len++;
+                }
+                if (match_len < remaining) {
+                    // Mismatch before key ended
+                    return split_prefix(node, h, key_data, key_len, value, 
+                                       consumed, match_len);
+                }
+                // Key matches prefix up to key's end — split and add EOS
+                return split_prefix(node, h, key_data, key_len, value,
+                                   consumed, remaining);
+            }
+
+            // Check for prefix mismatch
+            uint32_t match_len = 0;
+            while (match_len < skip_bytes &&
+                   key_data[consumed + match_len] == prefix[match_len]) {
+                match_len++;
+            }
+
+            if (match_len < skip_bytes) {
+                // Prefix mismatch — split here
+                return split_prefix(node, h, key_data, key_len, value,
+                                   consumed, match_len);
+            }
+
+            consumed += skip_bytes;
+
+            if (!h.is_continuation()) break;
+
+            // Follow continuation to next node
+            node = *reinterpret_cast<uint64_t**>(
+                node + header_and_prefix_u64(h.skip));
+            h = hdr(node);
+        }
+
+        // --- EOS check: key fully consumed ---
+        if (consumed == key_len) {
+            if (h.has_eos()) {
+                // Update existing EOS value
+                VST& slot = const_cast<VST&>(eos_slot(node, h.skip));
+                VT::destroy(slot);
+                slot = VT::store(value);
+                return {node, false};
+            }
+            // Add EOS to this node
+            return add_eos_to_node(node, h, value);
+        }
+
+        // --- Dispatch based on node type ---
+        if (h.is_compact()) {
+            return compact_insert(node, h, key_data, key_len, value, consumed);
+        } else {
+            return bitmap_insert(node, h, key_data, key_len, value, consumed);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // compact_insert — insert into compact node
+    // -----------------------------------------------------------------------
+
+    InsertResult compact_insert(uint64_t* node, NodeHeader h,
+                                const uint8_t* key_data, uint32_t key_len,
+                                const VALUE& value, uint32_t consumed) {
+        const uint8_t* suffix = key_data + consumed;
+        uint32_t suffix_len = key_len - consumed;
+
+        // Find position for this key
+        auto [found, pos] = compact_search_position(node, h, suffix, suffix_len);
+
+        if (found) {
+            // Key exists — update value
+            compact_update_value(node, h, pos, value);
+            return {node, false};
+        }
+
+        // Key not found — insert at pos
+        if (h.count < COMPACT_MAX) {
+            // Room to insert
+            uint64_t* new_node = compact_insert_at(node, h, suffix, suffix_len, 
+                                                    value, pos);
+            return {new_node, true};
+        }
+
+        // Node full — split to bitmap
+        return compact_split_to_bitmap(node, h, suffix, suffix_len, value);
+    }
+
+    // -----------------------------------------------------------------------
+    // bitmap_insert — insert into bitmap node
+    // -----------------------------------------------------------------------
+
+    InsertResult bitmap_insert(uint64_t* node, NodeHeader h,
+                               const uint8_t* key_data, uint32_t key_len,
+                               const VALUE& value, uint32_t consumed) {
+        uint8_t byte = key_data[consumed];
+        consumed++;
+
+        Bitmap& bm = const_cast<Bitmap&>(bm_bitmap(node, h.skip, h.has_eos()));
+        uint64_t* children = const_cast<uint64_t*>(bm_children(node, h.skip, h.has_eos()));
+
+        if (bm.has_bit(byte)) {
+            // Child exists — recurse
+            int slot = bm.find_slot(byte);
+            uint64_t* child = reinterpret_cast<uint64_t*>(children[slot]);
+
+            InsertResult r = insert_impl(child, key_data, key_len, value, consumed);
+
+            if (r.node != child) {
+                children[slot] = reinterpret_cast<uint64_t>(r.node);
+            }
+            return {node, r.inserted};
+        }
+
+        // No child for this byte — create one
+        return bitmap_add_child(node, h, byte, key_data, key_len, value, consumed);
+    }
+
+    // ===================================================================
+    // STUB HELPERS — to be implemented
+    // ===================================================================
+
+    // Search for suffix in compact node
+    // Returns: {found, position} where position is insert point if not found
+    std::pair<bool, int> compact_search_position(uint64_t* node, NodeHeader h,
+                                                  const uint8_t* suffix,
+                                                  uint32_t suffix_len) {
+        // TODO: implement using E-based search
+        (void)node; (void)h; (void)suffix; (void)suffix_len;
+        return {false, 0};
+    }
+
+    // Update value at position in compact node
+    void compact_update_value(uint64_t* node, NodeHeader h, int pos,
+                              const VALUE& value) {
+        // TODO: implement
+        (void)node; (void)h; (void)pos; (void)value;
+    }
+
+    // Insert suffix/value at position, return new node
+    uint64_t* compact_insert_at(uint64_t* node, NodeHeader h,
+                                const uint8_t* suffix, uint32_t suffix_len,
+                                const VALUE& value, int pos) {
+        // TODO: allocate new node with count+1, copy with insertion
+        (void)node; (void)h; (void)suffix; (void)suffix_len; (void)value; (void)pos;
+        return nullptr;
+    }
+
+    // Split full compact node to bitmap, insert new entry
+    InsertResult compact_split_to_bitmap(uint64_t* node, NodeHeader h,
+                                         const uint8_t* suffix, uint32_t suffix_len,
+                                         const VALUE& value) {
+        // TODO: bucket by first byte, create bitmap with children
+        (void)node; (void)h; (void)suffix; (void)suffix_len; (void)value;
+        return {nullptr, false};
+    }
+
+    // Add new child to bitmap node for given byte
+    InsertResult bitmap_add_child(uint64_t* node, NodeHeader h, uint8_t byte,
+                                  const uint8_t* key_data, uint32_t key_len,
+                                  const VALUE& value, uint32_t consumed) {
+        // TODO: reallocate bitmap with new child slot, create child node
+        (void)node; (void)h; (void)byte; (void)key_data; (void)key_len;
+        (void)value; (void)consumed;
+        return {nullptr, false};
+    }
+
+    // Add EOS value to node (reallocate with EOS slot)
+    InsertResult add_eos_to_node(uint64_t* node, NodeHeader h, const VALUE& value) {
+        // TODO: reallocate node with has_eos=true, copy data
+        (void)node; (void)h; (void)value;
+        return {nullptr, false};
+    }
+
+    // Split node at prefix mismatch point
+    InsertResult split_prefix(uint64_t* node, NodeHeader h,
+                              const uint8_t* key_data, uint32_t key_len,
+                              const VALUE& value, uint32_t consumed,
+                              uint32_t match_len) {
+        // TODO: create new parent with shared prefix, two children
+        (void)node; (void)h; (void)key_data; (void)key_len;
+        (void)value; (void)consumed; (void)match_len;
+        return {nullptr, false};
+    }
+
+    // Create a compact leaf with a single entry
+    uint64_t* create_leaf_with_entry(const uint8_t* suffix, uint32_t suffix_len,
+                                     const VALUE& value) {
+        // TODO: allocate minimal compact node
+        (void)suffix; (void)suffix_len; (void)value;
+        return nullptr;
+    }
+
+    // Create an EOS-only node (no entries, just a value)
+    uint64_t* create_eos_only_node(const VALUE& value) {
+        // TODO: allocate minimal compact node with has_eos=true, count=0
+        (void)value;
+        return nullptr;
+    }
 };
+
+// ============================================================================
+// Public method implementations
+// ============================================================================
+
+template <typename VALUE, typename CHARMAP, typename ALLOC>
+bool kstrie<VALUE, CHARMAP, ALLOC>::insert(std::string_view key, const VALUE& value) {
+    uint8_t buf[4096];
+    uint8_t* mapped = key.size() <= sizeof(buf) ? buf : new uint8_t[key.size()];
+    uint32_t len = map_key(key, mapped);
+
+    InsertResult r = insert_impl(root_, mapped, len, value, 0);
+    root_ = r.node;
+
+    if (mapped != buf) delete[] mapped;
+
+    if (r.inserted) size_++;
+    return r.inserted;
+}
+
+template <typename VALUE, typename CHARMAP, typename ALLOC>
+typename kstrie<VALUE, CHARMAP, ALLOC>::size_type 
+kstrie<VALUE, CHARMAP, ALLOC>::erase(std::string_view key) {
+    // TODO: implement
+    (void)key;
+    return 0;
+}
+
+template <typename VALUE, typename CHARMAP, typename ALLOC>
+void kstrie<VALUE, CHARMAP, ALLOC>::clear() noexcept {
+    if (root_) destroy_tree(root_);
+    init_empty_root();
+    size_ = 0;
+}
 
 } // namespace gteitelbaum
