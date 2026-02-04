@@ -756,6 +756,10 @@ private:
         // Existing keys grow by lcp_shrink each, new key stored as new_suffix_len
         uint32_t new_keys_bytes = old_keys_bytes + old_count * lcp_shrink + (2 + new_suffix_len);
         
+        int old_ic = idx_count(old_count);
+        int old_W = calc_W(old_ic);
+        int old_ec = old_W > 0 ? old_W - 1 : 0;
+        
         int new_ic = idx_count(new_count);
         int new_W = calc_W(new_ic);
         int new_ec = new_W > 0 ? new_W - 1 : 0;
@@ -772,6 +776,13 @@ private:
         uint16_t actual_needed = static_cast<uint16_t>(
             data_offset_u64(new_skip, has_eos) + (new_data_size + 7) / 8);
         uint16_t padded = padded_size(actual_needed);
+        
+        // Force realloc if layout changes (ec changes = hot/idx arrays shift,
+        // or ic increases = idx array grows into keys region)
+        // In-place memmove can't handle layout changes safely
+        if (new_ec != old_ec || new_ic > old_ic) {
+            return static_cast<int32_t>(padded);  // force realloc even if same size
+        }
         
         if (padded == current_alloc) {
             return 0;  // in-place OK
@@ -852,6 +863,12 @@ private:
                     
                     // Check offset matches
                     uint16_t stored_offset = e_offset(idx[idx_i]);
+                    if (stored_offset != cumulative_offset) {
+                        std::cerr << "BAD_IDX at i=" << i << " idx_i=" << idx_i << "\n";
+                        std::cerr << "  stored_offset=" << stored_offset 
+                                  << " cumulative_offset=" << cumulative_offset << "\n";
+                        std::cerr << "  count=" << h.count << " keys_bytes=" << h.keys_bytes << "\n";
+                    }
                     assert(stored_offset == cumulative_offset && "BAD_IDX: offset mismatch");
                     
                     // Check prefix matches (first 14 bytes of key)
@@ -983,7 +1000,7 @@ private:
                   << " ec=" << ec << " W=" << W << "\n";
         std::cerr << "  search_len=" << search_len << " search='";
         for (uint32_t j = 0; j < std::min(search_len, 20u); ++j)
-            std::cerr << (char)search[j];
+            std::cerr << (char)mapped_search[j];
         std::cerr << "'\n";
         std::cerr << "  idx_base=" << idx_base << " idx_end=" << idx_end << "\n";
         #endif
@@ -1365,6 +1382,16 @@ private:
             NodeHeader temp_h = hdr(temp);
             uint64_t* split_node = compact_split_to_bitmap_node(temp, temp_h);
             return {split_node, InsertOutcome::INSERTED};
+        }
+        
+        // Check if resulting node violates invariants (e.g., key > 14 bytes)
+        if (hdr(node).is_compact()) {
+            CompressedResult cr = check_compress(node);
+            if (cr != CompressedResult::OK) {
+                // Need to split this node
+                uint64_t* split_node = compact_split_to_bitmap_node(node, hdr(node));
+                return {split_node, InsertOutcome::INSERTED};
+            }
         }
         
         return {node, InsertOutcome::INSERTED};  // node was updated by reference
