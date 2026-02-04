@@ -2,88 +2,112 @@
 
 **Test Configuration:**
 - Compiler: g++ -std=c++23 -O2
-- Value type: int
+- Value type: int (4 bytes)
+- Entries: 100,000 per test
 - Read pattern: randomized order
+
+**Memory Metrics:**
+- **Keysize**: Sum of all key string lengths (raw key data)
+- **Overhead**: Total memory - Keysize (index/structure cost)
+- **B/entry**: Overhead bytes per entry
 
 ## Summary Table
 
-| Test | Keys | kstrie Insert | std::map Insert | kstrie Read | std::map Read | kstrie Mem | std::map Mem |
-|------|------|---------------|-----------------|-------------|---------------|------------|-------------|
-| Random Strings (8-32 chars) | 10000 | 6.08 ms | 4.29 ms | 1.54 ms | 2.40 ms | 535 KB | 907 KB |
-| URL-like Keys | 10000 | 5.25 ms | 6.13 ms | 1.81 ms | 3.09 ms | 296 KB | 1086 KB |
-| Prefix-style Keys (prefix_N) | 10000 | 160.37 ms | 1.74 ms | 1.19 ms | 1.86 ms | 123 KB | 742 KB |
-| Short Keys (4-8 chars) | 10000 | 38.20 ms | 2.28 ms | 0.99 ms | 1.94 ms | 136 KB | 742 KB |
-| Long Keys (64-128 chars) | 10000 | 7.17 ms | 4.63 ms | 1.41 ms | 3.47 ms | 1280 KB | 1688 KB |
+| Test | Entries | Keysize | kstrie Overhead | kstrie B/entry | std::map Overhead | std::map B/entry |
+|------|---------|---------|-----------------|----------------|-------------------|------------------|
+| Random Strings (8-32 chars) | 100000 | 1950.7 KB | 2781.3 KB | 28.5 B | 7129.5 KB | 73.0 B |
+| URL-like Keys | 100000 | 3448.2 KB | -1784.4 KB | -18.3 B | 7519.6 KB | 77.0 B |
+| Prefix-style Keys | 100000 | 953.7 KB | 217.1 KB | 2.2 B | 6468.2 KB | 66.2 B |
+| Short Keys (4-8 chars) | 100000 | 585.5 KB | 761.8 KB | 7.8 B | 6835.5 KB | 70.0 B |
+| Long Keys (64-128 chars) | 100000 | 9364.7 KB | 2792.6 KB | 28.6 B | 7519.6 KB | 77.0 B |
 
-## Performance Comparison
+## Timing Results
 
-### Random Strings (8-32 chars) (10000 keys)
+| Test | kstrie Insert | std::map Insert | kstrie Read | std::map Read |
+|------|---------------|-----------------|-------------|---------------|
+| Random Strings (8-32 chars) | 51.1 ms | 77.4 ms | 20.7 ms | 70.3 ms |
+| URL-like Keys | 73.8 ms | 92.4 ms | 31.2 ms | 79.0 ms |
+| Prefix-style Keys | 1588.8 ms | 21.1 ms | 24.1 ms | 65.1 ms |
+| Short Keys (4-8 chars) | 1255.8 ms | 45.6 ms | 22.7 ms | 60.2 ms |
+| Long Keys (64-128 chars) | 46.2 ms | 96.9 ms | 27.3 ms | 108.2 ms |
 
-| Metric | kstrie | std::map | Ratio (map/kstrie) |
-|--------|--------|----------|-------------------|
-| Insert Time | 6.08 ms | 4.29 ms | 0.71x |
-| Read Time | 1.54 ms | 2.40 ms | 1.56x |
-| Memory | 535 KB | 907 KB | 1.69x |
+## Detailed Analysis
 
-**Analysis:** std::map insert is 1.4x faster. kstrie read is 1.6x faster. kstrie uses 1.7x less memory.
+### Random Strings (8-32 chars)
 
-### URL-like Keys (10000 keys)
+- **Entries:** 100000
+- **Total key data:** 1950.7 KB
+- **Avg key length:** 20.0 bytes
 
-| Metric | kstrie | std::map | Ratio (map/kstrie) |
-|--------|--------|----------|-------------------|
-| Insert Time | 5.25 ms | 6.13 ms | 1.17x |
-| Read Time | 1.81 ms | 3.09 ms | 1.71x |
-| Memory | 296 KB | 1086 KB | 3.67x |
+| Metric | kstrie | std::map | Ratio |
+|--------|--------|----------|-------|
+| Total Memory | 4732 KB | 9080 KB | 1.92x |
+| Overhead | 2781 KB | 7129 KB | 2.56x |
+| B/entry | 28.5 B | 73.0 B | 2.56x |
+| Insert Time | 51.12 ms | 77.39 ms | 1.51x |
+| Read Time | 20.69 ms | 70.28 ms | 3.40x |
 
-**Analysis:** kstrie insert is 1.2x faster. kstrie read is 1.7x faster. kstrie uses 3.7x less memory.
+### URL-like Keys
 
-### Prefix-style Keys (prefix_N) (10000 keys)
+- **Entries:** 100000
+- **Total key data:** 3448.2 KB
+- **Avg key length:** 35.3 bytes
 
-| Metric | kstrie | std::map | Ratio (map/kstrie) |
-|--------|--------|----------|-------------------|
-| Insert Time | 160.37 ms | 1.74 ms | 0.01x |
-| Read Time | 1.19 ms | 1.86 ms | 1.57x |
-| Memory | 123 KB | 742 KB | 6.01x |
+| Metric | kstrie | std::map | Ratio |
+|--------|--------|----------|-------|
+| Total Memory | 1663 KB | 10967 KB | 6.59x |
+| Overhead | -1784 KB (savings!) | 7519 KB | N/A |
+| B/entry | -18.3 B (savings!) | 77.0 B | N/A |
+| Insert Time | 73.8 ms | 92.4 ms | 1.25x |
+| Read Time | 31.17 ms | 78.97 ms | 2.53x |
 
-**Analysis:** std::map insert is 92.1x faster. kstrie read is 1.6x faster. kstrie uses 6.0x less memory.
+### Prefix-style Keys
 
-### Short Keys (4-8 chars) (10000 keys)
+- **Entries:** 100000
+- **Total key data:** 953.7 KB
+- **Avg key length:** 9.8 bytes
 
-| Metric | kstrie | std::map | Ratio (map/kstrie) |
-|--------|--------|----------|-------------------|
-| Insert Time | 38.20 ms | 2.28 ms | 0.06x |
-| Read Time | 0.99 ms | 1.94 ms | 1.95x |
-| Memory | 136 KB | 742 KB | 5.44x |
+| Metric | kstrie | std::map | Ratio |
+|--------|--------|----------|-------|
+| Total Memory | 1170 KB | 7421 KB | 6.34x |
+| Overhead | 217 KB | 6468 KB | 29.79x |
+| B/entry | 2.2 B | 66.2 B | 29.79x |
+| Insert Time | 1588.81 ms | 21.13 ms | 0.01x |
+| Read Time | 24.06 ms | 65.15 ms | 2.71x |
 
-**Analysis:** std::map insert is 16.8x faster. kstrie read is 2.0x faster. kstrie uses 5.4x less memory.
+### Short Keys (4-8 chars)
 
-### Long Keys (64-128 chars) (10000 keys)
+- **Entries:** 100000
+- **Total key data:** 585.5 KB
+- **Avg key length:** 6.0 bytes
 
-| Metric | kstrie | std::map | Ratio (map/kstrie) |
-|--------|--------|----------|-------------------|
-| Insert Time | 7.17 ms | 4.63 ms | 0.65x |
-| Read Time | 1.41 ms | 3.47 ms | 2.46x |
-| Memory | 1280 KB | 1688 KB | 1.32x |
+| Metric | kstrie | std::map | Ratio |
+|--------|--------|----------|-------|
+| Total Memory | 1347 KB | 7420 KB | 5.51x |
+| Overhead | 761 KB | 6835 KB | 8.97x |
+| B/entry | 7.8 B | 70.0 B | 8.97x |
+| Insert Time | 1255.81 ms | 45.57 ms | 0.04x |
+| Read Time | 22.71 ms | 60.15 ms | 2.65x |
 
-**Analysis:** std::map insert is 1.5x faster. kstrie read is 2.5x faster. kstrie uses 1.3x less memory.
+### Long Keys (64-128 chars)
 
-## Key Characteristics
+- **Entries:** 100000
+- **Total key data:** 9364.7 KB
+- **Avg key length:** 95.9 bytes
 
-### kstrie
-- Byte-at-a-time trie with skip compression
-- Compact leaves with Eytzinger-layout binary search
-- Bitmap256-compressed 256-way dispatch nodes
-- Excellent memory density for string keys with shared prefixes
+| Metric | kstrie | std::map | Ratio |
+|--------|--------|----------|-------|
+| Total Memory | 12157 KB | 16884 KB | 1.39x |
+| Overhead | 2792 KB | 7519 KB | 2.69x |
+| B/entry | 28.6 B | 77.0 B | 2.69x |
+| Insert Time | 46.20 ms | 96.92 ms | 2.10x |
+| Read Time | 27.28 ms | 108.20 ms | 3.97x |
 
-### std::map
-- Red-black tree implementation
-- O(log n) operations with string comparison at each node
-- Per-node allocation overhead (~40 bytes + string)
-- Good general-purpose performance
+## Key Insights
 
-## Conclusions
-
-- **Memory:** kstrie typically uses significantly less memory, especially for keys with common prefixes
-- **Insert:** Performance varies by key pattern; kstrie benefits from prefix sharing
-- **Read:** kstrie competitive or faster due to cache-efficient layout and prefix compression
-- **Best for:** URL-like keys, identifiers with common prefixes, dictionary-style data
+- **Overhead** measures the indexing cost above raw key storage
+- **Negative overhead** means kstrie achieves compression (stores keys in less space than raw)
+- **B/entry** shows per-key indexing efficiency
+- Lower B/entry = more memory-efficient indexing
+- kstrie excels when keys share prefixes (skip compression eliminates redundant prefix storage)
+- std::map has ~72 B/entry overhead (RB-tree node + string object)
