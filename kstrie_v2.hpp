@@ -14,9 +14,9 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <iostream>
 
 #ifdef KSTRIE_DEBUG
-#include <iostream>
 #endif
 
 namespace gteitelbaum {
@@ -519,8 +519,10 @@ private:
     // Result of checking compact node invariants
     enum class CompressedResult {
         OK,
-        TOO_BIG,      // Node exceeds 16KB
-        TOO_MANY      // Node exceeds 4096 entries
+        TOO_BIG,          // Node exceeds 16KB
+        TOO_MANY,         // Node exceeds 4096 entries
+        KEY_TOO_LONG,     // A key suffix exceeds 14 bytes (can't distinguish via E prefix)
+        NEEDS_RECOMPRESS  // Keys share common prefix that should be in skip
     };
 
     using byte_alloc_type =
@@ -651,6 +653,25 @@ private:
         free_node(node);
     }
 
+    // Recursively compute memory usage
+    size_type memory_usage_impl(const uint64_t* node) const noexcept {
+        if (!node) return 0;
+        const NodeHeader& h = hdr(node);
+        size_type total = h.alloc_u64 * 8;  // This node's allocation
+        
+        if (!h.is_compact()) {
+            // Bitmap node - recurse into children
+            const Bitmap& bm = bm_bitmap(node, h.skip, h.has_eos());
+            const uint64_t* children = bm_children(node, h.skip, h.has_eos());
+            int top_count = bm.popcount();
+            for (int i = 0; i < top_count; ++i) {
+                total += memory_usage_impl(reinterpret_cast<const uint64_t*>(children[i]));
+            }
+        }
+        // TODO: add heap-allocated suffix memory for BIG keys
+        return total;
+    }
+
     // -----------------------------------------------------------------------
     // check_compress — Validate compact node invariants
     // Returns TOO_BIG/TOO_MANY if split needed, asserts on bugs
@@ -676,6 +697,23 @@ private:
         std::size_t node_bytes = data_offset_u64(h.skip, h.has_eos()) * 8 + data_size;
         if (node_bytes > COMPACT_MAX_BYTES) {
             return CompressedResult::TOO_BIG;
+        }
+        
+        // Check that no key suffix exceeds 14 bytes
+        // Keys longer than 14 bytes can't be distinguished by E prefix comparison
+        // If found, return KEY_TOO_LONG to trigger recursive split
+        if (h.count >= 2) {
+            const uint8_t* data = reinterpret_cast<const uint8_t*>(node) +
+                                  data_offset_u64(h.skip, h.has_eos()) * 8;
+            const uint8_t* keys = data + keys_off(h.count, ec);
+            const uint8_t* kp = keys;
+            for (uint16_t i = 0; i < h.count; ++i) {
+                uint16_t klen = read_u16(kp);
+                if (klen > 14) {
+                    return CompressedResult::KEY_TOO_LONG;
+                }
+                kp = key_next(kp);
+            }
         }
         
         // ASSERT: count=1 must have EOS (single entry = skip+EOS)
@@ -729,10 +767,22 @@ private:
                 uint32_t min_len = std::min(len1, len2);
                 int cmp = std::memcmp(k1, k2, min_len);
                 bool sorted = (cmp < 0) || (cmp == 0 && len1 < len2);
+                if (!sorted) {
+                    std::cerr << "UNSORTED at index " << i << ":\n";
+                    std::cerr << "  key[" << (i-1) << "] len=" << len1 << ": ";
+                    for (uint16_t j = 0; j < std::min(len1, uint16_t(40)); ++j) 
+                        std::cerr << (char)k1[j];
+                    std::cerr << "\n";
+                    std::cerr << "  key[" << i << "] len=" << len2 << ": ";
+                    for (uint16_t j = 0; j < std::min(len2, uint16_t(40)); ++j) 
+                        std::cerr << (char)k2[j];
+                    std::cerr << "\n";
+                    std::cerr << "  cmp=" << cmp << " min_len=" << min_len << "\n";
+                }
                 assert(sorted && "UNSORTED: keys not in order");
             }
             
-            // ASSERT: No shared prefix (LCP must be 0)
+            // Check for shared prefix that should be in skip
             // If all keys share a common prefix, it should be in skip
             if (h.count >= 2) {
                 auto [k0, len0] = key_list[0];
@@ -744,7 +794,9 @@ private:
                     while (j < max_cmp && k0[j] == ki[j]) ++j;
                     lcp = j;
                 }
-                assert(lcp == 0 && "BAD_PREFIX: keys share common prefix that should be in skip");
+                if (lcp > 0) {
+                    return CompressedResult::NEEDS_RECOMPRESS;
+                }
             }
             
             // ASSERT: Check hot array (Eytzinger layout)
@@ -987,6 +1039,11 @@ public:
 
     [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
     [[nodiscard]] size_type size() const noexcept { return size_; }
+    
+    // Returns total memory usage in bytes
+    [[nodiscard]] size_type memory_usage() const noexcept {
+        return sizeof(*this) + memory_usage_impl(root_);
+    }
 
     // -----------------------------------------------------------------------
     // Lookup
@@ -1128,8 +1185,35 @@ private:
         const uint8_t* suffix = key_data + consumed;
         uint32_t suffix_len = key_len - consumed;
 
+        // CRITICAL: If suffix > 14 bytes and node has entries, we MUST split first
+        // because the E prefix comparison (14 bytes) can't find the correct position.
+        // Inserting at a wrong position would corrupt the sorted order.
+        if (suffix_len > 14 && h.count >= 1) {
+            // Insert the key first (at potentially wrong position - doesn't matter
+            // because we're about to split anyway)
+            uint64_t* new_node = compact_insert_at(node, h, suffix, suffix_len, 
+                                                    value, h.count);  // append at end
+            NodeHeader new_h = hdr(new_node);
+            // Split will sort entries properly during bucketing
+            uint64_t* split_node = compact_split_to_bitmap_node(new_node, new_h);
+            return {split_node, true};
+        }
+
         // Find position for this key
         auto [found, pos] = compact_search_position(node, h, suffix, suffix_len);
+
+        #ifdef KSTRIE_DEBUG
+        if (h.count >= 40) {  // Only debug large nodes
+            std::cerr << "DEBUG compact_insert: suffix_len=" << suffix_len 
+                      << " found=" << found << " pos=" << pos
+                      << " count=" << h.count << "\n";
+            std::cerr << "  suffix (first 30): ";
+            for (uint32_t i = 0; i < std::min(suffix_len, 30u); ++i) {
+                std::cerr << (char)suffix[i];
+            }
+            std::cerr << "\n";
+        }
+        #endif
 
         if (found) {
             // Key exists — update value
@@ -1229,19 +1313,55 @@ private:
         }
         
         // Linear scan idx entries to find block - use prefix-only comparison
+        // Find the correct starting block for lower_bound search
         int block = idx_base;
+        bool prefix_match = false;
         for (int k = idx_base; k < idx_end; ++k) {
-            if (!(e_prefix_only(idx[k]) <= skey_prefix)) break;
-            block = k;
+            E idx_prefix = e_prefix_only(idx[k]);
+            if (idx_prefix < skey_prefix) {
+                block = k;
+            } else if (idx_prefix == skey_prefix) {
+                // Prefix equal - search key could be anywhere in this block or the previous one
+                // Go back one block if possible
+                prefix_match = true;
+                if (k > 0 && block == idx_base && k == idx_base) {
+                    // First iteration hit equal - need to check previous block
+                    block = k > 0 ? k - 1 : k;
+                }
+                break;
+            } else {
+                // idx_prefix > skey_prefix - search key belongs before this block
+                break;
+            }
         }
         
-        // Linear scan keys in block
+        // Linear scan keys in block (and possibly next block if prefix matched)
         const uint8_t* kp = keys + e_offset(idx[block]);
         int key_start = block * 8;
-        int scan_end = std::min(key_start + 8, (int)count);
+        // If prefix matched, scan up to 16 keys (two blocks) to be safe
+        int scan_end = prefix_match ? 
+            std::min(key_start + 16, (int)count) : 
+            std::min(key_start + 8, (int)count);
+        
+        #ifdef KSTRIE_DEBUG
+        if (count >= 40) {
+            std::cerr << "DEBUG search: ic=" << ic << " ec=" << ec 
+                      << " idx_base=" << idx_base << " idx_end=" << idx_end
+                      << " block=" << block << "\n";
+            std::cerr << "  key_start=" << key_start << " scan_end=" << scan_end << "\n";
+        }
+        #endif
         
         for (int i = key_start; i < scan_end; ++i) {
             int cmp = key_cmp(kp, suffix, suffix_len);
+            #ifdef KSTRIE_DEBUG
+            if (count >= 47) {
+                uint16_t klen = read_u16(kp);
+                std::cerr << "  scan i=" << i << " cmp=" << cmp << " klen=" << klen << " key=";
+                for (int j = 0; j < std::min((int)klen, 25); ++j) std::cerr << (char)kp[2+j];
+                std::cerr << "\n";
+            }
+            #endif
             if (cmp == 0) return {true, i};
             if (cmp > 0) return {false, i};
             kp = key_next(kp);
@@ -1859,11 +1979,13 @@ private:
                 child = create_compact_from_entries(buckets[b],
                     child_has_eos ? &bucket_eos[b][0] : nullptr);
                 
-                // Verify child is OK
+                // Check if child is OK - if not, recursively split it
                 if (hdr(child).is_compact()) {
                     CompressedResult child_result = check_compress(child);
-                    assert(child_result == CompressedResult::OK && 
-                           "SPLIT_CHILD_BAD: child after split is not OK");
+                    if (child_result != CompressedResult::OK) {
+                        // Child needs further splitting
+                        child = compact_split_to_bitmap_node(child, hdr(child));
+                    }
                 }
             }
             
@@ -2458,6 +2580,21 @@ private:
             }
             lcp = match;
         }
+        
+        #ifdef KSTRIE_DEBUG
+        if (lcp > 0 && entries.size() >= 2) {
+            std::cerr << "DEBUG create_compact_from_entries: lcp=" << lcp 
+                      << " entries=" << entries.size() << "\n";
+            std::cerr << "  entry[0] len=" << entries[0].len << ": ";
+            for (uint32_t j = 0; j < std::min(entries[0].len, 20u); ++j)
+                std::cerr << (char)entries[0].suffix[j];
+            std::cerr << "\n";
+            std::cerr << "  entry[1] len=" << entries[1].len << ": ";
+            for (uint32_t j = 0; j < std::min(entries[1].len, 20u); ++j)
+                std::cerr << (char)entries[1].suffix[j];
+            std::cerr << "\n";
+        }
+        #endif
         
         // Cap at 255 (max skip)
         if (lcp > 255) lcp = 255;

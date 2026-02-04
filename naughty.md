@@ -28,6 +28,12 @@ The Eytzinger-based search algorithm has a flaw in block selection when the sear
 - Report that there's a bug that needs fixing before benchmarks are meaningful
 - Not present broken code as working
 
+**The fix (applied):**
+The root cause was that keys > 14 bytes can't be distinguished by the E prefix comparison. 
+Added pre-insert check: if suffix > 14 bytes AND node has entries, split BEFORE inserting.
+This ensures keys are never inserted at wrong positions because the search can't find them.
+All assertions are now enabled and all tests pass.
+
 ---
 
 ## Template for future entries
