@@ -22,6 +22,25 @@
 namespace gteitelbaum {
 
 // ============================================================================
+// Allocation size classes
+// ============================================================================
+
+// Returns padded allocation size in u64 units
+// Pattern: 1, 2, 3, 4, then {lower, lower*1.5, upper} for powers of 2
+inline constexpr uint16_t padded_size(uint16_t needed) noexcept {
+    if (needed <= 4) return needed;
+    
+    unsigned bits = std::bit_width(static_cast<unsigned>(needed - 1));
+    uint16_t upper = uint16_t(1) << bits;
+    uint16_t lower = upper >> 1;
+    uint16_t mid = lower + (lower >> 1);  // lower * 1.5
+    
+    if (needed <= lower) return lower;
+    if (needed <= mid) return mid;
+    return upper;
+}
+
+// ============================================================================
 // BitmapN — templated on word count (1, 2, or 4)
 // ============================================================================
 
@@ -283,7 +302,7 @@ struct ValueTraits {
 // ============================================================================
 
 struct NodeHeader {
-    uint16_t alloc_u64;     // allocation size in u64 units (max 512KB)
+    uint16_t alloc_u64;     // allocation size in u64 units (0 = sentinel, don't free)
     uint16_t count;         // entry count (excl EOS), max 4096
     uint16_t keys_bytes;    // total size of keys[] region (compact only), max 65535
     uint8_t  skip;          // 0=none, 1-254=byte count, 255=continuation (254 bytes + child)
@@ -296,6 +315,7 @@ struct NodeHeader {
     [[nodiscard]] bool is_bitmap()  const noexcept { return !(flags & 1); }
     [[nodiscard]] bool has_eos()    const noexcept { return (flags >> 1) & 1; }
     [[nodiscard]] bool is_continuation() const noexcept { return skip == SKIP_CONTINUATION; }
+    [[nodiscard]] bool is_sentinel() const noexcept { return alloc_u64 == 0; }
     [[nodiscard]] uint32_t skip_bytes() const noexcept { 
         return skip == SKIP_CONTINUATION ? SKIP_MAX_INLINE : skip; 
     }
@@ -311,6 +331,14 @@ struct NodeHeader {
     }
 };
 static_assert(sizeof(NodeHeader) == 8);
+
+// ============================================================================
+// Global empty sentinel — bitmap node with empty bitmap
+// All zeros: is_bitmap=true, has_eos=false, empty bitmap = all lookups fail
+// alloc_u64=0 marks "don't free"
+// ============================================================================
+
+inline constexpr std::array<uint64_t, 5> EMPTY_NODE_STORAGE alignas(64) = {};
 
 // ============================================================================
 // E — 16-byte comparable key (for both hot and idx arrays)
@@ -534,11 +562,13 @@ private:
 
     // -- node alloc ---------------------------------------------------------
 
-    uint64_t* alloc_node(std::size_t u64_count) {
-        uint64_t* p = std::allocator_traits<ALLOC>::allocate(alloc_, u64_count);
-        std::memset(p, 0, u64_count * 8);
+    // Allocate with padded size for lazy allocation
+    uint64_t* alloc_node(std::size_t needed_u64) {
+        std::size_t alloc_u64 = padded_size(static_cast<uint16_t>(needed_u64));
+        uint64_t* p = std::allocator_traits<ALLOC>::allocate(alloc_, alloc_u64);
+        std::memset(p, 0, alloc_u64 * 8);
         // Store allocation size in header
-        hdr(p).alloc_u64 = static_cast<uint16_t>(u64_count);
+        hdr(p).alloc_u64 = static_cast<uint16_t>(alloc_u64);
         return p;
     }
 
@@ -547,8 +577,11 @@ private:
     }
 
     // Helper: deallocate using size stored in header
+    // Does not free sentinel (alloc_u64 == 0)
     void free_node(uint64_t* p) {
-        if (p) dealloc_node(p, hdr(p).alloc_u64);
+        if (p && !hdr(p).is_sentinel()) {
+            dealloc_node(p, hdr(p).alloc_u64);
+        }
     }
 
     // -- header/prefix/eos accessors ----------------------------------------
@@ -604,20 +637,14 @@ private:
     // -- init ---------------------------------------------------------------
 
     void init_empty_root() {
-        // Minimal compact leaf: header only (no data region when count=0)
-        std::size_t n = data_offset_u64(0, false);  // just header, no prefix, no eos
-        root_ = alloc_node(n);
-        NodeHeader& h = hdr(root_);
-        h.count = 0;
-        h.keys_bytes = 0;
-        h.skip = 0;
-        h.flags = 1;  // is_compact
+        // Use global sentinel - no allocation needed
+        root_ = const_cast<uint64_t*>(EMPTY_NODE_STORAGE.data());
     }
 
     // -- destroy ------------------------------------------------------------
 
     void destroy_tree(uint64_t* node) {
-        if (!node) return;
+        if (!node || hdr(node).is_sentinel()) return;
         const NodeHeader& h = hdr(node);
 
         if (h.is_compact()) {
@@ -655,7 +682,7 @@ private:
 
     // Recursively compute memory usage
     size_type memory_usage_impl(const uint64_t* node) const noexcept {
-        if (!node) return 0;
+        if (!node || hdr(node).is_sentinel()) return 0;
         const NodeHeader& h = hdr(node);
         size_type total = h.alloc_u64 * 8;  // This node's allocation
         
@@ -670,6 +697,40 @@ private:
         }
         // TODO: add heap-allocated suffix memory for BIG keys
         return total;
+    }
+
+    // -----------------------------------------------------------------------
+    // Reallocation check for lazy allocation
+    // Returns 0 if in-place possible, else returns needed allocation size
+    // -----------------------------------------------------------------------
+    
+    uint16_t needs_realloc_for_insert(uint16_t current_alloc, uint8_t skip, 
+                                       bool has_eos, uint16_t old_count,
+                                       uint32_t old_keys_bytes,
+                                       uint32_t suffix_len) const noexcept {
+        // Cheap upper bound: current data + max possible growth
+        // Growth for one insert: 2 (len) + suffix + sizeof(VST) + 16 (idx) + 16 (hot) + align
+        uint16_t max_growth = static_cast<uint16_t>((2 + suffix_len + sizeof(VST) + 32 + 7) / 8);
+        uint16_t max_needed = current_alloc + max_growth;
+        
+        if (padded_size(max_needed) == current_alloc) return 0;  // same size class
+        
+        // Expensive: compute actual layout
+        uint16_t new_count = old_count + 1;
+        uint32_t new_keys_bytes = old_keys_bytes + 2 + suffix_len;
+        
+        int new_ic = idx_count(new_count);
+        int new_W = calc_W(new_ic);
+        int new_ec = new_W > 0 ? new_W - 1 : 0;
+        
+        std::size_t new_data_size = values_off(new_count, new_keys_bytes, new_ec) +
+                                    new_count * sizeof(VST);
+        uint16_t actual_needed = static_cast<uint16_t>(
+            data_offset_u64(skip, has_eos) + (new_data_size + 7) / 8);
+        
+        if (padded_size(actual_needed) == current_alloc) return 0;  // same size class
+        
+        return padded_size(actual_needed);  // need realloc (grow or shrink)
     }
 
     // -----------------------------------------------------------------------
@@ -1108,6 +1169,15 @@ private:
                              uint32_t consumed) {
         NodeHeader h = hdr(node);
 
+        // Handle sentinel - need to allocate real node
+        if (h.is_sentinel()) {
+            // Create leaf with full key
+            const uint8_t* suffix = key_data + consumed;
+            uint32_t suffix_len = key_len - consumed;
+            uint64_t* new_node = create_leaf_with_entry(suffix, suffix_len, value);
+            return {new_node, true};
+        }
+
         // --- Handle skip prefix (with continuation) ---
         while (h.skip > 0) {
             uint32_t skip_bytes = h.skip_bytes();
@@ -1434,7 +1504,6 @@ private:
         // Create skip+EOS node instead of count=1 node
         if (h.count == 0 && !h.has_eos()) {
             // Deallocate old empty node (count=0 means no data region)
-            std::size_t old_node_u64 = data_offset_u64(h.skip, false);
             free_node(node);
             
             // Create new node with skip=old_skip+suffix, EOS=true
@@ -1455,6 +1524,7 @@ private:
     }
     
     // Insert without LCP extension (simple case)
+    // Uses lazy allocation - in-place if fits, else reallocate
     uint64_t* compact_insert_at_simple(uint64_t* node, NodeHeader h,
                                        const uint8_t* suffix, uint32_t suffix_len,
                                        const VALUE& value, int pos) {
@@ -1470,6 +1540,18 @@ private:
         int new_W = calc_W(new_ic);
         int new_ec = new_W > 0 ? new_W - 1 : 0;
         
+        // Check if we can insert in-place (same size class)
+        uint16_t realloc_size = needs_realloc_for_insert(
+            h.alloc_u64, h.skip, h.has_eos(), old_count, h.keys_bytes, suffix_len);
+        
+        if (realloc_size == 0) {
+            // In-place insert!
+            return compact_insert_inplace(node, h, suffix, suffix_len, value, pos,
+                                          new_count, new_keys_bytes, new_ec);
+        }
+        
+        // Need to reallocate
+        
         // Old data pointers
         const uint8_t* old_data = reinterpret_cast<const uint8_t*>(node) +
                                   data_offset_u64(h.skip, h.has_eos()) * 8;
@@ -1477,13 +1559,8 @@ private:
         const VST* old_values = reinterpret_cast<const VST*>(
             old_data + values_off(old_count, h.keys_bytes, old_ec));
         
-        // Calculate new node size
-        std::size_t new_data_size = values_off(new_count, new_keys_bytes, new_ec) +
-                                    new_count * sizeof(VST);
-        std::size_t new_node_u64 = data_offset_u64(h.skip, h.has_eos()) +
-                                   (new_data_size + 7) / 8;
-        
-        uint64_t* new_node = alloc_node(new_node_u64);
+        // Allocate new node with padded size
+        uint64_t* new_node = alloc_node(realloc_size);
         
         // Copy header
         NodeHeader& nh = hdr(new_node);
@@ -1577,15 +1654,6 @@ private:
         // Build idx array in O(ic) using precomputed data
         E* new_idx = reinterpret_cast<E*>(new_data + idx_off(new_ec));
         
-        #ifdef KSTRIE_DEBUG
-        std::cerr << "DEBUG compact_insert_at_simple: new_count=" << new_count 
-                  << " new_ic=" << new_ic << " new_ec=" << new_ec
-                  << " skip=" << (int)h.skip << " has_eos=" << h.has_eos() << "\n";
-        std::cerr << "  data_offset_u64=" << data_offset_u64(h.skip, h.has_eos())
-                  << " idx_off=" << idx_off(new_ec) 
-                  << " keys_off=" << keys_off(new_count, new_ec) << "\n";
-        #endif
-        
         for (int i = 0; i < new_ic; ++i) {
             int k = i * 8;
             uint32_t k_off = offsets[k];  // Offset to key at position k
@@ -1593,14 +1661,6 @@ private:
             // Get key data at position k for the E entry
             const uint8_t* kp_at_k = new_keys + k_off;
             uint16_t klen_at_k = read_u16(kp_at_k);
-            
-            #ifdef KSTRIE_DEBUG
-            std::cerr << "  idx[" << i << "]: k=" << k << " k_off=" << k_off 
-                      << " klen=" << klen_at_k << " key='";
-            for (int j = 0; j < std::min((int)klen_at_k, 20); ++j) 
-                std::cerr << (char)kp_at_k[2+j];
-            std::cerr << "'\n";
-            #endif
             
             ES es;
             es.setkey(reinterpret_cast<const char*>(kp_at_k + 2), 
@@ -1618,13 +1678,118 @@ private:
         }
         
         // Deallocate old node
-        std::size_t old_data_size = values_off(old_count, h.keys_bytes, old_ec) +
-                                    old_count * sizeof(VST);
-        std::size_t old_node_u64 = data_offset_u64(h.skip, h.has_eos()) +
-                                   (old_data_size + 7) / 8;
         free_node(node);
         
         return new_node;
+    }
+
+    // In-place insert - no reallocation needed
+    uint64_t* compact_insert_inplace(uint64_t* node, NodeHeader h,
+                                     const uint8_t* suffix, uint32_t suffix_len,
+                                     const VALUE& value, int pos,
+                                     uint16_t new_count, uint32_t new_keys_bytes,
+                                     int new_ec) {
+        uint16_t old_count = h.count;
+        
+        int old_ic = idx_count(old_count);
+        int old_W = calc_W(old_ic);
+        int old_ec = old_W > 0 ? old_W - 1 : 0;
+        
+        int new_ic = idx_count(new_count);
+        
+        uint8_t* data = reinterpret_cast<uint8_t*>(node) +
+                        data_offset_u64(h.skip, h.has_eos()) * 8;
+        
+        // Old layout pointers (before modification)
+        uint8_t* old_keys = data + keys_off(old_count, old_ec);
+        VST* old_values = reinterpret_cast<VST*>(
+            data + values_off(old_count, h.keys_bytes, old_ec));
+        
+        // If layout changes (ec changes), we need to relocate
+        // For simplicity, always relocate within the buffer
+        // This is still O(n) but no malloc
+        
+        // Compute new layout pointers
+        uint8_t* new_keys = data + keys_off(new_count, new_ec);
+        VST* new_values = reinterpret_cast<VST*>(
+            data + values_off(new_count, new_keys_bytes, new_ec));
+        
+        // Build new keys in temp buffer, then copy back
+        // (needed because keys might overlap with new idx region)
+        std::vector<uint8_t> temp_keys(new_keys_bytes);
+        std::vector<VST> temp_values(new_count);
+        std::vector<uint32_t> offsets(new_count);
+        
+        const uint8_t* old_kp = old_keys;
+        uint8_t* temp_kp = temp_keys.data();
+        uint32_t off = 0;
+        
+        // Copy keys before insertion point
+        for (int i = 0; i < pos; ++i) {
+            uint16_t klen = read_u16(old_kp);
+            std::memcpy(temp_kp, old_kp, 2 + klen);
+            offsets[i] = off;
+            off += 2 + klen;
+            temp_values[i] = old_values[i];
+            old_kp += 2 + klen;
+            temp_kp += 2 + klen;
+        }
+        
+        // Insert new key
+        write_u16(temp_kp, static_cast<uint16_t>(suffix_len));
+        std::memcpy(temp_kp + 2, suffix, suffix_len);
+        offsets[pos] = off;
+        off += 2 + suffix_len;
+        temp_values[pos] = VT::store(value);
+        temp_kp += 2 + suffix_len;
+        
+        // Copy keys after insertion point
+        for (int i = pos; i < old_count; ++i) {
+            uint16_t klen = read_u16(old_kp);
+            std::memcpy(temp_kp, old_kp, 2 + klen);
+            offsets[i + 1] = off;
+            off += 2 + klen;
+            temp_values[i + 1] = old_values[i];
+            old_kp += 2 + klen;
+            temp_kp += 2 + klen;
+        }
+        
+        // Update header
+        hdr(node).count = new_count;
+        hdr(node).keys_bytes = new_keys_bytes;
+        
+        // Copy keys back (after updating header, so layout pointers are correct)
+        std::memcpy(new_keys, temp_keys.data(), new_keys_bytes);
+        
+        // Copy values back
+        for (uint16_t i = 0; i < new_count; ++i) {
+            new_values[i] = temp_values[i];
+        }
+        
+        // Build idx array
+        E* new_idx = reinterpret_cast<E*>(data + idx_off(new_ec));
+        for (int i = 0; i < new_ic; ++i) {
+            int k = i * 8;
+            uint32_t k_off = offsets[k];
+            const uint8_t* kp_at_k = new_keys + k_off;
+            uint16_t klen_at_k = read_u16(kp_at_k);
+            
+            ES es;
+            es.setkey(reinterpret_cast<const char*>(kp_at_k + 2),
+                     static_cast<int>(klen_at_k));
+            es.setoff(static_cast<uint16_t>(k_off));
+            new_idx[i] = cvt(es);
+        }
+        
+        // Build hot array
+        E* new_hot = reinterpret_cast<E*>(data + hot_off());
+        if (new_ec > 0) {
+            build_eyt(new_idx, new_ic, new_hot);
+        } else {
+            new_hot[0] = E{};
+        }
+        
+        return node;
     }
 
     // Insert with LCP extension - extends skip and strips LCP from all keys
@@ -1796,13 +1961,6 @@ private:
         }
         
         // Deallocate old node
-        int old_ic = idx_count(h.count);
-        int old_W = calc_W(old_ic);
-        int old_ec = old_W > 0 ? old_W - 1 : 0;
-        std::size_t old_data_size = values_off(h.count, h.keys_bytes, old_ec) +
-                                    h.count * sizeof(VST);
-        std::size_t old_node_u64 = data_offset_u64(h.skip, h.has_eos()) +
-                                   (old_data_size + 7) / 8;
         free_node(node);
         
         return new_node;
@@ -1993,10 +2151,6 @@ private:
         }
         
         // Deallocate old node (don't destroy values, they were moved)
-        std::size_t old_data_size = values_off(h.count, h.keys_bytes, ec) +
-                                    h.count * sizeof(VST);
-        std::size_t old_node_u64 = data_offset_u64(h.skip, h.has_eos()) + 
-                                   (old_data_size + 7) / 8;
         free_node(node);
         
         return new_node;
@@ -2067,8 +2221,6 @@ private:
         }
         
         // Deallocate old node
-        std::size_t old_node_u64 = data_offset_u64(h.skip, h.has_eos()) + 
-                                   BITMAP_U64 + old_top_count;
         free_node(node);
         
         return {new_node, true};
@@ -2464,11 +2616,7 @@ private:
             new_values[i] = final_entries[i].slot;
         }
         
-        // Deallocate old node - must match allocation formula
-        std::size_t old_data_size = (h.count > 0) ?
-            (values_off(h.count, h.keys_bytes, ec) + h.count * sizeof(VST)) : 0;
-        std::size_t old_node_u64 = data_offset_u64(h.skip, h.has_eos()) +
-                                   (old_data_size + 7) / 8;
+        // Deallocate old node
         free_node(node);
         
         return {new_node, true};
@@ -2580,21 +2728,6 @@ private:
             }
             lcp = match;
         }
-        
-        #ifdef KSTRIE_DEBUG
-        if (lcp > 0 && entries.size() >= 2) {
-            std::cerr << "DEBUG create_compact_from_entries: lcp=" << lcp 
-                      << " entries=" << entries.size() << "\n";
-            std::cerr << "  entry[0] len=" << entries[0].len << ": ";
-            for (uint32_t j = 0; j < std::min(entries[0].len, 20u); ++j)
-                std::cerr << (char)entries[0].suffix[j];
-            std::cerr << "\n";
-            std::cerr << "  entry[1] len=" << entries[1].len << ": ";
-            for (uint32_t j = 0; j < std::min(entries[1].len, 20u); ++j)
-                std::cerr << (char)entries[1].suffix[j];
-            std::cerr << "\n";
-        }
-        #endif
         
         // Cap at 255 (max skip)
         if (lcp > 255) lcp = 255;
