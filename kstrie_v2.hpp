@@ -937,13 +937,12 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // compact_find — Eytzinger hot array + linear scan
-    // Layout: [hot: (ec+1)×16B][idx: ic×16B][keys][values]
+    // compact_find_mapped — search with already-mapped bytes
     // -----------------------------------------------------------------------
 
-    const VST* compact_find(const uint64_t* node, NodeHeader h,
-                            const uint8_t* search,
-                            uint32_t search_len) const noexcept {
+    const VST* compact_find_mapped(const uint64_t* node, NodeHeader h,
+                                   const uint8_t* mapped_search,
+                                   uint32_t search_len) const noexcept {
         uint16_t count = h.count;
         if (count == 0) return nullptr;
 
@@ -959,7 +958,7 @@ private:
         const uint8_t* keys = data + keys_off(count, ec);
         const VST* values = reinterpret_cast<const VST*>(data + values_off(count, h.keys_bytes, ec));
 
-        E skey = make_search_key(search, search_len);
+        E skey = make_search_key(mapped_search, search_len);
         E skey_prefix = e_prefix_only(skey);
         int idx_base = 0, idx_end = ic;
 
@@ -1013,6 +1012,7 @@ private:
         std::cerr << "  key_start=" << key_start << " scan_end=" << scan_end << "\n";
         #endif
 
+        const VST* result = nullptr;
         for (int i = key_start; i < scan_end; ++i) {
             uint16_t klen = read_u16(kp);
             
@@ -1023,13 +1023,24 @@ private:
             std::cerr << "'\n";
             #endif
             
-            int cmp = key_cmp(kp, search, search_len);
-            if (cmp == 0) return &values[i];
-            if (cmp > 0) return nullptr;
+            int cmp = key_cmp(kp, mapped_search, search_len);
+            if (cmp == 0) { result = &values[i]; break; }
+            if (cmp > 0) break;
             kp = key_next(kp);
         }
 
-        return nullptr;
+        return result;
+    }
+
+    // compact_find — public wrapper that maps bytes then searches
+    const VST* compact_find(const uint64_t* node, NodeHeader h,
+                            const uint8_t* search,
+                            uint32_t search_len) const noexcept {
+        uint8_t stack_buf[256];
+        auto [mapped, heap_buf] = get_mapped(search, search_len, stack_buf, sizeof(stack_buf));
+        const VST* result = compact_find_mapped(node, h, mapped, search_len);
+        delete[] heap_buf;
+        return result;
     }
 
     VST* compact_find(uint64_t* node, NodeHeader h,
@@ -1044,8 +1055,13 @@ private:
     // -----------------------------------------------------------------------
 
     const VST* find_impl(const uint8_t* key_data, uint32_t key_len) const noexcept {
+        // Map key bytes once upfront
+        uint8_t stack_buf[256];
+        auto [mapped, heap_buf] = get_mapped(key_data, key_len, stack_buf, sizeof(stack_buf));
+        
         const uint64_t* node = root_;
         uint32_t consumed = 0;
+        const VST* result = nullptr;
 
         for (;;) {
             NodeHeader h = hdr(node);
@@ -1055,9 +1071,9 @@ private:
                 uint32_t skip_bytes = h.skip_bytes();
                 uint32_t remaining = key_len - consumed;
                 if (remaining < skip_bytes)
-                    return nullptr;
-                if (std::memcmp(key_data + consumed, node_prefix(node), skip_bytes) != 0)
-                    return nullptr;
+                    goto done;
+                if (std::memcmp(mapped + consumed, node_prefix(node), skip_bytes) != 0)
+                    goto done;
                 consumed += skip_bytes;
 
                 if (!h.is_continuation()) break;
@@ -1071,27 +1087,30 @@ private:
             // --- EOS check ---
             if (consumed == key_len) {
                 if (h.has_eos())
-                    return &eos_slot(node, h.skip);
-                return nullptr;
+                    result = &eos_slot(node, h.skip);
+                goto done;
             }
 
             if (h.is_compact()) {
-                return compact_find(node, h,
-                                    key_data + consumed,
-                                    key_len - consumed);
+                result = compact_find_mapped(node, h, mapped + consumed, key_len - consumed);
+                goto done;
             }
 
-            // --- Bitmap dispatch: consume one byte ---
-            uint8_t byte = key_data[consumed];
+            // --- Bitmap dispatch: consume one mapped byte ---
+            uint8_t byte = mapped[consumed];
             consumed++;
 
             const Bitmap& bm = bm_bitmap(node, h.skip, h.has_eos());
             int slot = bm.find_slot(byte);
-            if (slot < 0) return nullptr;
+            if (slot < 0) goto done;
 
             const uint64_t* children = bm_children(node, h.skip, h.has_eos());
             node = reinterpret_cast<const uint64_t*>(children[slot]);
         }
+        
+    done:
+        delete[] heap_buf;  // no-op if nullptr
+        return result;
     }
 
     VST* find_impl(const uint8_t* key_data, uint32_t key_len) noexcept {
@@ -1099,16 +1118,28 @@ private:
             static_cast<const kstrie*>(this)->find_impl(key_data, key_len));
     }
 
-    // Map key through char_map
-    uint32_t map_key(std::string_view key, uint8_t* buf) const noexcept {
-        uint32_t len = static_cast<uint32_t>(key.size());
-        if constexpr (CHARMAP::IS_IDENTITY) {
-            std::memcpy(buf, key.data(), len);
-        } else {
-            for (uint32_t i = 0; i < len; ++i)
-                buf[i] = CHARMAP::to_index(static_cast<uint8_t>(key[i]));
+    // Map bytes through char_map into buffer (for non-identity maps)
+    static void map_bytes_into(const uint8_t* src, uint8_t* dst, uint32_t len) noexcept {
+        for (uint32_t i = 0; i < len; ++i) {
+            dst[i] = CHARMAP::to_index(src[i]);
         }
-        return len;
+    }
+    
+    // Get mapped key data
+    // For identity: returns raw pointer directly (zero copy)
+    // For non-identity: maps into stack_buf or heap
+    // Returns: {mapped pointer, heap buffer to delete (or nullptr)}
+    std::pair<const uint8_t*, uint8_t*> get_mapped(
+            const uint8_t* raw, uint32_t len,
+            uint8_t* stack_buf, size_t stack_size) const noexcept {
+        if constexpr (CHARMAP::IS_IDENTITY) {
+            return {raw, nullptr};
+        } else {
+            uint8_t* heap_buf = (len <= stack_size) ? nullptr : new uint8_t[len];
+            uint8_t* buf = heap_buf ? heap_buf : stack_buf;
+            map_bytes_into(raw, buf, len);
+            return {buf, heap_buf};
+        }
     }
 
 public:
@@ -1158,15 +1189,9 @@ public:
     // -----------------------------------------------------------------------
 
     const VALUE* find(std::string_view key) const {
-        uint8_t buf[4096];
-        uint8_t* mapped = key.size() <= sizeof(buf) ? buf :
-            new uint8_t[key.size()];
-        uint32_t len = map_key(key, mapped);
-
-        const VST* slot = find_impl(mapped, len);
-
-        if (mapped != buf) delete[] mapped;
-
+        const uint8_t* key_data = reinterpret_cast<const uint8_t*>(key.data());
+        uint32_t len = static_cast<uint32_t>(key.size());
+        const VST* slot = find_impl(key_data, len);
         if (!slot) return nullptr;
         return &VT::load(*slot);
     }
@@ -1392,8 +1417,9 @@ private:
     };
     
     SearchResult compact_search_position(uint64_t* node, NodeHeader h,
-                                         const uint8_t* suffix,
+                                         const uint8_t* mapped_suffix,
                                          uint32_t suffix_len) {
+        // NOTE: mapped_suffix is already mapped through char_map
         uint16_t count = h.count;
         if (count == 0) return {false, 0, 0};
         
@@ -1408,7 +1434,7 @@ private:
         const E* idx = reinterpret_cast<const E*>(data + idx_off(ec));
         const uint8_t* keys = data + keys_off(count, ec);
         
-        E skey = make_search_key(suffix, suffix_len);
+        E skey = make_search_key(mapped_suffix, suffix_len);
         E skey_prefix = e_prefix_only(skey);
         int idx_base = 0, idx_end = ic;
         
@@ -1452,7 +1478,7 @@ private:
             std::min(key_start + 8, (int)count);
         
         for (int i = key_start; i < scan_end; ++i) {
-            int cmp = key_cmp(kp, suffix, suffix_len);
+            int cmp = key_cmp(kp, mapped_suffix, suffix_len);
             if (cmp == 0) return {true, i, block_offset};
             if (cmp > 0) return {false, i, block_offset};
             kp = key_next(kp);
@@ -3009,38 +3035,44 @@ private:
 
 template <typename VALUE, typename CHARMAP, typename ALLOC>
 bool kstrie<VALUE, CHARMAP, ALLOC>::insert(std::string_view key, const VALUE& value) {
-    uint8_t buf[4096];
-    uint8_t* mapped = key.size() <= sizeof(buf) ? buf : new uint8_t[key.size()];
-    uint32_t len = map_key(key, mapped);
+    const uint8_t* raw = reinterpret_cast<const uint8_t*>(key.data());
+    uint32_t len = static_cast<uint32_t>(key.size());
+    
+    // Map key bytes (zero-copy for identity map)
+    uint8_t stack_buf[256];
+    auto [mapped, heap_buf] = get_mapped(raw, len, stack_buf, sizeof(stack_buf));
 
     InsertResult r = insert_impl(root_, mapped, len, value, 0, InsertMode::INSERT);
     root_ = r.node;
-
-    if (mapped != buf) delete[] mapped;
+    
+    delete[] heap_buf;
 
     if (r.outcome == InsertOutcome::INSERTED) {
         size_++;
         return true;
     }
-    return false;  // FOUND or UPDATED (shouldn't happen with INSERT mode)
+    return false;
 }
 
 template <typename VALUE, typename CHARMAP, typename ALLOC>
 bool kstrie<VALUE, CHARMAP, ALLOC>::insert_or_assign(std::string_view key, const VALUE& value) {
-    uint8_t buf[4096];
-    uint8_t* mapped = key.size() <= sizeof(buf) ? buf : new uint8_t[key.size()];
-    uint32_t len = map_key(key, mapped);
+    const uint8_t* raw = reinterpret_cast<const uint8_t*>(key.data());
+    uint32_t len = static_cast<uint32_t>(key.size());
+    
+    // Map key bytes (zero-copy for identity map)
+    uint8_t stack_buf[256];
+    auto [mapped, heap_buf] = get_mapped(raw, len, stack_buf, sizeof(stack_buf));
 
     InsertResult r = insert_impl(root_, mapped, len, value, 0, InsertMode::UPDATE);
     root_ = r.node;
-
-    if (mapped != buf) delete[] mapped;
+    
+    delete[] heap_buf;
 
     if (r.outcome == InsertOutcome::INSERTED) {
         size_++;
         return true;
     }
-    return false;  // UPDATED existing key
+    return false;
 }
 
 template <typename VALUE, typename CHARMAP, typename ALLOC>
