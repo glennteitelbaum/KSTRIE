@@ -544,14 +544,6 @@ private:
     static constexpr uint32_t COMPACT_MAX = 4096;        // Max entries
     static constexpr size_t COMPACT_MAX_BYTES = 16384;   // Max node size (16KB)
 
-    // Result of checking compact node invariants
-    enum class CompressedResult {
-        OK,
-        TOO_BIG,          // Node exceeds 16KB
-        TOO_MANY,         // Node exceeds 4096 entries
-        KEY_TOO_LONG      // A key suffix exceeds 14 bytes (can't distinguish via E prefix)
-    };
-
     // Result of compact insert check
     // Negative: force split
     // Zero: in-place OK
@@ -791,20 +783,19 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // check_compress — Validate compact node invariants
-    // Returns TOO_BIG/TOO_MANY if split needed, asserts on bugs
+    // check_compress — DEBUG ONLY: Validate compact node invariants
+    // Asserts on any violation - if it fires, there's a bug in the code
     // -----------------------------------------------------------------------
     
-    CompressedResult check_compress(const uint64_t* node) const {
+    void check_compress([[maybe_unused]] const uint64_t* node) const {
+#ifdef KSTRIE_DEBUG
         NodeHeader h = hdr(node);
         
         // Must be a compact node
         assert(h.is_compact() && "check_compress called on bitmap node");
         
         // Check count limit
-        if (h.count > COMPACT_MAX) {
-            return CompressedResult::TOO_MANY;
-        }
+        assert(h.count <= COMPACT_MAX && "TOO_MANY: count exceeds limit");
         
         // Check size limit
         int ic = idx_count(h.count);
@@ -813,105 +804,72 @@ private:
         std::size_t data_size = values_off(h.count, h.keys_bytes, ec) +
                                 h.count * sizeof(VST);
         std::size_t node_bytes = data_offset_u64(h.skip, h.has_eos()) * 8 + data_size;
-        if (node_bytes > COMPACT_MAX_BYTES) {
-            return CompressedResult::TOO_BIG;
-        }
+        assert(node_bytes <= COMPACT_MAX_BYTES && "TOO_BIG: node exceeds size limit");
         
         // Check that no key suffix exceeds 14 bytes
-        // Keys longer than 14 bytes can't be distinguished by E prefix comparison
-        // If found, return KEY_TOO_LONG to trigger recursive split
-        if (h.count >= 2) {
+        if (h.count >= 1) {
             const uint8_t* data = reinterpret_cast<const uint8_t*>(node) +
                                   data_offset_u64(h.skip, h.has_eos()) * 8;
             const uint8_t* keys = data + keys_off(h.count, ec);
             const uint8_t* kp = keys;
             for (uint16_t i = 0; i < h.count; ++i) {
                 uint16_t klen = read_u16(kp);
-                if (klen > 14) {
-                    return CompressedResult::KEY_TOO_LONG;
-                }
+                assert(klen <= 14 && "KEY_TOO_LONG: suffix exceeds 14 bytes");
                 kp = key_next(kp);
             }
         }
         
-        // ASSERT: count=1 must have EOS (single entry = skip+EOS)
+        // count=1 must have EOS (single entry = skip+EOS)
         assert(!(h.count == 1 && !h.has_eos()) && "MISSING_EOS: count=1 without EOS");
         
-        // For count >= 2, check invariants
+        // For count >= 2, check structural invariants
         if (h.count >= 2) {
             const uint8_t* data = reinterpret_cast<const uint8_t*>(node) +
                                   data_offset_u64(h.skip, h.has_eos()) * 8;
-            const E* hot = reinterpret_cast<const E*>(data + hot_off());
             const E* idx = reinterpret_cast<const E*>(data + idx_off(ec));
             const uint8_t* keys = data + keys_off(h.count, ec);
             
-            // Collect all keys for checking
-            std::vector<std::pair<const uint8_t*, uint16_t>> key_list;
-            key_list.reserve(h.count);
+            // Check idx entries and key order
             const uint8_t* kp = keys;
             uint32_t cumulative_offset = 0;
+            const uint8_t* prev_key = nullptr;
+            uint16_t prev_len = 0;
             
             for (uint16_t i = 0; i < h.count; ++i) {
                 uint16_t klen = read_u16(kp);
                 const uint8_t* kdata = kp + 2;
-                key_list.push_back({kdata, klen});
                 
-                // ASSERT: Check idx entry at block boundary
+                // Check idx entry at block boundary
                 if (i % 8 == 0) {
                     int idx_i = i / 8;
-                    
-                    // Check offset matches
                     uint16_t stored_offset = e_offset(idx[idx_i]);
-                    if (stored_offset != cumulative_offset) {
-                        std::cerr << "BAD_IDX at i=" << i << " idx_i=" << idx_i << "\n";
-                        std::cerr << "  stored_offset=" << stored_offset 
-                                  << " cumulative_offset=" << cumulative_offset << "\n";
-                        std::cerr << "  count=" << h.count << " keys_bytes=" << h.keys_bytes << "\n";
-                    }
                     assert(stored_offset == cumulative_offset && "BAD_IDX: offset mismatch");
                     
-                    // Check prefix matches (first 14 bytes of key)
                     ES es;
                     es.setkey(reinterpret_cast<const char*>(kdata), klen);
                     es.setoff(cumulative_offset);
-                    E expected = cvt(es);
-                    E expected_prefix = e_prefix_only(expected);
+                    E expected_prefix = e_prefix_only(cvt(es));
                     E stored_prefix = e_prefix_only(idx[idx_i]);
                     assert(expected_prefix == stored_prefix && "BAD_IDX: prefix mismatch");
                 }
                 
-                cumulative_offset += 2 + klen;  // length field + key bytes
+                // Check sort order
+                if (prev_key) {
+                    uint32_t min_len = std::min<uint32_t>(prev_len, klen);
+                    int cmp = std::memcmp(prev_key, kdata, min_len);
+                    bool sorted = (cmp < 0) || (cmp == 0 && prev_len < klen);
+                    assert(sorted && "UNSORTED: keys not in order");
+                }
+                
+                prev_key = kdata;
+                prev_len = klen;
+                cumulative_offset += 2 + klen;
                 kp = key_next(kp);
             }
             
-            // ASSERT: Keys must be sorted
-            for (size_t i = 1; i < key_list.size(); ++i) {
-                auto [k1, len1] = key_list[i-1];
-                auto [k2, len2] = key_list[i];
-                uint32_t min_len = std::min(len1, len2);
-                int cmp = std::memcmp(k1, k2, min_len);
-                bool sorted = (cmp < 0) || (cmp == 0 && len1 < len2);
-                if (!sorted) {
-                    std::cerr << "UNSORTED at index " << i << ":\n";
-                    std::cerr << "  key[" << (i-1) << "] len=" << len1 << ": ";
-                    for (uint16_t j = 0; j < std::min(len1, uint16_t(40)); ++j) 
-                        std::cerr << (char)k1[j];
-                    std::cerr << "\n";
-                    std::cerr << "  key[" << i << "] len=" << len2 << ": ";
-                    for (uint16_t j = 0; j < std::min(len2, uint16_t(40)); ++j) 
-                        std::cerr << (char)k2[j];
-                    std::cerr << "\n";
-                    std::cerr << "  cmp=" << cmp << " min_len=" << min_len << "\n";
-                }
-                assert(sorted && "UNSORTED: keys not in order");
-            }
-            
-            // Note: Keys CAN share common prefixes - skip only shrinks, never grows
-            // Skip extension only happens during leaf creation, not on subsequent inserts
-            
-            // ASSERT: Check hot array (Eytzinger layout)
+            // Check hot array (Eytzinger layout)
             if (ec > 0) {
-                // Rebuild expected hot array
+                const E* hot = reinterpret_cast<const E*>(data + hot_off());
                 E stack_buf[128];
                 E* boundaries = (ec <= 128) ? stack_buf : new E[ec];
                 for (int i = 0; i < ec; ++i) {
@@ -920,13 +878,13 @@ private:
                 }
                 E expected_hot[128];
                 int k = 0;
-                std::function<void(int)> build_eyt_local = [&](int i) {
+                std::function<void(int)> build = [&](int i) {
                     if (i > ec) return;
-                    build_eyt_local(2*i);
+                    build(2*i);
                     expected_hot[i] = boundaries[k++];
-                    build_eyt_local(2*i + 1);
+                    build(2*i + 1);
                 };
-                build_eyt_local(1);
+                build(1);
                 if (boundaries != stack_buf) delete[] boundaries;
                 
                 for (int i = 1; i <= ec; ++i) {
@@ -934,8 +892,7 @@ private:
                 }
             }
         }
-        
-        return CompressedResult::OK;
+#endif  // KSTRIE_DEBUG
     }
 
     // -----------------------------------------------------------------------
@@ -1349,34 +1306,33 @@ private:
             }
             // Update value
             compact_update_value(node, h, sr.pos, value);
+            check_compress(node);
             return {node, InsertOutcome::UPDATED};
         }
 
-        // KEY_TOO_LONG check: if suffix > 14 bytes AND node has entries, must split
-        // (14-byte E prefix comparison can't distinguish keys with same 14-byte prefix)
+        // KEY_TOO_LONG check (O(1)): if suffix > 14 bytes AND node has entries, must split
         if (suffix_len > 14 && h.count >= 1) {
-            // Force insert at end (position doesn't matter for split)
             uint64_t* temp = compact_force_insert(node, h, suffix, suffix_len,
                                                    value, h.count);
-            NodeHeader temp_h = hdr(temp);
-            uint64_t* split_node = compact_split_to_bitmap_node(temp, temp_h);
+            uint64_t* split_node = compact_split_to_bitmap_node(temp, hdr(temp));
             return {split_node, InsertOutcome::INSERTED};
         }
 
-        // Key not found — try insert at pos
+        // Try insert at pos - returns nullptr if size/count limit hit
         uint64_t* result = compact_insert_at(node, h, suffix, suffix_len, 
                                               value, sr.pos, sr.block_offset);
         
         if (result == nullptr) {
-            // Need split (size/count limit) - insert anyway then split
+            // Need split (size/count limit)
             uint64_t* temp = compact_force_insert(node, h, suffix, suffix_len,
                                                    value, sr.pos);
-            NodeHeader temp_h = hdr(temp);
-            uint64_t* split_node = compact_split_to_bitmap_node(temp, temp_h);
+            uint64_t* split_node = compact_split_to_bitmap_node(temp, hdr(temp));
             return {split_node, InsertOutcome::INSERTED};
         }
         
-        return {node, InsertOutcome::INSERTED};  // node was updated by reference
+        // Success - validate in DEBUG mode
+        check_compress(node);
+        return {node, InsertOutcome::INSERTED};
     }
 
     // -----------------------------------------------------------------------
@@ -2014,14 +1970,15 @@ private:
                 child = create_compact_from_entries(buckets[b],
                     child_has_eos ? &bucket_eos[b][0] : nullptr);
                 
-                // Check if child is OK - if not, recursively split it
-                if (hdr(child).is_compact()) {
-                    CompressedResult child_result = check_compress(child);
-                    if (child_result != CompressedResult::OK) {
-                        // Child needs further splitting
-                        child = compact_split_to_bitmap_node(child, hdr(child));
-                    }
+                // Check if child needs further splitting (any key > 14 bytes)
+                if (hdr(child).is_compact() && compact_needs_split(child)) {
+                    child = compact_split_to_bitmap_node(child, hdr(child));
                 }
+            }
+            
+            // DEBUG: validate compact children
+            if (hdr(child).is_compact()) {
+                check_compress(child);
             }
             
             children[slot++] = reinterpret_cast<uint64_t>(child);
@@ -2031,6 +1988,29 @@ private:
         free_node(node);
         
         return new_node;
+    }
+    
+    // O(1) check if compact node needs to be split
+    // Returns true if any key > 14 bytes (must scan keys)
+    bool compact_needs_split(const uint64_t* node) const {
+        NodeHeader h = hdr(node);
+        if (h.count == 0) return false;
+        
+        int ic = idx_count(h.count);
+        int W = calc_W(ic);
+        int ec = W > 0 ? W - 1 : 0;
+        
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(node) +
+                              data_offset_u64(h.skip, h.has_eos()) * 8;
+        const uint8_t* keys = data + keys_off(h.count, ec);
+        const uint8_t* kp = keys;
+        
+        for (uint16_t i = 0; i < h.count; ++i) {
+            uint16_t klen = read_u16(kp);
+            if (klen > 14) return true;
+            kp = key_next(kp);
+        }
+        return false;
     }
     // Add new child to bitmap node for given byte
     InsertResult bitmap_add_child(uint64_t* node, NodeHeader h, uint8_t byte,
