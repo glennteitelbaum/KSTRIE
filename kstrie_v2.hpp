@@ -564,6 +564,19 @@ private:
         ALLOC_TOO_BIG = -3,
     };
 
+    // Insert mode
+    enum class InsertMode {
+        INSERT,   // fail if key exists (return FOUND)
+        UPDATE    // overwrite if key exists (upsert)
+    };
+
+    // Insert outcome
+    enum class InsertOutcome {
+        INSERTED,  // new key added, size++
+        UPDATED,   // existing key overwritten
+        FOUND      // key exists, INSERT mode, no change
+    };
+
     using byte_alloc_type =
         typename std::allocator_traits<ALLOC>::template rebind_alloc<uint8_t>;
 
@@ -717,8 +730,8 @@ private:
     //          positive = new allocation size needed
     // -----------------------------------------------------------------------
     
-    int32_t check_compact_insert(uint16_t current_alloc, uint8_t skip, 
-                                  bool has_eos, uint16_t old_count,
+    int32_t check_compact_insert(uint16_t current_alloc, uint8_t old_skip, 
+                                  uint8_t new_skip, bool has_eos, uint16_t old_count,
                                   uint32_t old_keys_bytes,
                                   uint32_t suffix_len) const noexcept {
         // Check count limit
@@ -726,14 +739,22 @@ private:
             return static_cast<int32_t>(CompactInsertCheck::TOO_MANY_KEYS);
         }
         
+        // Calculate LCP shrink (skip can only shrink or stay same on insert)
+        // lcp_shrink >= 0: each existing key grows by this many bytes
+        uint32_t lcp_shrink = old_skip - new_skip;
+        
+        // New suffix length after new skip
+        uint32_t new_suffix_len = suffix_len + lcp_shrink;
+        
         // Check key length limit (14 bytes max for E prefix comparison)
-        if (suffix_len > 14) {
+        if (new_suffix_len > 14) {
             return static_cast<int32_t>(CompactInsertCheck::KEY_TOO_BIG);
         }
         
         // Calculate new layout
         uint16_t new_count = old_count + 1;
-        uint32_t new_keys_bytes = old_keys_bytes + 2 + suffix_len;
+        // Existing keys grow by lcp_shrink each, new key stored as new_suffix_len
+        uint32_t new_keys_bytes = old_keys_bytes + old_count * lcp_shrink + (2 + new_suffix_len);
         
         int new_ic = idx_count(new_count);
         int new_W = calc_W(new_ic);
@@ -741,7 +762,7 @@ private:
         
         std::size_t new_data_size = values_off(new_count, new_keys_bytes, new_ec) +
                                     new_count * sizeof(VST);
-        std::size_t new_node_bytes = data_offset_u64(skip, has_eos) * 8 + new_data_size;
+        std::size_t new_node_bytes = data_offset_u64(new_skip, has_eos) * 8 + new_data_size;
         
         // Check size limit
         if (new_node_bytes > COMPACT_MAX_BYTES) {
@@ -749,7 +770,7 @@ private:
         }
         
         uint16_t actual_needed = static_cast<uint16_t>(
-            data_offset_u64(skip, has_eos) + (new_data_size + 7) / 8);
+            data_offset_u64(new_skip, has_eos) + (new_data_size + 7) / 8);
         uint16_t padded = padded_size(actual_needed);
         
         if (padded == current_alloc) {
@@ -1168,10 +1189,15 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Modifiers — stubs
+    // Modifiers
     // -----------------------------------------------------------------------
 
+    // Insert only if key doesn't exist. Returns true if inserted.
     bool insert(std::string_view key, const VALUE& value);
+    
+    // Insert or update (upsert). Returns true if inserted, false if updated.
+    bool insert_or_assign(std::string_view key, const VALUE& value);
+    
     size_type erase(std::string_view key);
     void clear() noexcept;
 
@@ -1182,8 +1208,8 @@ private:
 
     // Result of insert operation
     struct InsertResult {
-        uint64_t* node;     // possibly reallocated node
-        bool inserted;      // true if new key, false if updated existing
+        uint64_t* node;       // possibly reallocated node
+        InsertOutcome outcome;
     };
 
     // -----------------------------------------------------------------------
@@ -1192,7 +1218,7 @@ private:
 
     InsertResult insert_impl(uint64_t* node, const uint8_t* key_data, 
                              uint32_t key_len, const VALUE& value,
-                             uint32_t consumed) {
+                             uint32_t consumed, InsertMode mode) {
         NodeHeader h = hdr(node);
 
         // Handle sentinel - need to allocate real node
@@ -1201,7 +1227,7 @@ private:
             const uint8_t* suffix = key_data + consumed;
             uint32_t suffix_len = key_len - consumed;
             uint64_t* new_node = create_leaf_with_entry(suffix, suffix_len, value);
-            return {new_node, true};
+            return {new_node, InsertOutcome::INSERTED};
         }
 
         // --- Handle skip prefix (with continuation) ---
@@ -1220,11 +1246,11 @@ private:
                 if (match_len < remaining) {
                     // Mismatch before key ended
                     return split_prefix(node, h, key_data, key_len, value, 
-                                       consumed, match_len);
+                                       consumed, match_len, mode);
                 }
                 // Key matches prefix up to key's end — split and add EOS
                 return split_prefix(node, h, key_data, key_len, value,
-                                   consumed, remaining);
+                                   consumed, remaining, mode);
             }
 
             // Check for prefix mismatch
@@ -1237,7 +1263,7 @@ private:
             if (match_len < skip_bytes) {
                 // Prefix mismatch — split here
                 return split_prefix(node, h, key_data, key_len, value,
-                                   consumed, match_len);
+                                   consumed, match_len, mode);
             }
 
             consumed += skip_bytes;
@@ -1253,11 +1279,15 @@ private:
         // --- EOS check: key fully consumed ---
         if (consumed == key_len) {
             if (h.has_eos()) {
+                // Key exists
+                if (mode == InsertMode::INSERT) {
+                    return {node, InsertOutcome::FOUND};
+                }
                 // Update existing EOS value
                 VST& slot = const_cast<VST&>(eos_slot(node, h.skip));
                 VT::destroy(slot);
                 slot = VT::store(value);
-                return {node, false};
+                return {node, InsertOutcome::UPDATED};
             }
             // Add EOS to this node
             return add_eos_to_node(node, h, value);
@@ -1265,9 +1295,9 @@ private:
 
         // --- Dispatch based on node type ---
         if (h.is_compact()) {
-            return compact_insert(node, h, key_data, key_len, value, consumed);
+            return compact_insert(node, h, key_data, key_len, value, consumed, mode);
         } else {
-            return bitmap_insert(node, h, key_data, key_len, value, consumed);
+            return bitmap_insert(node, h, key_data, key_len, value, consumed, mode);
         }
     }
 
@@ -1277,7 +1307,8 @@ private:
 
     InsertResult compact_insert(uint64_t* node, NodeHeader h,
                                 const uint8_t* key_data, uint32_t key_len,
-                                const VALUE& value, uint32_t consumed) {
+                                const VALUE& value, uint32_t consumed,
+                                InsertMode mode) {
         const uint8_t* suffix = key_data + consumed;
         uint32_t suffix_len = key_len - consumed;
 
@@ -1285,9 +1316,13 @@ private:
         SearchResult sr = compact_search_position(node, h, suffix, suffix_len);
 
         if (sr.found) {
-            // Key exists — update value
+            // Key exists
+            if (mode == InsertMode::INSERT) {
+                return {node, InsertOutcome::FOUND};
+            }
+            // Update value
             compact_update_value(node, h, sr.pos, value);
-            return {node, false};
+            return {node, InsertOutcome::UPDATED};
         }
 
         // Key not found — try insert at pos
@@ -1304,10 +1339,10 @@ private:
                                                    value, insert_pos);
             NodeHeader temp_h = hdr(temp);
             uint64_t* split_node = compact_split_to_bitmap_node(temp, temp_h);
-            return {split_node, true};
+            return {split_node, InsertOutcome::INSERTED};
         }
         
-        return {node, true};  // node was updated by reference
+        return {node, InsertOutcome::INSERTED};  // node was updated by reference
     }
 
     // -----------------------------------------------------------------------
@@ -1316,7 +1351,8 @@ private:
 
     InsertResult bitmap_insert(uint64_t* node, NodeHeader h,
                                const uint8_t* key_data, uint32_t key_len,
-                               const VALUE& value, uint32_t consumed) {
+                               const VALUE& value, uint32_t consumed,
+                               InsertMode mode) {
         uint8_t byte = key_data[consumed];
         consumed++;
 
@@ -1328,12 +1364,12 @@ private:
             int slot = bm.find_slot(byte);
             uint64_t* child = reinterpret_cast<uint64_t*>(children[slot]);
 
-            InsertResult r = insert_impl(child, key_data, key_len, value, consumed);
+            InsertResult r = insert_impl(child, key_data, key_len, value, consumed, mode);
 
             if (r.node != child) {
                 children[slot] = reinterpret_cast<uint64_t>(r.node);
             }
-            return {node, r.inserted};
+            return {node, r.outcome};
         }
 
         // No child for this byte — create one
@@ -1506,7 +1542,8 @@ private:
         }
         
         // No common prefix - simple insert with check
-        int32_t check = check_compact_insert(h.alloc_u64, h.skip, h.has_eos(),
+        // new_skip == old_skip since lcp == 0
+        int32_t check = check_compact_insert(h.alloc_u64, h.skip, h.skip, h.has_eos(),
                                               h.count, h.keys_bytes, suffix_len);
         
         // Need split?
@@ -1880,14 +1917,14 @@ private:
         SearchResult sr = compact_search_position(node, h, suffix, suffix_len);
         if (sr.found) {
             compact_update_value(node, h, sr.pos, value);
-            return {node, false};
+            return {node, InsertOutcome::UPDATED};
         }
         
         // Force insert then split
         uint64_t* new_node = compact_force_insert(node, h, suffix, suffix_len, value, sr.pos);
         NodeHeader new_h = hdr(new_node);
         uint64_t* split_node = compact_split_to_bitmap_node(new_node, new_h);
-        return {split_node, true};
+        return {split_node, InsertOutcome::INSERTED};
     }
     
     // Force insert without limit checks (used before split)
@@ -2248,7 +2285,7 @@ private:
         // Deallocate old node
         free_node(node);
         
-        return {new_node, true};
+        return {new_node, InsertOutcome::INSERTED};
     }
 
     // Add EOS value to node (reallocate with EOS slot)
@@ -2295,7 +2332,7 @@ private:
             }
             
             free_node(node);
-            return {new_node, true};
+            return {new_node, InsertOutcome::INSERTED};
             
         } else {
             // Bitmap: [Header][prefix?][bitmap][children] -> 
@@ -2333,7 +2370,7 @@ private:
                        bitmap_and_children_u64 * 8);
             
             free_node(node);
-            return {new_node, true};
+            return {new_node, InsertOutcome::INSERTED};
         }
     }
 
@@ -2341,7 +2378,8 @@ private:
     InsertResult split_prefix(uint64_t* node, NodeHeader h,
                               const uint8_t* key_data, uint32_t key_len,
                               const VALUE& value, uint32_t consumed,
-                              uint32_t match_len) {
+                              uint32_t match_len, InsertMode mode) {
+        (void)mode;  // split always inserts (new key doesn't exist yet)
         // If node is compact, stay compact
         if (h.is_compact()) {
             return compact_split_on_prefix(node, h, key_data, key_len, 
@@ -2428,7 +2466,7 @@ private:
                                BITMAP_U64 + top_count;
         free_node(node);
         
-        return {parent, true};
+        return {parent, InsertOutcome::INSERTED};
     }
     
     // Split compact node at prefix mismatch - stays compact
@@ -2644,7 +2682,7 @@ private:
         // Deallocate old node
         free_node(node);
         
-        return {new_node, true};
+        return {new_node, InsertOutcome::INSERTED};
     }
 
     // Create a compact leaf with a single entry
@@ -2975,13 +3013,34 @@ bool kstrie<VALUE, CHARMAP, ALLOC>::insert(std::string_view key, const VALUE& va
     uint8_t* mapped = key.size() <= sizeof(buf) ? buf : new uint8_t[key.size()];
     uint32_t len = map_key(key, mapped);
 
-    InsertResult r = insert_impl(root_, mapped, len, value, 0);
+    InsertResult r = insert_impl(root_, mapped, len, value, 0, InsertMode::INSERT);
     root_ = r.node;
 
     if (mapped != buf) delete[] mapped;
 
-    if (r.inserted) size_++;
-    return r.inserted;
+    if (r.outcome == InsertOutcome::INSERTED) {
+        size_++;
+        return true;
+    }
+    return false;  // FOUND or UPDATED (shouldn't happen with INSERT mode)
+}
+
+template <typename VALUE, typename CHARMAP, typename ALLOC>
+bool kstrie<VALUE, CHARMAP, ALLOC>::insert_or_assign(std::string_view key, const VALUE& value) {
+    uint8_t buf[4096];
+    uint8_t* mapped = key.size() <= sizeof(buf) ? buf : new uint8_t[key.size()];
+    uint32_t len = map_key(key, mapped);
+
+    InsertResult r = insert_impl(root_, mapped, len, value, 0, InsertMode::UPDATE);
+    root_ = r.node;
+
+    if (mapped != buf) delete[] mapped;
+
+    if (r.outcome == InsertOutcome::INSERTED) {
+        size_++;
+        return true;
+    }
+    return false;  // UPDATED existing key
 }
 
 template <typename VALUE, typename CHARMAP, typename ALLOC>
