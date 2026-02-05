@@ -132,13 +132,12 @@ private:
         const VALUE* result = nullptr;
 
         for (;;) {
-            if (node == sentinel_ptr()) goto done;
             hdr_type h = hdr_type::from_node(node);
 
             // Match skip prefix
             {
                 auto mr = skip_type::match_prefix(node, h, mapped, key_len, consumed);
-                if (mr.status != skip_type::match_status::MATCHED) goto done;
+                if (mr.status != skip_type::match_status::MATCHED) break;
                 consumed = mr.consumed;
             }
 
@@ -146,7 +145,7 @@ private:
             if (h.is_compact()) {
                 result = compact_type::find(node, h, mapped + consumed,
                                              key_len - consumed);
-                goto done;
+                break;
             }
 
             // Bitmask: key exhausted → follow eos_child
@@ -162,7 +161,6 @@ private:
             }
         }
 
-    done:
         delete[] heap_buf;
         return result;
     }

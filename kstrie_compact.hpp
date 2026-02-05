@@ -160,8 +160,6 @@ struct kstrie_compact {
     static const VALUE* find(const uint64_t* node, const hdr_type& h,
                              const uint8_t* suffix,
                              uint32_t suffix_len) noexcept {
-        if (h.count == 0) return nullptr;
-
         const uint8_t* index = h.get_index(const_cast<uint64_t*>(node));
         auto [found, pos] = search_in_index(index, h.count, suffix, suffix_len);
         if (!found) return nullptr;
@@ -178,7 +176,6 @@ struct kstrie_compact {
                                     build_entry* out,
                                     uint8_t* key_buf) noexcept {
         uint16_t N = h.count;
-        if (N == 0) return 0;
 
         const uint8_t* index = h.get_index(const_cast<uint64_t*>(node));
         int W = calc_W(N);
