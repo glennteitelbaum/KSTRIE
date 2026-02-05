@@ -147,15 +147,12 @@ private:
                                              key_len - consumed);
                 break;
             }
-
-            // Bitmask: key exhausted → follow eos_child
+            
             if (consumed == key_len) {
+		// Bitmask: key exhausted → follow eos_child
                 node = bitmask_type::eos_child(node, h);
-                continue;
-            }
-
-            // Bitmap dispatch — consume one byte, follow child
-            {
+            } else {
+                // Bitmap dispatch — consume one byte, follow child
                 uint8_t byte = mapped[consumed++];
                 node = bitmask_type::find_child(node, h, byte);
             }
