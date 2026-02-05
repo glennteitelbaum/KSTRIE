@@ -9,13 +9,11 @@ namespace gteitelbaum {
 // ============================================================================
 // kstrie -- main trie class
 //
-// Router + helpers. Dispatches by node type. Does not know internal layouts
-// of compact or bitmask nodes. Composes the modules.
+// Router + helpers. Dispatches by node type.
 //
 // Node layout: [header] [skip] [index] [slots]
-//   - slots[0] = EOS when has_eos, data starts at slots[has_eos()]
-//   - compact: slots hold VALUES
-//   - bitmask: slots hold child pointers
+//   - bitmask: slots[0] = EOS when has_eos, then child pointers
+//   - compact: no EOS, all slots are values, zero-length key for exact match
 // ============================================================================
 
 template <typename VALUE,
@@ -84,8 +82,8 @@ private:
         uint64_t* slot_base = h.get_slots(node);
 
         if (h.is_compact()) {
-            // Destroy EOS + data values
-            slots_type::destroy_values(slot_base, 0, h.total_slots());
+            // Compact: all slots are values, no EOS offset
+            slots_type::destroy_values(slot_base, 0, h.count);
         } else {
             // Bitmap: recurse into child pointers, then destroy EOS if present
             uint16_t data_start = h.has_eos() ? 1 : 0;
@@ -140,19 +138,19 @@ private:
             if (mr.status != skip_type::match_status::MATCHED) goto done;
             consumed = mr.consumed;
 
-            // EOS check
+            // Compact node — search within (including zero-length suffix)
+            if (h.is_compact()) {
+                result = compact_type::find(node, h, mapped + consumed,
+                                             key_len - consumed);
+                goto done;
+            }
+
+            // Bitmask: EOS check
             if (consumed == key_len) {
                 if (h.has_eos()) {
                     const uint64_t* slot_base = h.get_slots(node);
                     result = &slots_type::load_value(slot_base, 0);
                 }
-                goto done;
-            }
-
-            // Compact node — search within
-            if (h.is_compact()) {
-                result = compact_type::find(node, h, mapped + consumed,
-                                             key_len - consumed);
                 goto done;
             }
 
@@ -288,9 +286,6 @@ public:
 
     // ------------------------------------------------------------------
     // insert_node -- public recursive dispatch
-    //
-    // Called by insert/insert_or_assign, and by bitmask/compact
-    // when they need to recurse back through the router.
     // ------------------------------------------------------------------
 
     insert_result insert_node(uint64_t* node, const uint8_t* key_data,
@@ -320,69 +315,53 @@ public:
 
         consumed = mr.consumed;
 
-        // EOS check — key fully consumed
+        // Compact: always dispatch (handles zero-length suffix as regular entry)
+        if (h.is_compact()) {
+            return compact_type::insert(node, h, key_data, key_len,
+                                         value, consumed, mr, mode, *this);
+        }
+
+        // Bitmask: EOS check — key fully consumed
         if (consumed == key_len) {
             uint64_t* slot_base = h.get_slots(node);
             if (h.has_eos()) {
                 if (mode == insert_mode::INSERT)
                     return {node, insert_outcome::FOUND};
-                // Update existing EOS
                 slots_type::destroy_value(slot_base, 0);
                 slots_type::store_value(slot_base, 0, value);
                 return {node, insert_outcome::UPDATED};
             }
-            // Add EOS — shift slots right by 1, store at slot[0]
             return add_eos(node, h, value);
         }
 
-        // Dispatch by node type
-        if (h.is_compact()) {
-            return compact_type::insert(node, h, key_data, key_len,
-                                         value, consumed, mr, mode, *this);
-        } else {
-            return bitmask_type::insert(node, h, key_data, key_len,
-                                         value, consumed, mr, mode, *this);
-        }
+        // Bitmask dispatch
+        return bitmask_type::insert(node, h, key_data, key_len,
+                                     value, consumed, mr, mode, *this);
     }
 
     // ------------------------------------------------------------------
-    // add_child -- create node for a single suffix + value
+    // add_child -- create compact leaf for a single suffix + value
     //
-    // Called by compact/bitmask when creating new children.
-    // Suffix is already mapped through char_map.
+    // Suffix becomes skip prefix. Value stored as zero-length key entry.
     // ------------------------------------------------------------------
 
     uint64_t* add_child(const uint8_t* suffix, uint32_t suffix_len,
                         const VALUE& value) {
-        // Entire suffix becomes skip prefix, value in EOS slot
-        uint8_t skip = static_cast<uint8_t>(suffix_len);
-        hdr_type h{};
-        h.count = 0;
-        h.keys_bytes = 0;
-        h.skip = skip;
-        h.flags = 0b11;  // is_compact=1, has_eos=1
+        uint64_t raw = 0;
+        slots_type::store_value(&raw, 0, value);
 
-        std::size_t nu = (h.header_size() + h.skip_size() + h.slots_size() + 7) / 8;
-        uint64_t* node = mem_.alloc_node(nu);
+        typename compact_type::build_entry entry;
+        entry.key      = suffix;  // unused for key_len=0
+        entry.key_len  = 0;
+        entry.raw_slot = raw;
 
-        hdr_type::from_node(node) = h;
-        // alloc_node already wrote alloc_u64, restore it
-        // (copy_from pattern — alloc_node zeroes then writes alloc_u64)
-
-        if (suffix_len > 0)
-            std::memcpy(hdr_type::get_skip(node), suffix, suffix_len);
-
-        uint64_t* slot_base = hdr_type::from_node(node).get_slots(node);
-        slots_type::store_value(slot_base, 0, value);
-
-        return node;
+        return compact_type::build_compact(mem_,
+            static_cast<uint8_t>(suffix_len), suffix,
+            &entry, 1);
     }
 
     // ------------------------------------------------------------------
-    // add_child (bulk) -- create node for multiple suffix + value pairs
-    //
-    // Entries must be pre-sorted by suffix. Suffix is already mapped.
-    // Routes to compact::create_from_entries.
+    // add_child (bulk)
     // ------------------------------------------------------------------
 
     struct child_entry {
@@ -396,53 +375,39 @@ public:
     }
 
     // ------------------------------------------------------------------
-    // add_eos -- add EOS to existing node
-    //
-    // Reallocates with one extra slot, shifts existing data right,
-    // stores value at slot[0], sets has_eos flag.
+    // add_eos -- add EOS to existing bitmask node
     // ------------------------------------------------------------------
 
     insert_result add_eos(uint64_t* node, hdr_type h, const VALUE& value) {
-        // Compute current sizes
-        size_t old_total = h.header_size() + h.skip_size()
-                         + h.index_size() + h.slots_size();
-        
-        // New header with has_eos set
         hdr_type nh = h;
         nh.set_eos(true);
-        // total_slots grows by 1
-        
+
         size_t new_total = nh.header_size() + nh.skip_size()
                          + nh.index_size() + nh.slots_size();
         size_t new_u64 = (new_total + 7) / 8;
 
         uint64_t* nn = mem_.alloc_node(new_u64);
 
-        // Copy header with has_eos set
         hdr_type& dest_h = hdr_type::from_node(nn);
         dest_h.copy_from(nh);
 
-        // Copy skip prefix
         if (h.skip > 0)
             std::memcpy(hdr_type::get_skip(nn),
                        hdr_type::get_skip(node),
                        h.skip_size());
 
-        // Copy index region
         size_t idx_sz = h.index_size();
         if (idx_sz > 0)
             std::memcpy(dest_h.get_index(nn),
                        h.get_index(node),
                        idx_sz);
 
-        // Copy existing slots shifted right by 1
         uint64_t* old_slots = h.get_slots(node);
         uint64_t* new_slots = dest_h.get_slots(nn);
 
         if (h.total_slots() > 0)
             slots_type::copy_slots(new_slots, 1, old_slots, 0, h.total_slots());
 
-        // Store EOS value at slot[0]
         slots_type::store_value(new_slots, 0, value);
 
         mem_.free_node(node);
@@ -450,7 +415,7 @@ public:
     }
 
     // ------------------------------------------------------------------
-    // Accessor for memory (modules need it for allocation)
+    // Accessor for memory
     // ------------------------------------------------------------------
 
     mem_type& memory() noexcept { return mem_; }

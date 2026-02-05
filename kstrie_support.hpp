@@ -645,8 +645,9 @@ inline int build_eyt(const e* idx, int ic, e* hot) noexcept {
 // Compact node limits
 // ============================================================================
 
-inline constexpr uint32_t COMPACT_MAX       = 4096;
-inline constexpr size_t   COMPACT_MAX_BYTES = 16384;
+inline constexpr uint32_t COMPACT_MAX           = 4096;
+inline constexpr size_t   COMPACT_MAX_ALLOC_U64  = 256 * 256;
+inline constexpr uint32_t COMPACT_MAX_KEY_LEN    = 14;
 
 // ============================================================================
 // Shared result types
