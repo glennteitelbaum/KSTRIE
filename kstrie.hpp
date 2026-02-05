@@ -303,23 +303,13 @@ public:
         // Match skip prefix
         auto mr = skip_type::match_prefix(node, h, key_data, key_len, consumed);
 
-        if (mr.status != skip_type::match_status::MATCHED) {
-            // Prefix mismatch — compact and bitmask handle their own splits
-            if (h.is_compact())
-                return compact_type::insert(node, h, key_data, key_len,
-                                             value, consumed, mr, mode, *this);
-            else
-                return bitmask_type::insert(node, h, key_data, key_len,
-                                             value, consumed, mr, mode, *this);
-        }
-
-        consumed = mr.consumed;
-
-        // Compact: always dispatch (handles zero-length suffix as regular entry)
-        if (h.is_compact()) {
+        // Compact handles all three statuses (matched, mismatch, exhausted)
+        if (h.is_compact())
             return compact_type::insert(node, h, key_data, key_len,
                                          value, consumed, mr, mode, *this);
-        }
+
+        // Bitmask: only MATCHED reaches here (bitmask skip never mismatches)
+        consumed = mr.consumed;
 
         // Bitmask: EOS check — key fully consumed
         if (consumed == key_len) {
