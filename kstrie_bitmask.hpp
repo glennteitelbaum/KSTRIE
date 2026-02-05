@@ -336,8 +336,8 @@ struct kstrie_bitmask {
     // ------------------------------------------------------------------
 
     static size_t memory_usage(const uint64_t* node) noexcept {
+        if (node == sentinel_ptr()) return 0;
         const hdr_type& h = hdr_type::from_node(node);
-        if (h.is_sentinel()) return 0;
 
         size_t total = static_cast<size_t>(h.alloc_u64) * 8;
 
@@ -347,8 +347,8 @@ struct kstrie_bitmask {
         // slot[0] is sentinel — skip it
         for (uint16_t i = 1; i <= static_cast<uint16_t>(h.count + 1); ++i) {
             uint64_t* child = slots::load_child(sb, i);
+            if (child == sentinel_ptr()) continue;
             const hdr_type& ch = hdr_type::from_node(child);
-            if (ch.is_sentinel()) continue;
             if (ch.is_bitmap())
                 total += memory_usage(child);
             else
@@ -363,8 +363,8 @@ struct kstrie_bitmask {
     // ------------------------------------------------------------------
 
     static void destroy(uint64_t* node, mem_type& mem) {
+        if (node == sentinel_ptr()) return;
         hdr_type& h = hdr_type::from_node(node);
-        if (h.is_sentinel()) return;
 
         uint64_t* sb = h.get_slots(node);
 
@@ -372,9 +372,8 @@ struct kstrie_bitmask {
         // slot[0] is sentinel — don't touch
         for (uint16_t i = 1; i <= static_cast<uint16_t>(h.count + 1); ++i) {
             uint64_t* child = slots::load_child(sb, i);
-            const hdr_type& ch = hdr_type::from_node(child);
-            if (ch.is_sentinel()) continue;
-            if (ch.is_bitmap())
+            if (child == sentinel_ptr()) continue;
+            if (hdr_type::from_node(child).is_bitmap())
                 destroy(child, mem);
             mem.free_node(child);
         }

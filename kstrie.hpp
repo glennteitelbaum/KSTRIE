@@ -76,8 +76,8 @@ private:
 
     void destroy_tree(uint64_t* node) {
         if (!node) return;
+        if (node == sentinel_ptr()) return;
         hdr_type h = hdr_type::from_node(node);
-        if (h.is_sentinel()) return;
 
         uint64_t* slot_base = h.get_slots(node);
 
@@ -100,8 +100,8 @@ private:
 
     size_type memory_usage_impl(const uint64_t* node) const noexcept {
         if (!node) return 0;
+        if (node == sentinel_ptr()) return 0;
         hdr_type h = hdr_type::from_node(node);
-        if (h.is_sentinel()) return 0;
 
         size_type total = h.alloc_u64 * 8;
 
@@ -132,8 +132,8 @@ private:
         const VALUE* result = nullptr;
 
         for (;;) {
+            if (node == sentinel_ptr()) goto done;
             hdr_type h = hdr_type::from_node(node);
-            if (h.is_sentinel()) goto done;
 
             // Match skip prefix
             {
@@ -242,8 +242,7 @@ public:
         auto [mapped, heap_buf] = get_mapped(raw, len, stack_buf, sizeof(stack_buf));
 
         // Sentinel — create leaf directly
-        hdr_type rh = hdr_type::from_node(root_);
-        if (rh.is_sentinel()) {
+        if (root_ == sentinel_ptr()) {
             root_ = add_child(mapped, len, value);
             delete[] heap_buf;
             size_++;
@@ -270,8 +269,7 @@ public:
         auto [mapped, heap_buf] = get_mapped(raw, len, stack_buf, sizeof(stack_buf));
 
         // Sentinel — create leaf directly
-        hdr_type rh = hdr_type::from_node(root_);
-        if (rh.is_sentinel()) {
+        if (root_ == sentinel_ptr()) {
             root_ = add_child(mapped, len, value);
             delete[] heap_buf;
             size_++;
@@ -328,9 +326,8 @@ public:
         // Key exhausted → follow eos_child
         if (consumed == key_len) {
             uint64_t* eos = bitmask_type::eos_child(node, h);
-            hdr_type eh = hdr_type::from_node(eos);
 
-            if (eh.is_sentinel()) {
+            if (eos == sentinel_ptr()) {
                 // No EOS yet — create compact leaf with zero-length suffix
                 uint64_t* leaf = add_child(key_data + consumed, 0, value);
                 bitmask_type::set_eos_child(node, h, leaf);
@@ -349,9 +346,8 @@ public:
         {
             uint8_t byte = key_data[consumed++];
             uint64_t* child = bitmask_type::find_child(node, h, byte);
-            hdr_type ch = hdr_type::from_node(child);
 
-            if (ch.is_sentinel()) {
+            if (child == sentinel_ptr()) {
                 // No child — create compact leaf
                 uint64_t* leaf = add_child(key_data + consumed,
                                            key_len - consumed, value);
