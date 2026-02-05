@@ -533,11 +533,11 @@ struct kstrie_compact {
             bucket_bytes, children,
             static_cast<uint16_t>(n_buckets));
 
-        // Raw-transfer EOS slot
+        // Raw-transfer EOS slot (EOS is at slot[count], i.e. after children)
         if (parent_has_eos) {
             hdr_type& ph = hdr_type::from_node(parent);
             uint64_t* sb = ph.get_slots(parent);
-            sb[0] = parent_eos_raw;
+            sb[ph.count] = parent_eos_raw;
         }
 
         trie.memory().free_node(node);

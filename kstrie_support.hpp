@@ -252,9 +252,9 @@ using reverse_lower_char_map  = char_map<REVERSE_LOWER_MAP>;
 // Compact nodes: slots hold VALUE (or VALUE* when sizeof(VALUE) > 8)
 // Bitmask nodes: slots hold child pointers (uint64_t*)
 //
-// Layout when has_eos:  [eos] [data_0 .. data_{count-1}]
-// Layout when !has_eos: [data_0 .. data_{count-1}]
-// Data index = base + has_eos()
+// Layout when has_eos:  [child_0 .. child_{count-1}] [eos]
+// Layout when !has_eos: [child_0 .. child_{count-1}]
+// EOS index = count (always last)
 // ============================================================================
 
 template <typename VALUE>
@@ -343,22 +343,22 @@ struct kstrie_slots {
         return reinterpret_cast<uint64_t*>(base[index]);
     }
 
-    // --- EOS convenience (slot[0] when has_eos) ---
+    // --- EOS convenience (slot[count] when has_eos, i.e. last slot) ---
 
-    static void store_eos(uint64_t* slot_base, const VALUE& v) {
-        store_value(slot_base, 0, v);
+    static void store_eos(uint64_t* slot_base, uint16_t count, const VALUE& v) {
+        store_value(slot_base, count, v);
     }
 
-    static VALUE& load_eos(uint64_t* slot_base) noexcept {
-        return load_value(slot_base, 0);
+    static VALUE& load_eos(uint64_t* slot_base, uint16_t count) noexcept {
+        return load_value(slot_base, count);
     }
 
-    static const VALUE& load_eos(const uint64_t* slot_base) noexcept {
-        return load_value(slot_base, 0);
+    static const VALUE& load_eos(const uint64_t* slot_base, uint16_t count) noexcept {
+        return load_value(slot_base, count);
     }
 
-    static void destroy_eos(uint64_t* slot_base) {
-        destroy_value(slot_base, 0);
+    static void destroy_eos(uint64_t* slot_base, uint16_t count) {
+        destroy_value(slot_base, count);
     }
 };
 

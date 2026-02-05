@@ -12,7 +12,7 @@ namespace gteitelbaum {
 // Router + helpers. Dispatches by node type.
 //
 // Node layout: [header] [skip] [index] [slots]
-//   - bitmask: slots[0] = EOS when has_eos, then child pointers
+//   - bitmask: child pointers first, then EOS value at slot[count] when has_eos
 //   - compact: no EOS, all slots are values, zero-length key for exact match
 // ============================================================================
 
@@ -85,12 +85,12 @@ private:
             // Compact: all slots are values, no EOS offset
             slots_type::destroy_values(slot_base, 0, h.count);
         } else {
-            // Bitmap: recurse into child pointers, then destroy EOS if present
-            uint16_t data_start = h.has_eos() ? 1 : 0;
-            for (uint16_t i = data_start; i < h.total_slots(); ++i)
+            // Bitmap: recurse into child pointers (slots 0..count-1),
+            // then destroy EOS if present (slot[count])
+            for (uint16_t i = 0; i < h.count; ++i)
                 destroy_tree(slots_type::load_child(slot_base, i));
             if (h.has_eos())
-                slots_type::destroy_value(slot_base, 0);
+                slots_type::destroy_value(slot_base, h.count);
         }
 
         mem_.free_node(node);
@@ -109,8 +109,7 @@ private:
 
         if (!h.is_compact()) {
             const uint64_t* slot_base = h.get_slots(node);
-            uint16_t data_start = h.has_eos() ? 1 : 0;
-            for (uint16_t i = data_start; i < h.total_slots(); ++i)
+            for (uint16_t i = 0; i < h.count; ++i)
                 total += memory_usage_impl(slots_type::load_child(slot_base, i));
         }
 
@@ -149,7 +148,7 @@ private:
             if (consumed == key_len) {
                 if (h.has_eos()) {
                     const uint64_t* slot_base = h.get_slots(node);
-                    result = &slots_type::load_value(slot_base, 0);
+                    result = &slots_type::load_value(slot_base, h.count);
                 }
                 goto done;
             }
@@ -242,6 +241,15 @@ public:
         uint8_t stack_buf[256];
         auto [mapped, heap_buf] = get_mapped(raw, len, stack_buf, sizeof(stack_buf));
 
+        // Sentinel — create leaf directly
+        hdr_type rh = hdr_type::from_node(root_);
+        if (rh.is_sentinel()) {
+            root_ = add_child(mapped, len, value);
+            delete[] heap_buf;
+            size_++;
+            return true;
+        }
+
         insert_result r = insert_node(root_, mapped, len, value, 0,
                                        insert_mode::INSERT);
         root_ = r.node;
@@ -260,6 +268,15 @@ public:
 
         uint8_t stack_buf[256];
         auto [mapped, heap_buf] = get_mapped(raw, len, stack_buf, sizeof(stack_buf));
+
+        // Sentinel — create leaf directly
+        hdr_type rh = hdr_type::from_node(root_);
+        if (rh.is_sentinel()) {
+            root_ = add_child(mapped, len, value);
+            delete[] heap_buf;
+            size_++;
+            return true;
+        }
 
         insert_result r = insert_node(root_, mapped, len, value, 0,
                                        insert_mode::UPDATE);
@@ -293,13 +310,6 @@ public:
                                uint32_t consumed, insert_mode mode) {
         hdr_type h = hdr_type::from_node(node);
 
-        // Sentinel — create leaf
-        if (h.is_sentinel()) {
-            uint64_t* nn = add_child(key_data + consumed,
-                                      key_len - consumed, value);
-            return {nn, insert_outcome::INSERTED};
-        }
-
         // Match skip prefix
         auto mr = skip_type::match_prefix(node, h, key_data, key_len, consumed);
 
@@ -317,8 +327,8 @@ public:
             if (h.has_eos()) {
                 if (mode == insert_mode::INSERT)
                     return {node, insert_outcome::FOUND};
-                slots_type::destroy_value(slot_base, 0);
-                slots_type::store_value(slot_base, 0, value);
+                slots_type::destroy_value(slot_base, h.count);
+                slots_type::store_value(slot_base, h.count, value);
                 return {node, insert_outcome::UPDATED};
             }
             return add_eos(node, h, value);
@@ -376,6 +386,15 @@ public:
                          + nh.index_size() + nh.slots_size();
         size_t new_u64 = (new_total + 7) / 8;
 
+        if (new_u64 <= h.alloc_u64) {
+            // Fits in place: just append EOS at slot[count]
+            hdr_type& dest_h = hdr_type::from_node(node);
+            uint64_t* sb = h.get_slots(node);
+            slots_type::store_value(sb, h.count, value);
+            dest_h.set_eos(true);
+            return {node, insert_outcome::INSERTED};
+        }
+
         uint64_t* nn = mem_.alloc_node(new_u64);
 
         hdr_type& dest_h = hdr_type::from_node(nn);
@@ -395,10 +414,12 @@ public:
         uint64_t* old_slots = h.get_slots(node);
         uint64_t* new_slots = dest_h.get_slots(nn);
 
-        if (h.total_slots() > 0)
-            slots_type::copy_slots(new_slots, 1, old_slots, 0, h.total_slots());
+        // Copy children (slots 0..count-1)
+        if (h.count > 0)
+            slots_type::copy_slots(new_slots, 0, old_slots, 0, h.count);
 
-        slots_type::store_value(new_slots, 0, value);
+        // Append EOS at slot[count]
+        slots_type::store_value(new_slots, h.count, value);
 
         mem_.free_node(node);
         return {nn, insert_outcome::INSERTED};
