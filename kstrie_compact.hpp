@@ -100,8 +100,6 @@ struct kstrie_compact {
     static search_pos search_in_index(const uint8_t* index, uint16_t N,
                                       const uint8_t* suffix,
                                       uint32_t suffix_len) noexcept {
-        if (N == 0) return {false, 0};
-
         int W = calc_W(N);
         e search = make_search_key(suffix, suffix_len);
 
@@ -176,6 +174,7 @@ struct kstrie_compact {
                                     build_entry* out,
                                     uint8_t* key_buf) noexcept {
         uint16_t N = h.count;
+        if (N == 0) return 0;
 
         const uint8_t* index = h.get_index(const_cast<uint64_t*>(node));
         int W = calc_W(N);
@@ -278,15 +277,14 @@ struct kstrie_compact {
     // ------------------------------------------------------------------
 
     static insert_result finalize(uint64_t* old_node, uint64_t* new_node,
-                                   uint32_t key_len, uint32_t consumed,
-                                   trie_type& trie) {
-        trie.memory().free_node(old_node);
+                                   uint32_t max_key_len,
+                                   mem_type& mem) {
+        mem.free_node(old_node);
         hdr_type& h = hdr_type::from_node(new_node);
-        uint32_t added = key_len - consumed - h.skip;
         if (h.count > COMPACT_MAX ||
             h.alloc_u64 > COMPACT_MAX_ALLOC_U64 ||
-            added > COMPACT_MAX_KEY_LEN)
-            return split_node(new_node, h, trie);
+            max_key_len > COMPACT_MAX_KEY_LEN)
+            return split_node(new_node, h, mem);
         return {new_node, insert_outcome::INSERTED};
     }
 
@@ -298,7 +296,7 @@ struct kstrie_compact {
                                  const uint8_t* key_data, uint32_t key_len,
                                  const VALUE& value, uint32_t consumed,
                                  match_result mr, insert_mode mode,
-                                 trie_type& trie) {
+                                 mem_type& mem) {
         // MATCHED: check for existing entry (update/found short-circuits)
         if (mr.status == match_status::MATCHED) {
             uint32_t suffix_len = key_len - mr.consumed;
@@ -317,7 +315,7 @@ struct kstrie_compact {
             }
         }
 
-        return rebuild(node, h, key_data, key_len, value, consumed, mr, trie);
+        return rebuild(node, h, key_data, key_len, value, consumed, mr, mem);
     }
 
     // ------------------------------------------------------------------
@@ -327,7 +325,7 @@ struct kstrie_compact {
     static insert_result rebuild(uint64_t* node, hdr_type& h,
                                   const uint8_t* key_data, uint32_t key_len,
                                   const VALUE& value, uint32_t consumed,
-                                  match_result mr, trie_type& trie) {
+                                  match_result mr, mem_type& mem) {
         const uint8_t* skip_data = hdr_type::get_skip(node);
         uint32_t old_skip = h.skip_bytes();
 
@@ -371,6 +369,7 @@ struct kstrie_compact {
 
         size_t buf_off = 0;
         uint16_t ei = 0;
+        uint32_t max_key_len = new_suffix_len;
 
         for (uint16_t i = 0; i < h.count; ++i) {
             uint16_t off  = e_offset(idx_arr[i]);
@@ -380,10 +379,12 @@ struct kstrie_compact {
             if (tail > 0) std::memcpy(dst, prepend, tail);
             std::memcpy(dst + tail, keys + off + 2, klen);
 
+            uint32_t entry_len = klen + tail;
             entries[ei].key      = dst;
-            entries[ei].key_len  = klen + tail;
+            entries[ei].key_len  = entry_len;
             entries[ei].raw_slot = sb[i];
-            buf_off += klen + tail;
+            if (entry_len > max_key_len) max_key_len = entry_len;
+            buf_off += entry_len;
             ei++;
         }
 
@@ -409,14 +410,14 @@ struct kstrie_compact {
                       return a.key_len < b.key_len;
                   });
 
-        uint64_t* result = build_compact(trie.memory(),
+        uint64_t* result = build_compact(mem,
                                           new_skip, skip_data,
                                           entries, new_count);
 
         if (entries != stack_entries) delete[] entries;
         if (key_buf != stack_keys)   delete[] key_buf;
 
-        return finalize(node, result, key_len, consumed, trie);
+        return finalize(node, result, max_key_len, mem);
     }
 
     // ------------------------------------------------------------------
@@ -428,7 +429,7 @@ struct kstrie_compact {
     // ------------------------------------------------------------------
 
     static insert_result split_node(uint64_t* node, hdr_type& h,
-                                     trie_type& trie) {
+                                     mem_type& mem) {
         uint16_t N = h.count;
 
         uint8_t* key_buf = new uint8_t[h.keys_bytes + 256];
@@ -442,7 +443,7 @@ struct kstrie_compact {
         if (N > 0 && all[0].key_len == 0) {
             // Build a compact leaf: skip=0, one entry with key_len=0
             build_entry eos_entry = all[0];
-            eos_leaf = build_compact(trie.memory(), 0, nullptr, &eos_entry, 1);
+            eos_leaf = build_compact(mem, 0, nullptr, &eos_entry, 1);
             data_start = 1;
         }
 
@@ -488,7 +489,7 @@ struct kstrie_compact {
                 data_cnt++;
             }
 
-            children[b] = build_compact(trie.memory(),
+            children[b] = build_compact(mem,
                                          0, nullptr,
                                          child_entries, data_cnt);
 
@@ -496,7 +497,7 @@ struct kstrie_compact {
             hdr_type& ch = hdr_type::from_node(children[b]);
             if (ch.count > COMPACT_MAX ||
                 ch.alloc_u64 > COMPACT_MAX_ALLOC_U64) {
-                auto sr = split_node(children[b], ch, trie);
+                auto sr = split_node(children[b], ch, mem);
                 children[b] = sr.node;
             }
 
@@ -505,7 +506,7 @@ struct kstrie_compact {
 
         // Create bitmask parent
         uint64_t* parent = bitmask_ops::create_with_children(
-            trie.memory(),
+            mem,
             h.skip, hdr_type::get_skip(node),
             bucket_bytes, children,
             static_cast<uint16_t>(n_buckets));
@@ -516,7 +517,7 @@ struct kstrie_compact {
             bitmask_ops::set_eos_child(parent, ph, eos_leaf);
         }
 
-        trie.memory().free_node(node);
+        mem.free_node(node);
         delete[] all;
         delete[] key_buf;
 
@@ -529,9 +530,9 @@ struct kstrie_compact {
 
     static uint64_t* create_from_entries(
             const typename trie_type::child_entry* entries,
-            size_t count, trie_type& trie) {
+            size_t count, mem_type& mem) {
         if (count == 0)
-            return trie.memory().alloc_node(1);
+            return mem.alloc_node(1);
 
         build_entry* be = new build_entry[count];
         for (size_t i = 0; i < count; ++i) {
@@ -542,7 +543,7 @@ struct kstrie_compact {
             be[i].raw_slot = raw;
         }
 
-        uint64_t* node = build_compact(trie.memory(),
+        uint64_t* node = build_compact(mem,
                                          0, nullptr,
                                          be, static_cast<uint16_t>(count));
         delete[] be;

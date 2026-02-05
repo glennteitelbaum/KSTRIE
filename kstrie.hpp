@@ -117,9 +117,10 @@ private:
     // ------------------------------------------------------------------
     // find_impl -- trie traversal
     //
-    // No special EOS branch. When key is exhausted at a bitmask node,
-    // we follow slot[count+1] (eos_child). If it's sentinel → not found.
-    // If it's a compact leaf → find zero-length suffix in it.
+    // Sentinel nodes have skip=0, count=0, is_compact()=true.
+    // match_prefix returns MATCHED immediately (skip=0), then
+    // compact_type::find returns nullptr (count=0). No explicit
+    // sentinel check needed on the hot path.
     // ------------------------------------------------------------------
 
     const VALUE* find_impl(const uint8_t* key_data, uint32_t key_len) const noexcept {
@@ -147,12 +148,15 @@ private:
                                              key_len - consumed);
                 break;
             }
-            
+
+            // Bitmask: key exhausted → follow eos_child
             if (consumed == key_len) {
-		// Bitmask: key exhausted → follow eos_child
                 node = bitmask_type::eos_child(node, h);
-            } else {
-                // Bitmap dispatch — consume one byte, follow child
+                continue;
+            }
+
+            // Bitmap dispatch — consume one byte, follow child
+            {
                 uint8_t byte = mapped[consumed++];
                 node = bitmask_type::find_child(node, h, byte);
             }
@@ -296,10 +300,6 @@ public:
 
     // ------------------------------------------------------------------
     // insert_node -- recursive dispatch
-    //
-    // No special EOS branch. When key is exhausted at a bitmask node,
-    // follow eos_child. If sentinel → create compact leaf, store as
-    // eos_child. If non-sentinel → descend (normal compact insert).
     // ------------------------------------------------------------------
 
     insert_result insert_node(uint64_t* node, const uint8_t* key_data,
@@ -313,7 +313,7 @@ public:
         // Compact handles all three statuses (matched, mismatch, exhausted)
         if (h.is_compact())
             return compact_type::insert(node, h, key_data, key_len,
-                                         value, consumed, mr, mode, *this);
+                                         value, consumed, mr, mode, mem_);
 
         // Bitmask: only MATCHED reaches here
         consumed = mr.consumed;
@@ -329,7 +329,7 @@ public:
                 return {node, insert_outcome::INSERTED};
             }
 
-            // EOS exists — descend into compact leaf
+            // EOS exists — descend
             insert_result r = insert_node(eos, key_data, key_len, value,
                                            consumed, mode);
             if (r.node != eos)
@@ -392,7 +392,7 @@ public:
     };
 
     uint64_t* add_children(const child_entry* entries, size_t count) {
-        return compact_type::create_from_entries(entries, count, *this);
+        return compact_type::create_from_entries(entries, count, mem_);
     }
 
     // ------------------------------------------------------------------
