@@ -418,7 +418,6 @@ struct node_header {
     }
 
     // Index region: delegates to compact or bitmask
-    // Bodies reference kstrie_compact/kstrie_bitmask — resolved at instantiation
     [[nodiscard]] size_t index_size() const noexcept;
 
     // Slots region
@@ -473,11 +472,7 @@ struct node_header {
     }
 };
 
-// Deferred: index_size() body — needs kstrie_compact and kstrie_bitmask definitions.
-// Defined after those headers are included. See kstrie_bitmask.hpp / kstrie_compact.hpp,
-// or define in kstrie.hpp where everything is visible.
-// For now, declare only. Definition at bottom of this file uses forward-declared types;
-// actual instantiation deferred to point of use.
+// Deferred: index_size() body
 template <typename VALUE, typename CHARMAP, typename ALLOC>
 size_t node_header<VALUE, CHARMAP, ALLOC>::index_size() const noexcept {
     if (is_compact())
@@ -496,12 +491,6 @@ inline constexpr std::array<uint64_t, 5> EMPTY_NODE_STORAGE alignas(64) = {};
 
 // ============================================================================
 // e -- 16-byte comparable key (for hot and idx arrays in compact index)
-//
-// Bytes 0-7:   first 8 bytes of suffix (big-endian for comparison)
-// Bytes 8-13:  next 6 bytes of suffix
-// Bytes 14-15: byte offset into keys region
-//
-// Comparison via std::array<uint64_t,2> operator<= gives correct sort order.
 // ============================================================================
 
 using e = std::array<uint64_t, 2>;
@@ -557,36 +546,36 @@ inline constexpr std::size_t align8(std::size_t n) noexcept {
 }
 
 // ============================================================================
-// Compact index layout helpers
-// These compute sub-regions within the compact index: hot, idx, keys
-// do not delete -- will use when implementing compact
+// Eytzinger layout helpers (calc_W needed by compact_index_size below)
 // ============================================================================
 
-// Number of idx entries for N keys (one per 8 keys, at least 1 if N > 0)
+inline int calc_W(int ic) noexcept {
+    if (ic <= 4) return 0;
+    return std::bit_ceil(static_cast<unsigned>((ic + 3) / 4));
+}
+
+// ============================================================================
+// Compact index layout helpers
+// ============================================================================
+
 inline constexpr int idx_count(uint16_t N) noexcept {
     return N > 0 ? (N + 7) / 8 : 0;
 }
 
-// Hot array always at offset 0 within index region
 inline constexpr std::size_t hot_off() noexcept { return 0; }
 
-// Idx array offset within index region (after hot)
-// ec = Eytzinger element count (W - 1)
 inline std::size_t idx_off(int ec) noexcept {
     return (ec + 1) * 16;
 }
 
-// Keys offset within index region (after idx)
 inline std::size_t keys_off(uint16_t N, int ec) noexcept {
     return idx_off(ec) + idx_count(N) * 16;
 }
 
-// Total compact index size in bytes
-// Includes hot + idx + keys (aligned)
 inline std::size_t compact_index_size(uint16_t count, uint16_t keys_bytes) noexcept {
     if (count == 0) return 0;
     int ic = idx_count(count);
-    int W  = calc_W(ic);  // forward ref, defined below
+    int W  = calc_W(ic);
     int ec = W > 0 ? W - 1 : 0;
     return align8(keys_off(count, ec) + keys_bytes);
 }
@@ -610,7 +599,6 @@ inline void write_u16(uint8_t* p, uint16_t v) noexcept {
     std::memcpy(p, &v, sizeof(v));
 }
 
-// Compare packed key [u16 len][bytes] against search key
 inline int key_cmp(const uint8_t* kp, const uint8_t* search,
                    uint32_t search_len) noexcept {
     uint16_t klen = read_u16(kp);
@@ -621,20 +609,13 @@ inline int key_cmp(const uint8_t* kp, const uint8_t* search,
     return makecmp(static_cast<uint32_t>(klen), search_len);
 }
 
-// Advance to next packed key
 inline const uint8_t* key_next(const uint8_t* kp) noexcept {
     return kp + 2 + read_u16(kp);
 }
 
 // ============================================================================
-// Eytzinger layout helpers
+// Eytzinger layout helpers (continued)
 // ============================================================================
-
-// W = next_power_of_2(ceil(ic/4)), ec = W - 1
-inline int calc_W(int ic) noexcept {
-    if (ic <= 4) return 0;
-    return std::bit_ceil(static_cast<unsigned>((ic + 3) / 4));
-}
 
 inline void build_eyt_rec(const e* b, int n, e* hot, int i, int& k) noexcept {
     if (i > n) return;
@@ -672,8 +653,8 @@ inline constexpr size_t   COMPACT_MAX_BYTES = 16384;
 // ============================================================================
 
 enum class insert_mode : uint8_t {
-    INSERT,   // fail if key exists
-    UPDATE    // overwrite if key exists (upsert)
+    INSERT,
+    UPDATE
 };
 
 enum class insert_outcome : uint8_t {
@@ -695,9 +676,6 @@ struct search_result {
 
 // ============================================================================
 // kstrie_memory -- node allocation and deallocation
-//
-// Reads alloc_u64 (first uint16_t of node) directly.
-// Does not depend on VALUE or CHARMAP.
 // ============================================================================
 
 template <typename ALLOC>
@@ -707,7 +685,6 @@ struct kstrie_memory {
     kstrie_memory() = default;
     explicit kstrie_memory(const ALLOC& a) : alloc_(a) {}
 
-    // Allocate node with padded size, zeroed, alloc_u64 written into first 2 bytes.
     uint64_t* alloc_node(std::size_t needed_u64) {
         std::size_t au = padded_size(static_cast<uint16_t>(needed_u64));
         uint64_t* p = std::allocator_traits<ALLOC>::allocate(alloc_, au);
@@ -717,8 +694,6 @@ struct kstrie_memory {
         return p;
     }
 
-    // Free node using alloc_u64 stored in first 2 bytes.
-    // Skips sentinel (alloc_u64 == 0).
     void free_node(uint64_t* p) {
         if (!p) return;
         uint16_t au;
@@ -730,33 +705,24 @@ struct kstrie_memory {
 
 // ============================================================================
 // kstrie_skip -- skip prefix operations
-//
-// Owns: prefix byte comparison, LCP computation
-// Does NOT own: EOS (moved to kstrie_slots)
 // ============================================================================
 
 template <typename VALUE, typename CHARMAP, typename ALLOC>
 struct kstrie_skip {
     using hdr_type = node_header<VALUE, CHARMAP, ALLOC>;
 
-    // ------------------------------------------------------------------
-    // Prefix matching
-    // ------------------------------------------------------------------
-
     enum class match_status : uint8_t {
-        MATCHED,        // full prefix matched, consumed advanced
-        MISMATCH,       // mismatch at some point
-        KEY_EXHAUSTED   // key ran out within prefix
+        MATCHED,
+        MISMATCH,
+        KEY_EXHAUSTED
     };
 
     struct match_result {
         match_status status;
-        uint32_t     consumed;    // updated consumed position
-        uint32_t     match_len;   // bytes matched before divergence
+        uint32_t     consumed;
+        uint32_t     match_len;
     };
 
-    // Walk skip prefix chain (including continuations).
-    // mapped_key must already be mapped through char_map.
     static match_result match_prefix(const uint64_t*& node, hdr_type& h,
                                      const uint8_t* mapped_key,
                                      uint32_t key_len,
@@ -794,7 +760,6 @@ struct kstrie_skip {
         return {match_status::MATCHED, consumed, 0};
     }
 
-    // Mutable version (for insert path)
     static match_result match_prefix(uint64_t*& node, hdr_type& h,
                                      const uint8_t* mapped_key,
                                      uint32_t key_len,
@@ -805,10 +770,6 @@ struct kstrie_skip {
         return r;
     }
 
-    // ------------------------------------------------------------------
-    // LCP computation (2-way: new key suffix vs existing prefix)
-    // ------------------------------------------------------------------
-
     static uint32_t find_lcp(const uint8_t* a, uint32_t a_len,
                              const uint8_t* b, uint32_t b_len) noexcept {
         uint32_t max_cmp = std::min(a_len, b_len);
@@ -817,10 +778,6 @@ struct kstrie_skip {
             ++ml;
         return ml;
     }
-
-    // ------------------------------------------------------------------
-    // Skip region size
-    // ------------------------------------------------------------------
 
     static size_t size(hdr_type h) noexcept {
         return h.skip_size();
