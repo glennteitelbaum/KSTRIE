@@ -2,17 +2,25 @@
 
 #include "kstrie_bitmask.hpp"
 #include "kstrie_compact.hpp"
-#include "kstrie_memory.hpp"
-#include "kstrie_skip_eos.hpp"
 #include "kstrie_support.hpp"
 
 namespace gteitelbaum {
 
 // ============================================================================
 // kstrie -- main trie class
+//
+// Router + helpers. Dispatches by node type. Does not know internal layouts
+// of compact or bitmask nodes. Composes the modules.
+//
+// Node layout: [header] [skip] [index] [slots]
+//   - slots[0] = EOS when has_eos, data starts at slots[has_eos()]
+//   - compact: slots hold VALUES
+//   - bitmask: slots hold child pointers
 // ============================================================================
 
-template <typename VALUE, typename CHARMAP, typename ALLOC>
+template <typename VALUE,
+          typename CHARMAP = identity_char_map,
+          typename ALLOC   = std::allocator<uint64_t>>
 class kstrie {
 public:
     using key_type       = std::string;
@@ -21,14 +29,14 @@ public:
     using allocator_type = ALLOC;
     using char_map_type  = CHARMAP;
 
-private:
-    using vals     = kstrie_values<VALUE>;
-    using mem_type = kstrie_memory<ALLOC>;
-    using skip_eos = kstrie_skip_eos<VALUE, ALLOC>;
-    using bitmask  = kstrie_bitmask<VALUE, CHARMAP, ALLOC>;
-    using compact  = kstrie_compact<VALUE, CHARMAP, ALLOC>;
-    using bitmap_type = typename CHARMAP::bitmap_type;
+    using hdr_type     = node_header<VALUE, CHARMAP, ALLOC>;
+    using mem_type     = kstrie_memory<ALLOC>;
+    using slots_type   = kstrie_slots<VALUE>;
+    using skip_type    = kstrie_skip<VALUE, CHARMAP, ALLOC>;
+    using bitmask_type = kstrie_bitmask<VALUE, CHARMAP, ALLOC>;
+    using compact_type = kstrie_compact<VALUE, CHARMAP, ALLOC>;
 
+private:
     uint64_t* root_{};
     size_type size_{};
     mem_type  mem_{};
@@ -43,7 +51,6 @@ private:
             dst[i] = CHARMAP::to_index(src[i]);
     }
 
-    // Returns {mapped_ptr, heap_buf_to_delete_or_nullptr}
     static std::pair<const uint8_t*, uint8_t*>
     get_mapped(const uint8_t* raw, uint32_t len,
                uint8_t* stack_buf, size_t stack_size) noexcept {
@@ -70,35 +77,22 @@ private:
     // ------------------------------------------------------------------
 
     void destroy_tree(uint64_t* node) {
-        if (!node || hdr(node).is_sentinel()) return;
-        const node_header& h = hdr(node);
+        if (!node) return;
+        hdr_type h = hdr_type::from_node(node);
+        if (h.is_sentinel()) return;
+
+        uint64_t* slot_base = h.get_slots(node);
 
         if (h.is_compact()) {
-            // Destroy array values
-            if (h.count > 0) {
-                int ic = idx_count(h.count);
-                int W  = calc_W(ic);
-                int ec = W > 0 ? W - 1 : 0;
-                const uint8_t* data = reinterpret_cast<const uint8_t*>(node) +
-                    data_offset_u64<VALUE>(h.skip, h.has_eos()) * 8;
-                const uint64_t* val_base = reinterpret_cast<const uint64_t*>(
-                    data + values_off(h.count, h.keys_bytes, ec));
-                vals::destroy_range(const_cast<uint64_t*>(val_base), h.count);
-            }
-            if (h.has_eos()) {
-                skip_eos::destroy_eos(node, h.skip);
-            }
+            // Destroy EOS + data values
+            slots_type::destroy_values(slot_base, 0, h.total_slots());
         } else {
-            // Bitmap node -- recurse into children
-            const bitmap_type& bm = bitmask::bm_bitmap(node, h.skip, h.has_eos());
-            const uint64_t* children = bitmask::bm_children(node, h.skip, h.has_eos());
-            int top_count = bm.popcount();
-            for (int i = 0; i < top_count; ++i) {
-                destroy_tree(reinterpret_cast<uint64_t*>(children[i]));
-            }
-            if (h.has_eos()) {
-                skip_eos::destroy_eos(node, h.skip);
-            }
+            // Bitmap: recurse into child pointers, then destroy EOS if present
+            uint16_t data_start = h.has_eos() ? 1 : 0;
+            for (uint16_t i = data_start; i < h.total_slots(); ++i)
+                destroy_tree(slots_type::load_child(slot_base, i));
+            if (h.has_eos())
+                slots_type::destroy_value(slot_base, 0);
         }
 
         mem_.free_node(node);
@@ -109,19 +103,19 @@ private:
     // ------------------------------------------------------------------
 
     size_type memory_usage_impl(const uint64_t* node) const noexcept {
-        if (!node || hdr(node).is_sentinel()) return 0;
-        const node_header& h = hdr(node);
+        if (!node) return 0;
+        hdr_type h = hdr_type::from_node(node);
+        if (h.is_sentinel()) return 0;
+
         size_type total = h.alloc_u64 * 8;
 
         if (!h.is_compact()) {
-            const bitmap_type& bm = bitmask::bm_bitmap(node, h.skip, h.has_eos());
-            const uint64_t* children = bitmask::bm_children(node, h.skip, h.has_eos());
-            int top_count = bm.popcount();
-            for (int i = 0; i < top_count; ++i) {
-                total += memory_usage_impl(
-                    reinterpret_cast<const uint64_t*>(children[i]));
-            }
+            const uint64_t* slot_base = h.get_slots(node);
+            uint16_t data_start = h.has_eos() ? 1 : 0;
+            for (uint16_t i = data_start; i < h.total_slots(); ++i)
+                total += memory_usage_impl(slots_type::load_child(slot_base, i));
         }
+
         return total;
     }
 
@@ -139,31 +133,33 @@ private:
         const VALUE* result = nullptr;
 
         for (;;) {
-            node_header h = hdr(node);
+            hdr_type h = hdr_type::from_node(node);
 
             // Match skip prefix
-            auto mr = skip_eos::match_prefix(node, h, mapped, key_len, consumed);
-            if (mr.status != skip_eos::match_status::MATCHED) goto done;
+            auto mr = skip_type::match_prefix(node, h, mapped, key_len, consumed);
+            if (mr.status != skip_type::match_status::MATCHED) goto done;
             consumed = mr.consumed;
 
             // EOS check
             if (consumed == key_len) {
-                if (h.has_eos())
-                    result = &skip_eos::load_eos(node, h.skip);
+                if (h.has_eos()) {
+                    const uint64_t* slot_base = h.get_slots(node);
+                    result = &slots_type::load_value(slot_base, 0);
+                }
                 goto done;
             }
 
-            // Compact node
+            // Compact node — search within
             if (h.is_compact()) {
-                result = compact::find(node, h, mapped + consumed,
-                                        key_len - consumed);
+                result = compact_type::find(node, h, mapped + consumed,
+                                             key_len - consumed);
                 goto done;
             }
 
-            // Bitmap dispatch
+            // Bitmap dispatch — consume one byte, step down
             {
                 uint8_t byte = mapped[consumed++];
-                const uint64_t* child = bitmask::find_child(node, h, byte);
+                const uint64_t* child = bitmask_type::find_child(node, h, byte);
                 if (!child) goto done;
                 node = child;
             }
@@ -177,153 +173,6 @@ private:
     VALUE* find_impl(const uint8_t* key_data, uint32_t key_len) noexcept {
         return const_cast<VALUE*>(
             static_cast<const kstrie*>(this)->find_impl(key_data, key_len));
-    }
-
-    // ------------------------------------------------------------------
-    // insert_impl -- recursive trie descent
-    // ------------------------------------------------------------------
-
-    insert_result insert_impl(uint64_t* node, const uint8_t* key_data,
-                               uint32_t key_len, const VALUE& value,
-                               uint32_t consumed, insert_mode mode) {
-        node_header h = hdr(node);
-
-        // Sentinel -- allocate real node
-        if (h.is_sentinel()) {
-            uint64_t* nn = skip_eos::create_leaf(
-                key_data + consumed, key_len - consumed, value, mem_);
-            return {nn, insert_outcome::INSERTED};
-        }
-
-        // Match skip prefix
-        auto mr = skip_eos::match_prefix(node, h, key_data, key_len, consumed);
-
-        if (mr.status == skip_eos::match_status::MISMATCH ||
-            mr.status == skip_eos::match_status::KEY_EXHAUSTED) {
-            // Prefix mismatch -- split
-            return split_prefix(node, h, key_data, key_len, value,
-                               consumed, mr.match_len, mode);
-        }
-
-        consumed = mr.consumed;
-
-        // EOS check
-        if (consumed == key_len) {
-            if (h.has_eos()) {
-                if (mode == insert_mode::INSERT)
-                    return {node, insert_outcome::FOUND};
-                // Update EOS
-                skip_eos::destroy_eos(node, h.skip);
-                skip_eos::store_eos(node, h.skip, value);
-                return {node, insert_outcome::UPDATED};
-            }
-            // Add EOS
-            std::size_t dsb;
-            if (h.is_compact())
-                dsb = compact::data_size_bytes(h);
-            else
-                dsb = bitmask::data_size_bytes(node, h);
-            return skip_eos::add_eos_to_node(node, h, value, dsb, mem_);
-        }
-
-        // Dispatch by node type
-        if (h.is_compact()) {
-            return compact::insert(node, h, key_data, key_len, value,
-                                    consumed, mode, mem_);
-        } else {
-            return bitmask::insert(node, h, key_data, key_len, value,
-                                    consumed, mode, mem_);
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // split_prefix -- dispatch to compact or bitmap split
-    // ------------------------------------------------------------------
-
-    insert_result split_prefix(uint64_t* node, node_header h,
-                                const uint8_t* key_data, uint32_t key_len,
-                                const VALUE& value, uint32_t consumed,
-                                uint32_t match_len, insert_mode mode) {
-        (void)mode;
-
-        if (h.is_compact()) {
-            return compact::split_on_prefix(node, h, key_data, key_len,
-                                             value, consumed, match_len, mem_);
-        }
-
-        // Bitmap node split
-        const uint8_t* old_prefix = node_prefix(node);
-        uint32_t old_skip = h.skip_bytes();
-        uint32_t remaining_key = key_len - consumed;
-
-        bool key_exhausted = (match_len == remaining_key);
-        uint8_t old_byte = old_prefix[match_len];
-        uint8_t new_byte = key_exhausted ? 0 : key_data[consumed + match_len];
-
-        int child_count = 1 + (key_exhausted ? 0 : 1);
-        uint8_t parent_skip = static_cast<uint8_t>(match_len);
-        bool parent_has_eos = key_exhausted;
-
-        // Allocate parent bitmap node
-        std::size_t parent_u64 = data_offset_u64<VALUE>(parent_skip, parent_has_eos)
-                                 + bitmask::BITMAP_U64 + child_count;
-        uint64_t* parent = mem_.alloc_node(parent_u64);
-
-        node_header& ph = hdr(parent);
-        ph.keys_bytes = 0;
-        ph.count = 0;
-        ph.skip  = parent_skip;
-        ph.flags = parent_has_eos ? 2 : 0;  // is_bitmap
-
-        // Copy shared prefix
-        if (parent_skip > 0)
-            std::memcpy(parent + header_u64(), old_prefix, parent_skip);
-
-        // Set parent EOS if new key exhausted
-        if (parent_has_eos)
-            skip_eos::store_eos(parent, parent_skip, value);
-
-        // Set up bitmap
-        auto& pbm = bitmask::bm_bitmap_mut(parent, parent_skip, parent_has_eos);
-        pbm.set_bit(old_byte);
-        if (!key_exhausted) pbm.set_bit(new_byte);
-
-        uint64_t* pchildren = bitmask::bm_children_mut(
-            parent, parent_skip, parent_has_eos);
-
-        // Clone old node with reduced prefix
-        uint32_t new_old_skip = old_skip - match_len - 1;
-        std::size_t old_data_size;
-        if (h.is_compact())
-            old_data_size = compact::data_size_bytes(h);
-        else
-            old_data_size = bitmask::data_size_bytes(node, h);
-
-        uint64_t* old_child = skip_eos::clone_with_new_prefix(
-            node, h, old_prefix + match_len + 1, new_old_skip,
-            old_data_size, mem_);
-
-        int old_slot = pbm.slot_for_insert(old_byte);
-        pchildren[old_slot] = reinterpret_cast<uint64_t>(old_child);
-
-        // Create new key child
-        if (!key_exhausted) {
-            const uint8_t* new_suffix = key_data + consumed + match_len + 1;
-            uint32_t new_suffix_len = key_len - consumed - match_len - 1;
-
-            uint64_t* new_child;
-            if (new_suffix_len == 0)
-                new_child = skip_eos::create_eos_only(value, mem_);
-            else
-                new_child = skip_eos::create_leaf(new_suffix, new_suffix_len,
-                                                   value, mem_);
-
-            int new_slot = pbm.slot_for_insert(new_byte);
-            pchildren[new_slot] = reinterpret_cast<uint64_t>(new_child);
-        }
-
-        mem_.free_node(node);
-        return {parent, insert_outcome::INSERTED};
     }
 
 public:
@@ -385,7 +234,7 @@ public:
     }
 
     // ------------------------------------------------------------------
-    // Modifiers
+    // Modifiers (public)
     // ------------------------------------------------------------------
 
     bool insert(std::string_view key, const VALUE& value) {
@@ -395,7 +244,7 @@ public:
         uint8_t stack_buf[256];
         auto [mapped, heap_buf] = get_mapped(raw, len, stack_buf, sizeof(stack_buf));
 
-        insert_result r = insert_impl(root_, mapped, len, value, 0,
+        insert_result r = insert_node(root_, mapped, len, value, 0,
                                        insert_mode::INSERT);
         root_ = r.node;
         delete[] heap_buf;
@@ -414,7 +263,7 @@ public:
         uint8_t stack_buf[256];
         auto [mapped, heap_buf] = get_mapped(raw, len, stack_buf, sizeof(stack_buf));
 
-        insert_result r = insert_impl(root_, mapped, len, value, 0,
+        insert_result r = insert_node(root_, mapped, len, value, 0,
                                        insert_mode::UPDATE);
         root_ = r.node;
         delete[] heap_buf;
@@ -436,6 +285,175 @@ public:
         init_empty_root();
         size_ = 0;
     }
+
+    // ------------------------------------------------------------------
+    // insert_node -- public recursive dispatch
+    //
+    // Called by insert/insert_or_assign, and by bitmask/compact
+    // when they need to recurse back through the router.
+    // ------------------------------------------------------------------
+
+    insert_result insert_node(uint64_t* node, const uint8_t* key_data,
+                               uint32_t key_len, const VALUE& value,
+                               uint32_t consumed, insert_mode mode) {
+        hdr_type h = hdr_type::from_node(node);
+
+        // Sentinel — create leaf
+        if (h.is_sentinel()) {
+            uint64_t* nn = add_child(key_data + consumed,
+                                      key_len - consumed, value);
+            return {nn, insert_outcome::INSERTED};
+        }
+
+        // Match skip prefix
+        auto mr = skip_type::match_prefix(node, h, key_data, key_len, consumed);
+
+        if (mr.status != skip_type::match_status::MATCHED) {
+            // Prefix mismatch — compact and bitmask handle their own splits
+            if (h.is_compact())
+                return compact_type::insert(node, h, key_data, key_len,
+                                             value, consumed, mr, mode, *this);
+            else
+                return bitmask_type::insert(node, h, key_data, key_len,
+                                             value, consumed, mr, mode, *this);
+        }
+
+        consumed = mr.consumed;
+
+        // EOS check — key fully consumed
+        if (consumed == key_len) {
+            uint64_t* slot_base = h.get_slots(node);
+            if (h.has_eos()) {
+                if (mode == insert_mode::INSERT)
+                    return {node, insert_outcome::FOUND};
+                // Update existing EOS
+                slots_type::destroy_value(slot_base, 0);
+                slots_type::store_value(slot_base, 0, value);
+                return {node, insert_outcome::UPDATED};
+            }
+            // Add EOS — shift slots right by 1, store at slot[0]
+            return add_eos(node, h, value);
+        }
+
+        // Dispatch by node type
+        if (h.is_compact()) {
+            return compact_type::insert(node, h, key_data, key_len,
+                                         value, consumed, mr, mode, *this);
+        } else {
+            return bitmask_type::insert(node, h, key_data, key_len,
+                                         value, consumed, mr, mode, *this);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // add_child -- create node for a single suffix + value
+    //
+    // Called by compact/bitmask when creating new children.
+    // Suffix is already mapped through char_map.
+    // ------------------------------------------------------------------
+
+    uint64_t* add_child(const uint8_t* suffix, uint32_t suffix_len,
+                        const VALUE& value) {
+        // Entire suffix becomes skip prefix, value in EOS slot
+        uint8_t skip = static_cast<uint8_t>(suffix_len);
+        hdr_type h{};
+        h.count = 0;
+        h.keys_bytes = 0;
+        h.skip = skip;
+        h.flags = 0b11;  // is_compact=1, has_eos=1
+
+        std::size_t nu = (h.header_size() + h.skip_size() + h.slots_size() + 7) / 8;
+        uint64_t* node = mem_.alloc_node(nu);
+
+        hdr_type::from_node(node) = h;
+        // alloc_node already wrote alloc_u64, restore it
+        // (copy_from pattern — alloc_node zeroes then writes alloc_u64)
+
+        if (suffix_len > 0)
+            std::memcpy(hdr_type::get_skip(node), suffix, suffix_len);
+
+        uint64_t* slot_base = hdr_type::from_node(node).get_slots(node);
+        slots_type::store_value(slot_base, 0, value);
+
+        return node;
+    }
+
+    // ------------------------------------------------------------------
+    // add_child (bulk) -- create node for multiple suffix + value pairs
+    //
+    // Entries must be pre-sorted by suffix. Suffix is already mapped.
+    // Routes to compact::create_from_entries.
+    // ------------------------------------------------------------------
+
+    struct child_entry {
+        const uint8_t* suffix;
+        uint32_t       suffix_len;
+        const VALUE*   value;
+    };
+
+    uint64_t* add_children(const child_entry* entries, size_t count) {
+        return compact_type::create_from_entries(entries, count, *this);
+    }
+
+    // ------------------------------------------------------------------
+    // add_eos -- add EOS to existing node
+    //
+    // Reallocates with one extra slot, shifts existing data right,
+    // stores value at slot[0], sets has_eos flag.
+    // ------------------------------------------------------------------
+
+    insert_result add_eos(uint64_t* node, hdr_type h, const VALUE& value) {
+        // Compute current sizes
+        size_t old_total = h.header_size() + h.skip_size()
+                         + h.index_size() + h.slots_size();
+        
+        // New header with has_eos set
+        hdr_type nh = h;
+        nh.set_eos(true);
+        // total_slots grows by 1
+        
+        size_t new_total = nh.header_size() + nh.skip_size()
+                         + nh.index_size() + nh.slots_size();
+        size_t new_u64 = (new_total + 7) / 8;
+
+        uint64_t* nn = mem_.alloc_node(new_u64);
+
+        // Copy header with has_eos set
+        hdr_type& dest_h = hdr_type::from_node(nn);
+        dest_h.copy_from(nh);
+
+        // Copy skip prefix
+        if (h.skip > 0)
+            std::memcpy(hdr_type::get_skip(nn),
+                       hdr_type::get_skip(node),
+                       h.skip_size());
+
+        // Copy index region
+        size_t idx_sz = h.index_size();
+        if (idx_sz > 0)
+            std::memcpy(dest_h.get_index(nn),
+                       h.get_index(node),
+                       idx_sz);
+
+        // Copy existing slots shifted right by 1
+        uint64_t* old_slots = h.get_slots(node);
+        uint64_t* new_slots = dest_h.get_slots(nn);
+
+        if (h.total_slots() > 0)
+            slots_type::copy_slots(new_slots, 1, old_slots, 0, h.total_slots());
+
+        // Store EOS value at slot[0]
+        slots_type::store_value(new_slots, 0, value);
+
+        mem_.free_node(node);
+        return {nn, insert_outcome::INSERTED};
+    }
+
+    // ------------------------------------------------------------------
+    // Accessor for memory (modules need it for allocation)
+    // ------------------------------------------------------------------
+
+    mem_type& memory() noexcept { return mem_; }
 };
 
 } // namespace gteitelbaum
