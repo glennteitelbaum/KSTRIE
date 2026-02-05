@@ -10,12 +10,15 @@ namespace gteitelbaum {
 // Node layout:  [header 8B] [skip] [bitmap] [slots]
 //
 // Index region = bitmap_type (8, 16, or 32 bytes depending on CHARMAP)
-// Slots region = [child_ptr_0] [child_ptr_1] ... [eos_value?]
-//   - child pointers are ordered by bitmap popcount position
-//   - eos slot (if present) is always slot[count] (last)
+// Slots region = [sentinel] [child_ptr_0 .. child_ptr_{count-1}] [eos_child]
+//   - slot[0]       = sentinel (always points to EMPTY_NODE_STORAGE)
+//   - slot[1..count] = child pointers ordered by bitmap popcount position
+//   - slot[count+1]  = eos_child (sentinel if no EOS, compact leaf if EOS)
 //
-// Owns: bitmap lookup, child insert/remove, eos management, node creation
-// Does NOT own: prefix matching (kstrie_skip), value storage details (kstrie_slots)
+// All slots are child pointers. No values stored directly.
+// EOS is represented as a compact leaf child with skip=0, one zero-length key.
+//
+// Branchless lookup: do_find_pop returns 0 (→ sentinel) or 1-based slot index.
 // ============================================================================
 
 template <typename VALUE, typename CHARMAP, typename ALLOC>
@@ -26,6 +29,7 @@ struct kstrie_bitmask {
     using mem_type    = kstrie_memory<ALLOC>;
 
     static constexpr size_t BITMAP_BYTES = sizeof(bitmap_type);
+    static constexpr size_t BITMAP_WORDS = CHARMAP::BITMAP_WORDS;
 
     // ------------------------------------------------------------------
     // Index size (called by node_header::index_size)
@@ -49,113 +53,147 @@ struct kstrie_bitmask {
     }
 
     // ------------------------------------------------------------------
-    // Child lookup
+    // Branchless bitmap probe
+    //
+    // Returns 0 if idx not present (→ slot[0] = sentinel).
+    // Returns 1-based slot index if present (popcount including target bit).
     // ------------------------------------------------------------------
 
-    // Find child node for mapped character index.
-    // Returns child pointer, or nullptr if no child for this index.
+    static int do_find_pop(const uint64_t* search, uint8_t v) noexcept {
+        constexpr size_t W = BITMAP_WORDS;
+        const int word = v >> 6;
+        const int bit  = v & 63;
+
+        uint64_t before = search[word] << (63 - bit);
+
+        int pc0 = 0, pc1 = 0, pc2 = 0;
+        if constexpr (W > 1) pc0 = std::popcount(search[0]);
+        if constexpr (W > 2) pc1 = std::popcount(search[1]);
+        if constexpr (W > 3) pc2 = std::popcount(search[2]);
+
+        int count = std::popcount(before);
+        if constexpr (W > 1) count += pc0 & -int(word > 0);
+        if constexpr (W > 2) count += pc1 & -int(word > 1);
+        if constexpr (W > 3) count += pc2 & -int(word > 2);
+
+        bool found = before & (1ULL << 63);
+        count &= -uint64_t(found);
+
+        return count;
+    }
+
+    // ------------------------------------------------------------------
+    // Child lookup (branchless)
+    // ------------------------------------------------------------------
+
+    // Returns slot index: 0 = not found (sentinel), 1+ = child position.
+    static int find_slot(const uint64_t* node, const hdr_type& h,
+                         uint8_t idx) noexcept {
+        const bitmap_type* bm = get_bitmap(node, h);
+        return do_find_pop(bm->words, idx);
+    }
+
+    // Returns child pointer. Sentinel if not found (never null).
     static uint64_t* find_child(const uint64_t* node, const hdr_type& h,
                                 uint8_t idx) noexcept {
-        const bitmap_type* bm = get_bitmap(node, h);
-        int slot = bm->find_slot(idx);
-        if (slot < 0) return nullptr;
+        int slot = find_slot(node, h, idx);
         const uint64_t* sb = h.get_slots(const_cast<uint64_t*>(node));
         return slots::load_child(sb, slot);
     }
 
     // ------------------------------------------------------------------
-    // EOS value access
+    // EOS child access — slot[count + 1]
     // ------------------------------------------------------------------
 
-    // Returns pointer to EOS value, or nullptr if no EOS.
-    static VALUE* find_eos(uint64_t* node, const hdr_type& h) noexcept {
-        if (!h.has_eos()) return nullptr;
-        uint64_t* sb = h.get_slots(node);
-        return &slots::load_eos(sb, h.count);
+    static uint64_t* eos_child(const uint64_t* node, const hdr_type& h) noexcept {
+        const uint64_t* sb = h.get_slots(const_cast<uint64_t*>(node));
+        return slots::load_child(sb, h.count + 1);
     }
 
-    static const VALUE* find_eos(const uint64_t* node, const hdr_type& h) noexcept {
-        if (!h.has_eos()) return nullptr;
-        const uint64_t* sb = h.get_slots(const_cast<uint64_t*>(node));
-        return &slots::load_eos(sb, h.count);
+    static void set_eos_child(uint64_t* node, const hdr_type& h,
+                              uint64_t* child) noexcept {
+        uint64_t* sb = h.get_slots(node);
+        slots::store_child(sb, h.count + 1, child);
     }
 
     // ------------------------------------------------------------------
     // Node size computation
     // ------------------------------------------------------------------
 
-    // Compute required u64 units for a bitmask node.
-    static size_t needed_u64(uint8_t skip_len, uint16_t child_count,
-                             bool has_eos) noexcept {
+    static size_t needed_u64(uint8_t skip_len, uint16_t child_count) noexcept {
         size_t bytes = hdr_type::header_size();                          // 8
         if (skip_len > 0) bytes += (skip_len + 7) & ~size_t(7);         // skip
         bytes += BITMAP_BYTES;                                           // bitmap
-        uint16_t total = child_count + (has_eos ? 1 : 0);
+        uint16_t total = child_count + 2;                                // sentinel + children + eos
         bytes += slots::size_bytes(total);                               // slots
         return (bytes + 7) / 8;
+    }
+
+    // ------------------------------------------------------------------
+    // Slot initialization — fill sentinel and eos_child with sentinel_ptr
+    // ------------------------------------------------------------------
+
+    static void init_slots(uint64_t* sb, uint16_t child_count) noexcept {
+        slots::store_child(sb, 0, sentinel_ptr());
+        slots::store_child(sb, child_count + 1, sentinel_ptr());
     }
 
     // ------------------------------------------------------------------
     // Node creation
     // ------------------------------------------------------------------
 
-    // Create a new bitmask node with optional skip prefix and optional EOS.
-    // Caller is responsible for populating children afterward.
+    // Create a new empty bitmask node with optional skip prefix.
     static uint64_t* create(mem_type& mem,
-                            uint8_t skip_len, const uint8_t* skip_data,
-                            bool has_eos, const VALUE* eos_val) {
-        size_t nu = needed_u64(skip_len, 0, has_eos);
+                            uint8_t skip_len, const uint8_t* skip_data) {
+        size_t nu = needed_u64(skip_len, 0);
         uint64_t* node = mem.alloc_node(nu);
         hdr_type& h = hdr_type::from_node(node);
         h.set_compact(false);
         h.skip       = skip_len;
         h.count      = 0;
         h.keys_bytes = 0;
-        h.set_eos(has_eos);
 
         if (skip_len > 0 && skip_data)
             std::memcpy(hdr_type::get_skip(node), skip_data, skip_len);
 
-        if (has_eos && eos_val)
-            slots::store_eos(h.get_slots(node), 0, *eos_val);
-
+        init_slots(h.get_slots(node), 0);
         return node;
     }
 
     // Create a bitmask node pre-populated with children from buckets.
-    // bucket_idx[i] = mapped character index for child i (must be sorted by idx).
+    // bucket_idx[i] = mapped character index for child i.
     // bucket_child[i] = child node pointer.
     // n_buckets = number of children.
     static uint64_t* create_with_children(
             mem_type& mem,
             uint8_t skip_len, const uint8_t* skip_data,
-            bool has_eos, const VALUE* eos_val,
             const uint8_t* bucket_idx, uint64_t* const* bucket_child,
             uint16_t n_buckets) {
-        size_t nu = needed_u64(skip_len, n_buckets, has_eos);
+        size_t nu = needed_u64(skip_len, n_buckets);
         uint64_t* node = mem.alloc_node(nu);
         hdr_type& h = hdr_type::from_node(node);
         h.set_compact(false);
         h.skip       = skip_len;
         h.count      = n_buckets;
         h.keys_bytes = 0;
-        h.set_eos(has_eos);
 
         if (skip_len > 0 && skip_data)
             std::memcpy(hdr_type::get_skip(node), skip_data, skip_len);
 
-        // Populate bitmap and child slots
         bitmap_type* bm = get_bitmap(node, h);
         uint64_t* sb = h.get_slots(node);
 
+        // sentinel at slot[0]
+        slots::store_child(sb, 0, sentinel_ptr());
+
+        // children at slot[1..n_buckets]
         for (uint16_t i = 0; i < n_buckets; ++i) {
             bm->set_bit(bucket_idx[i]);
-            slots::store_child(sb, i, bucket_child[i]);
+            slots::store_child(sb, i + 1, bucket_child[i]);
         }
 
-        // EOS goes after children
-        if (has_eos && eos_val)
-            slots::store_eos(sb, n_buckets, *eos_val);
+        // eos_child at slot[n_buckets + 1]
+        slots::store_child(sb, n_buckets + 1, sentinel_ptr());
 
         return node;
     }
@@ -172,24 +210,22 @@ struct kstrie_bitmask {
         bitmap_type* bm = get_bitmap(node, h);
         assert(!bm->has_bit(idx) && "insert_child: index already present");
 
-        int pos = bm->slot_for_insert(idx);
+        // 1-based position among children (slot_for_insert is 0-based count_below)
+        int pos = bm->slot_for_insert(idx) + 1;
         uint16_t old_count = h.count;
         uint16_t new_count = old_count + 1;
-        bool eos = h.has_eos();
 
-        size_t new_nu = needed_u64(h.skip, new_count, eos);
+        size_t new_nu = needed_u64(h.skip, new_count);
 
         if (new_nu <= h.alloc_u64) {
-            // Fits in place: shift slots right, insert
             uint64_t* sb = h.get_slots(node);
-            // If EOS present, move it from slot[old_count] to slot[new_count]
-            uint64_t eos_tmp = 0;
-            if (eos) eos_tmp = sb[old_count];
-            // Shift children after insertion point right by 1
-            slots::move_slots(sb, pos + 1, sb, pos, old_count - pos);
+            // Save eos_child from slot[old_count + 1]
+            uint64_t eos_tmp = sb[old_count + 1];
+            // Shift slot[pos..old_count] right by 1
+            slots::move_slots(sb, pos + 1, sb, pos, old_count - (pos - 1));
             slots::store_child(sb, pos, child);
-            // Restore EOS at new position
-            if (eos) sb[new_count] = eos_tmp;
+            // Restore eos_child at slot[new_count + 1]
+            sb[new_count + 1] = eos_tmp;
             bm->set_bit(idx);
             h.count = new_count;
             return node;
@@ -201,29 +237,29 @@ struct kstrie_bitmask {
         nh.copy_from(h);
         nh.count = new_count;
 
-        // Copy skip
         if (h.skip > 0)
             std::memcpy(hdr_type::get_skip(new_node),
                         hdr_type::get_skip(node), h.skip_bytes());
 
-        // Copy bitmap and set new bit
         bitmap_type* new_bm = get_bitmap(new_node, nh);
         *new_bm = *bm;
         new_bm->set_bit(idx);
 
-        // Copy slots with insertion gap
         const uint64_t* old_sb = h.get_slots(node);
         uint64_t* new_sb = nh.get_slots(new_node);
 
-        // Children before insertion point
-        slots::copy_slots(new_sb, 0, old_sb, 0, pos);
-        // New child
+        // slot[0] = sentinel
+        slots::store_child(new_sb, 0, sentinel_ptr());
+        // Children before insertion point: slot[1..pos-1]
+        if (pos > 1)
+            slots::copy_slots(new_sb, 1, old_sb, 1, pos - 1);
+        // New child at slot[pos]
         slots::store_child(new_sb, pos, child);
-        // Children after insertion point
-        slots::copy_slots(new_sb, pos + 1, old_sb, pos, old_count - pos);
-        // EOS at end
-        if (eos)
-            new_sb[new_count] = old_sb[old_count];
+        // Children after insertion point: old slot[pos..old_count]
+        slots::copy_slots(new_sb, pos + 1, old_sb, pos,
+                          old_count - (pos - 1));
+        // eos_child at slot[new_count + 1]
+        new_sb[new_count + 1] = old_sb[old_count + 1];
 
         mem.free_node(node);
         return new_node;
@@ -233,70 +269,10 @@ struct kstrie_bitmask {
     // idx must already be present.
     static void replace_child(uint64_t* node, const hdr_type& h,
                               uint8_t idx, uint64_t* new_child) noexcept {
-        const bitmap_type* bm = get_bitmap(node, h);
-        int slot = bm->find_slot(idx);
-        assert(slot >= 0 && "replace_child: index not found");
+        int slot = find_slot(node, h, idx);
+        assert(slot > 0 && "replace_child: index not found");
         uint64_t* sb = h.get_slots(node);
         slots::store_child(sb, slot, new_child);
-    }
-
-    // ------------------------------------------------------------------
-    // EOS insertion / update
-    // ------------------------------------------------------------------
-
-    // Set or update the EOS value on a bitmask node.
-    // Returns (possibly reallocated) node pointer and whether it was an update.
-    struct eos_result {
-        uint64_t* node;
-        bool      was_update;
-    };
-
-    static eos_result set_eos(uint64_t* node, hdr_type& h, mem_type& mem,
-                              const VALUE& val) {
-        if (h.has_eos()) {
-            // Update existing EOS value
-            uint64_t* sb = h.get_slots(node);
-            slots::destroy_eos(sb, h.count);
-            slots::store_eos(sb, h.count, val);
-            return {node, true};
-        }
-
-        // Adding EOS: need one more slot (appended at end, no shifts needed)
-        uint16_t child_count = h.count;
-        size_t new_nu = needed_u64(h.skip, child_count, true);
-
-        if (new_nu <= h.alloc_u64) {
-            // Fits in place: just append EOS at slot[count]
-            uint64_t* sb = h.get_slots(node);
-            slots::store_eos(sb, child_count, val);
-            h.set_eos(true);
-            return {node, false};
-        }
-
-        // Reallocate
-        uint64_t* new_node = mem.alloc_node(new_nu);
-        hdr_type& nh = hdr_type::from_node(new_node);
-        nh.copy_from(h);
-        nh.set_eos(true);
-
-        // Copy skip
-        if (h.skip > 0)
-            std::memcpy(hdr_type::get_skip(new_node),
-                        hdr_type::get_skip(node), h.skip_bytes());
-
-        // Copy bitmap
-        bitmap_type* new_bm = get_bitmap(new_node, nh);
-        const bitmap_type* old_bm = get_bitmap(node, h);
-        *new_bm = *old_bm;
-
-        // Copy children, then append EOS
-        uint64_t* new_sb = nh.get_slots(new_node);
-        const uint64_t* old_sb = h.get_slots(node);
-        slots::copy_slots(new_sb, 0, old_sb, 0, child_count);
-        slots::store_eos(new_sb, child_count, val);
-
-        mem.free_node(node);
-        return {new_node, false};
     }
 
     // ------------------------------------------------------------------
@@ -309,68 +285,50 @@ struct kstrie_bitmask {
     static uint64_t* remove_child(uint64_t* node, hdr_type& h,
                                   uint8_t idx) noexcept {
         bitmap_type* bm = get_bitmap(node, h);
-        int pos = bm->find_slot(idx);
-        assert(pos >= 0 && "remove_child: index not found");
+        int pos = bm->find_slot(idx) + 1;   // 1-based
+        assert(pos > 0 && "remove_child: index not found");
 
         uint16_t old_count = h.count;
         uint64_t* sb = h.get_slots(node);
-        bool eos = h.has_eos();
 
-        // Save EOS if present
-        uint64_t eos_tmp = 0;
-        if (eos) eos_tmp = sb[old_count];
+        // Save eos_child
+        uint64_t eos_tmp = sb[old_count + 1];
 
-        // Shift children left to close the gap
-        slots::move_slots(sb, pos, sb, pos + 1, old_count - pos - 1);
+        // Shift slot[pos+1..old_count] left by 1
+        slots::move_slots(sb, pos, sb, pos + 1, old_count - pos);
 
         bm->clear_bit(idx);
         h.count = old_count - 1;
 
-        // Restore EOS at new position
-        if (eos)
-            sb[old_count - 1] = eos_tmp;
+        // Restore eos_child at slot[new_count + 1] = slot[old_count]
+        sb[old_count] = eos_tmp;
 
-        // Clear the now-unused last slot
-        sb[old_count - 1 + (eos ? 1 : 0)] = 0;
+        // Clear unused last slot
+        sb[old_count + 1] = 0;
 
         return node;
-    }
-
-    // Remove EOS value (no shifts needed, just clear the last slot).
-    static void remove_eos(uint64_t* node, hdr_type& h) noexcept {
-        if (!h.has_eos()) return;
-
-        uint64_t* sb = h.get_slots(node);
-        slots::destroy_eos(sb, h.count);
-
-        // Clear the slot
-        sb[h.count] = 0;
-
-        h.set_eos(false);
     }
 
     // ------------------------------------------------------------------
     // Iteration helpers
     // ------------------------------------------------------------------
 
-    // Get the first set bit in the bitmap (-1 if empty).
     static int first_child_idx(const uint64_t* node, const hdr_type& h) noexcept {
         const bitmap_type* bm = get_bitmap(node, h);
         return bm->find_next_set(0);
     }
 
-    // Get the next set bit after prev (-1 if none).
     static int next_child_idx(const uint64_t* node, const hdr_type& h,
                               int prev) noexcept {
         const bitmap_type* bm = get_bitmap(node, h);
         return bm->find_next_set(prev + 1);
     }
 
-    // Get child pointer by dense slot position (not by character index).
+    // Get child pointer by dense slot position (0-based among children).
     static uint64_t* child_by_slot(const uint64_t* node, const hdr_type& h,
                                    uint16_t slot) noexcept {
         const uint64_t* sb = h.get_slots(const_cast<uint64_t*>(node));
-        return slots::load_child(sb, slot);
+        return slots::load_child(sb, slot + 1);  // +1 to skip sentinel
     }
 
     // ------------------------------------------------------------------
@@ -385,16 +343,16 @@ struct kstrie_bitmask {
 
         const uint64_t* sb = h.get_slots(const_cast<uint64_t*>(node));
 
-        for (uint16_t i = 0; i < h.count; ++i) {
+        // Iterate slot[1..count] (children) and slot[count+1] (eos_child)
+        // slot[0] is sentinel — skip it
+        for (uint16_t i = 1; i <= static_cast<uint16_t>(h.count + 1); ++i) {
             uint64_t* child = slots::load_child(sb, i);
-            if (child) {
-                const hdr_type& ch = hdr_type::from_node(child);
-                if (ch.is_sentinel()) continue;
-                if (ch.is_bitmap())
-                    total += memory_usage(child);
-                else
-                    total += static_cast<size_t>(ch.alloc_u64) * 8;
-            }
+            const hdr_type& ch = hdr_type::from_node(child);
+            if (ch.is_sentinel()) continue;
+            if (ch.is_bitmap())
+                total += memory_usage(child);
+            else
+                total += static_cast<size_t>(ch.alloc_u64) * 8;
         }
 
         return total;
@@ -410,25 +368,15 @@ struct kstrie_bitmask {
 
         uint64_t* sb = h.get_slots(node);
 
-        // Destroy EOS value if present
-        if (h.has_eos())
-            slots::destroy_eos(sb, h.count);
-
-        // Recursively destroy children
-        for (uint16_t i = 0; i < h.count; ++i) {
+        // Destroy all children and eos_child (slot[1..count+1])
+        // slot[0] is sentinel — don't touch
+        for (uint16_t i = 1; i <= static_cast<uint16_t>(h.count + 1); ++i) {
             uint64_t* child = slots::load_child(sb, i);
-            if (child) {
-                const hdr_type& ch = hdr_type::from_node(child);
-                if (ch.is_sentinel()) continue;
-                if (ch.is_bitmap())
-                    destroy(child, mem);
-                else {
-                    // Compact node: destroy its values, then free
-                    // Caller (kstrie) handles compact destruction
-                    // We just free the node here
-                }
-                mem.free_node(child);
-            }
+            const hdr_type& ch = hdr_type::from_node(child);
+            if (ch.is_sentinel()) continue;
+            if (ch.is_bitmap())
+                destroy(child, mem);
+            mem.free_node(child);
         }
     }
 

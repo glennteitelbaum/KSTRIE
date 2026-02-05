@@ -250,11 +250,12 @@ using reverse_lower_char_map  = char_map<REVERSE_LOWER_MAP>;
 // kstrie_slots -- slot access for both VALUE and child pointer modes
 //
 // Compact nodes: slots hold VALUE (or VALUE* when sizeof(VALUE) > 8)
-// Bitmask nodes: slots hold child pointers (uint64_t*)
+//   Layout: [value_0 .. value_{count-1}]
 //
-// Layout when has_eos:  [child_0 .. child_{count-1}] [eos]
-// Layout when !has_eos: [child_0 .. child_{count-1}]
-// EOS index = count (always last)
+// Bitmask nodes: all slots hold child pointers (uint64_t*)
+//   Layout: [sentinel] [child_0 .. child_{count-1}] [eos_child]
+//   sentinel at slot[0], eos_child at slot[count+1]
+//   No values stored directly in bitmask nodes.
 // ============================================================================
 
 template <typename VALUE>
@@ -262,10 +263,8 @@ struct kstrie_slots {
     static constexpr bool IS_TRIVIAL = std::is_trivially_copyable_v<VALUE>;
     static constexpr bool IS_INLINE  = IS_TRIVIAL && sizeof(VALUE) <= 8;
 
-    // Every slot is one uint64_t wide
     static constexpr size_t SLOT_WIDTH = 8;
 
-    // Total bytes for N slots
     static constexpr size_t size_bytes(uint16_t total_slots) noexcept {
         return total_slots * SLOT_WIDTH;
     }
@@ -342,24 +341,6 @@ struct kstrie_slots {
     static uint64_t* load_child(const uint64_t* base, size_t index) noexcept {
         return reinterpret_cast<uint64_t*>(base[index]);
     }
-
-    // --- EOS convenience (slot[count] when has_eos, i.e. last slot) ---
-
-    static void store_eos(uint64_t* slot_base, uint16_t count, const VALUE& v) {
-        store_value(slot_base, count, v);
-    }
-
-    static VALUE& load_eos(uint64_t* slot_base, uint16_t count) noexcept {
-        return load_value(slot_base, count);
-    }
-
-    static const VALUE& load_eos(const uint64_t* slot_base, uint16_t count) noexcept {
-        return load_value(slot_base, count);
-    }
-
-    static void destroy_eos(uint64_t* slot_base, uint16_t count) {
-        destroy_value(slot_base, count);
-    }
 };
 
 // ============================================================================
@@ -374,7 +355,7 @@ struct node_header {
     uint16_t count;         // compact: entry count, bitmask: child count
     uint16_t keys_bytes;    // compact index needs this (compact-only by policy)
     uint8_t  skip;          // prefix byte count (0 = no prefix)
-    uint8_t  flags;         // bit0: is_compact, bit1: has_eos
+    uint8_t  flags;         // bit0: is_compact
 
     static constexpr uint8_t SKIP_CONTINUATION = 255;
     static constexpr uint8_t SKIP_MAX_INLINE   = 254;
@@ -383,7 +364,6 @@ struct node_header {
 
     [[nodiscard]] bool is_compact()      const noexcept { return flags & 1; }
     [[nodiscard]] bool is_bitmap()       const noexcept { return !(flags & 1); }
-    [[nodiscard]] bool has_eos()         const noexcept { return (flags >> 1) & 1; }
     [[nodiscard]] bool is_continuation() const noexcept { return skip == SKIP_CONTINUATION; }
     [[nodiscard]] bool is_sentinel()     const noexcept { return alloc_u64 == 0; }
 
@@ -392,7 +372,6 @@ struct node_header {
     }
 
     void set_compact(bool v) noexcept { if (v) flags |= 1; else flags &= ~uint8_t(1); }
-    void set_eos(bool v)     noexcept { if (v) flags |= 2; else flags &= ~uint8_t(2); }
 
     void copy_from(const node_header& src) noexcept {
         uint16_t saved = alloc_u64;
@@ -400,39 +379,35 @@ struct node_header {
         alloc_u64 = saved;
     }
 
-    // --- total_slots: count + has_eos ---
+    // --- total_slots ---
+    // compact: count values
+    // bitmask: sentinel + count children + eos_child = count + 2
 
     [[nodiscard]] uint16_t total_slots() const noexcept {
-        return count + has_eos();
+        return is_compact() ? count : static_cast<uint16_t>(count + 2);
     }
 
     // --- Region sizes ---
 
-    // Header is always 8 bytes (1 uint64_t)
     static constexpr size_t header_size() noexcept { return 8; }
 
-    // Skip region: prefix bytes, 8-byte aligned
     [[nodiscard]] size_t skip_size() const noexcept {
         uint32_t sb = skip_bytes();
         return sb > 0 ? ((sb + 7) & ~size_t(7)) : 0;
     }
 
-    // Index region: delegates to compact or bitmask
     [[nodiscard]] size_t index_size() const noexcept;
 
-    // Slots region
     [[nodiscard]] size_t slots_size() const noexcept {
         return kstrie_slots<VALUE>::size_bytes(total_slots());
     }
 
-    // Total node size in bytes
     [[nodiscard]] size_t node_size() const noexcept {
         return header_size() + skip_size() + index_size() + slots_size();
     }
 
     // --- Region pointers ---
 
-    // Skip region start
     static uint8_t* get_skip(uint64_t* node) noexcept {
         return reinterpret_cast<uint8_t*>(node) + header_size();
     }
@@ -441,7 +416,6 @@ struct node_header {
         return reinterpret_cast<const uint8_t*>(node) + header_size();
     }
 
-    // Index region start
     [[nodiscard]] uint8_t* get_index(uint64_t* node) const noexcept {
         return reinterpret_cast<uint8_t*>(node) + header_size() + skip_size();
     }
@@ -450,7 +424,6 @@ struct node_header {
         return reinterpret_cast<const uint8_t*>(node) + header_size() + skip_size();
     }
 
-    // Slots region start
     [[nodiscard]] uint64_t* get_slots(uint64_t* node) const noexcept {
         return reinterpret_cast<uint64_t*>(
             reinterpret_cast<uint8_t*>(node) + header_size() + skip_size() + index_size());
@@ -484,10 +457,14 @@ size_t node_header<VALUE, CHARMAP, ALLOC>::index_size() const noexcept {
 static_assert(sizeof(node_header<int, identity_char_map, std::allocator<uint64_t>>) == 8);
 
 // ============================================================================
-// Global empty sentinel
+// Global empty sentinel -- all zeros, alloc_u64 == 0 → is_sentinel()
 // ============================================================================
 
 inline constexpr std::array<uint64_t, 5> EMPTY_NODE_STORAGE alignas(64) = {};
+
+inline uint64_t* sentinel_ptr() noexcept {
+    return const_cast<uint64_t*>(EMPTY_NODE_STORAGE.data());
+}
 
 // ============================================================================
 // e -- 16-byte comparable key (for hot and idx arrays in compact index)
@@ -546,7 +523,7 @@ inline constexpr std::size_t align8(std::size_t n) noexcept {
 }
 
 // ============================================================================
-// Eytzinger layout helpers (calc_W needed by compact_index_size below)
+// Eytzinger layout helpers
 // ============================================================================
 
 inline int calc_W(int ic) noexcept {
