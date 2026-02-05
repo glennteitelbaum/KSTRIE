@@ -40,6 +40,41 @@ No circular includes. All declarations live in `kstrie_support.hpp`, so every mo
 
 ---
 
+## Naming Conventions
+
+| Category | Style | Examples |
+|----------|-------|---------|
+| Classes, structs | `lowercase_with_underscores` | `bitmap_n`, `node_header`, `value_traits`, `kstrie`, `kstrie_memory` |
+| Variables, methods | `lowercase_with_underscores` | `find_slot`, `alloc_node`, `root_`, `size_` |
+| Enum types (enum class) | `lowercase_with_underscores` | `insert_mode`, `insert_outcome`, `compact_insert_check` |
+| Enum values | `ALL_CAPS` | `INSERT`, `UPDATE`, `INSERTED`, `FOUND`, `OK_INPLACE`, `TOO_MANY_KEYS` |
+| Template parameters | `ALL_CAPS` | `VALUE`, `CHARMAP`, `ALLOC`, `WORDS`, `USER_MAP` |
+| Constants / constexpr | `ALL_CAPS` | `BITMAP_U64`, `COMPACT_MAX`, `EMPTY_NODE_STORAGE`, `SKIP_CONTINUATION` |
+| Short domain types | `lowercase` | `e` (16-byte key type), `es` (entry builder struct) |
+
+### Renames from v2
+
+- `BitmapN` → `bitmap_n`
+- `Bitmap256` → `bitmap_256`
+- `NodeHeader` → `node_header`
+- `ValueTraits` → `value_traits`
+- `IdentityCharMap` → `identity_char_map`
+- `UpperCharMap` → `upper_char_map`
+- `ReverseLowerCharMap` → `reverse_lower_char_map`
+- `SearchResult` → `search_result`
+- `BucketEntry` → `bucket_entry`
+- `InsertResult` → `insert_result`
+- `InsertMode` → `insert_mode`
+- `InsertOutcome` → `insert_outcome`
+- `CompactInsertCheck` → `compact_insert_check`
+- `ValueTraits` → `kstrie_values` (redesigned, not just renamed)
+- `ES` → `es`
+- `E` → `e`
+
+No CamelCase anywhere. Enum/template params are ALL_CAPS. Everything else is snake_case.
+
+---
+
 ## Compiler / Build Settings
 
 - **C++23** (`-std=c++23`) — required for `std::byteswap`
@@ -59,15 +94,16 @@ No circular includes. All declarations live in `kstrie_support.hpp`, so every mo
 **Contains:**
 
 - `padded_size()` — allocation size classes
-- `BitmapN<WORDS>` template — 1/2/4 word bitmap with `has_bit`, `set_bit`, `clear_bit`, `find_slot`, `count_below`, `slot_for_insert`, `popcount`, `find_next_set`
-- `Bitmap256` alias
+- `bitmap_n<WORDS>` template — 1/2/4 word bitmap with `has_bit`, `set_bit`, `clear_bit`, `find_slot`, `count_below`, `slot_for_insert`, `popcount`, `find_next_set`
+- `bitmap_256` alias
 - Character maps: `IDENTITY_MAP`, `UPPER_MAP`, `REVERSE_LOWER_MAP`
 - `char_map<USER_MAP>` template — compile-time character mapping with `to_index`/`from_index`, deduces `BITMAP_WORDS`
-- `IdentityCharMap`, `UpperCharMap`, `ReverseLowerCharMap` aliases
-- `ValueTraits<VALUE>` — inline vs heap value storage
-- `NodeHeader` struct (8 bytes) — `alloc_u64`, `count`, `keys_bytes`, `skip`, `flags`; accessors for `is_compact`, `is_bitmap`, `has_eos`, `is_continuation`, `is_sentinel`, `skip_bytes`; `copy_from`
+- `identity_char_map`, `upper_char_map`, `reverse_lower_char_map` aliases
+- `value_traits<VALUE>` — inline vs heap value storage (legacy, replaced by `kstrie_values`)
+- `kstrie_values<VALUE>` — value storage with packing. See dedicated section below.
+- `node_header` struct (8 bytes) — `alloc_u64`, `count`, `keys_bytes`, `skip`, `flags`; accessors for `is_compact`, `is_bitmap`, `has_eos`, `is_continuation`, `is_sentinel`, `skip_bytes`; `copy_from`
 - `EMPTY_NODE_STORAGE` global sentinel
-- `E` type (16-byte comparable key), `ES` builder struct, `cvt()`, `make_search_key()`, `e_prefix_only()`, `e_offset()`
+- `e` type (16-byte comparable key), `es` builder struct, `cvt()`, `make_search_key()`, `e_prefix_only()`, `e_offset()`
 - Layout helpers: `align8`, `idx_count`, `hot_off`, `idx_off`, `keys_off`, `values_off`
 - Comparison helpers: `makecmp`, `read_u16`, `write_u16`, `key_cmp`, `key_next`
 - Eytzinger helpers: `calc_W`, `build_eyt_rec`, `build_eyt`
@@ -78,6 +114,66 @@ No circular includes. All declarations live in `kstrie_support.hpp`, so every mo
   - `kstrie_compact<VALUE, CHARMAP, ALLOC>`
 
 **Does NOT contain:** `kstrie` class itself (that's in `kstrie.hpp`).
+
+---
+
+### kstrie_values (in kstrie_support.hpp)
+
+**Purpose:** Owns all value storage logic — whether values are inline, heap-allocated, or packed multiple-per-uint64_t. Replaces `value_traits`. Every module that reads/writes values goes through this class.
+
+**Template:** `kstrie_values<VALUE>`
+
+**Packing strategy:**
+
+Values are stored in arrays backed by `uint64_t` slots. The number of values per slot depends on `sizeof(VALUE)`:
+
+| sizeof(VALUE) | Values per uint64_t | Example types |
+|---------------|---------------------|---------------|
+| 1 | 8 | `char`, `uint8_t`, `bool` |
+| 2 | 4 | `uint16_t`, `short` |
+| 4 | 2 | `uint32_t`, `int`, `float` |
+| 8 | 1 | `uint64_t`, `double`, `void*` |
+| >8, trivially copyable | spans multiple uint64_t, inline | small structs |
+| >8, not trivially copyable | 1 (pointer) | `std::string`, complex objects |
+
+**Constants:**
+- `PACK_COUNT` — how many values fit in one uint64_t (0 if heap-allocated)
+- `SLOT_SIZE` — number of uint64_t per value (1 for packed/single, 1 for pointer)
+- `IS_PACKED` — true if `PACK_COUNT > 1`
+- `IS_INLINE` — true if stored by value (not heap pointer)
+
+**Interface:**
+- `store(slot, index, value)` — write value at logical index within a uint64_t array
+- `load(slot, index) → VALUE&` — read value at logical index
+- `load(slot, index) → const VALUE&` — const read
+- `destroy(slot, index)` — cleanup (no-op for trivial, delete for heap)
+- `slots_needed(count) → size_t` — how many uint64_t needed for N values
+- `move_range(dst, dst_idx, src, src_idx, count)` — bulk move values
+- `copy_range(dst, dst_idx, src, src_idx, count)` — bulk copy values
+
+**How packing works in compact nodes:**
+
+Currently the values array is `VST values[count]` where each VST is 8 bytes. With packing, for `int` (4 bytes), two values share one uint64_t:
+
+```
+Before (unpacked):  [val0][____][val1][____][val2][____][val3][____]  (4 uint64_t for 4 ints)
+After (packed):     [val0|val1][val2|val3]                            (2 uint64_t for 4 ints)
+```
+
+For `char` (1 byte), eight values share one uint64_t:
+
+```
+[v0|v1|v2|v3|v4|v5|v6|v7]  (1 uint64_t for 8 chars)
+```
+
+**Impact on layout:**
+- `values_off()` stays the same (byte offset to values region)
+- The values region size changes: `kstrie_values::slots_needed(count) * 8` bytes instead of `count * sizeof(VST)`
+- Compact and bitmask call `kstrie_values` methods instead of direct memcpy/assignment on value slots
+- EOS value storage is always 1 slot (single value, no packing benefit)
+
+**Why this belongs in kstrie_support.hpp:**
+It's a type-level concern, not a node-type concern. Every module that touches values needs it. Putting it in support means the declaration (and likely the full definition, since it's all constexpr/inline) is available everywhere.
 
 ---
 
@@ -95,6 +191,8 @@ No circular includes. All declarations live in `kstrie_support.hpp`, so every mo
 - Holds the `ALLOC` instance
 
 **Every other helper class takes a `kstrie_memory<ALLOC>&`** as its way to allocate/free nodes. This is the only shared mutable dependency.
+
+**Uses `node_header` struct to read alloc_u64 and node type for traversal during destroy/memory accounting.**
 
 ---
 
@@ -154,9 +252,9 @@ No circular includes. All declarations live in `kstrie_support.hpp`, so every mo
 **Template:** `kstrie_compact<VALUE, CHARMAP, ALLOC>`
 
 **Contains:**
-- `find(node, header, suffix, suffix_len) → VST*` — binary/Eytzinger search + linear scan
-- `search_position(node, header, suffix, suffix_len) → SearchResult{found, pos, block_offset}` — find insert point
-- `insert(node, header, suffix, value, memory) → InsertResult` — insert into compact node. If key exists, returns FOUND/UPDATED. If node overflows or suffix > 14 bytes, performs split.
+- `find(node, header, suffix, suffix_len) → value_ptr` — binary/Eytzinger search + linear scan (returns pointer via kstrie_values)
+- `search_position(node, header, suffix, suffix_len) → search_result{found, pos, block_offset}` — find insert point
+- `insert(node, header, suffix, value, memory) → insert_result` — insert into compact node. If key exists, returns FOUND/UPDATED. If node overflows or suffix > 14 bytes, performs split.
 - `update_value(node, header, pos, value)` — overwrite value at position
 - `insert_at(node, header, suffix, value, pos, memory) → uint64_t*` — low-level positional insert. Returns nullptr if split needed.
 - `force_insert(node, header, suffix, value, pos, memory) → uint64_t*` — insert without limit checks (used before split)
@@ -203,12 +301,12 @@ No circular includes. All declarations live in `kstrie_support.hpp`, so every mo
   - `root_`, `size_`, memory instance
   - Instances of (or access to) skip_eos, bitmask, compact helpers
   - Public API: `find`, `insert`, `insert_or_assign`, `erase`, `clear`, `contains`, `empty`, `size`, `memory_usage`
-- `insert_impl(node, key, consumed, mode) → InsertResult` — **the router:**
+- `insert_impl(node, key, consumed, mode) → insert_result` — **the router:**
   - Calls `skip::match_prefix()` to consume skip
   - If key exhausted → skip::add_eos or update eos
   - If `is_compact()` → `compact::insert(...)`
   - If `is_bitmap()` → `bitmask::find(byte)`, recurse into child, or `bitmask::insert_child` with a new child
-- `find_impl(key) → VST*` — traversal:
+- `find_impl(key) → VALUE*` — traversal:
   - skip::match_prefix for skip chains
   - compact::find for compact nodes
   - bitmask::find for bitmap dispatch
@@ -244,6 +342,9 @@ kstrie (router)
 ---
 
 ## Design Decisions Log (Why We Made These Choices)
+
+### Why kstrie_values replaces value_traits and VST?
+The old `value_traits` had a `slot_type` (VST) that was either `VALUE` or `VALUE*` — always 8 bytes, one value per slot. This wastes space for small types: storing `char` values uses 8x the memory needed. `kstrie_values` packs multiple small values into each uint64_t, cutting memory for the values array by up to 8x for byte-sized types and 2x for int-sized types. The packing is transparent to compact/bitmask — they call `kstrie_values::store/load/destroy` with a logical index and the class handles the bit manipulation internally. The `VST` type alias is eliminated; all value access goes through `kstrie_values` methods.
 
 ### Why no CRTP or friends?
 Discussed explicitly. With declarations in kstrie_support.hpp, every module sees every peer's interface. Modules call each other as peers via public methods. CRTP adds complexity for no gain. Friends break encapsulation.
