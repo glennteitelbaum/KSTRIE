@@ -355,15 +355,15 @@ struct node_header {
     uint16_t count;         // compact: entry count, bitmask: child count
     uint16_t keys_bytes;    // compact index needs this (compact-only by policy)
     uint8_t  skip;          // prefix byte count (0 = no prefix)
-    uint8_t  flags;         // bit0: is_compact
+    uint8_t  flags;         // bit0: is_bitmask (0=compact, 1=bitmask)
 
     static constexpr uint8_t SKIP_CONTINUATION = 255;
     static constexpr uint8_t SKIP_MAX_INLINE   = 254;
 
     // --- Flag accessors ---
 
-    [[nodiscard]] bool is_compact()      const noexcept { return flags & 1; }
-    [[nodiscard]] bool is_bitmap()       const noexcept { return !(flags & 1); }
+    [[nodiscard]] bool is_compact()      const noexcept { return !(flags & 1); }
+    [[nodiscard]] bool is_bitmap()       const noexcept { return flags & 1; }
     [[nodiscard]] bool is_continuation() const noexcept { return skip == SKIP_CONTINUATION; }
     [[nodiscard]] bool is_sentinel()     const noexcept { return alloc_u64 == 0; }
 
@@ -371,7 +371,8 @@ struct node_header {
         return skip == SKIP_CONTINUATION ? SKIP_MAX_INLINE : skip;
     }
 
-    void set_compact(bool v) noexcept { if (v) flags |= 1; else flags &= ~uint8_t(1); }
+    void set_compact(bool v) noexcept { if (v) flags &= ~uint8_t(1); else flags |= 1; }
+    void set_bitmask(bool v) noexcept { if (v) flags |= 1; else flags &= ~uint8_t(1); }
 
     void copy_from(const node_header& src) noexcept {
         uint16_t saved = alloc_u64;
@@ -458,6 +459,7 @@ static_assert(sizeof(node_header<int, identity_char_map, std::allocator<uint64_t
 
 // ============================================================================
 // Global empty sentinel -- all zeros, alloc_u64 == 0 → is_sentinel()
+// flags == 0 → is_compact (compact is the default / zero state)
 // ============================================================================
 
 inline constexpr std::array<uint64_t, 5> EMPTY_NODE_STORAGE alignas(64) = {};

@@ -17,7 +17,7 @@ class kstrie;
 // Index region = [hot: W*16 bytes] [idx: N*16 bytes] [keys: keys_bytes]
 // Slots region = [value_0] ... [value_{N-1}]
 //
-// Compact nodes never use has_eos. A key that matches the skip prefix
+// Compact nodes store values directly. A key that matches the skip prefix
 // exactly is stored as a zero-length key entry in the index (sorts first).
 //
 // Insert strategy:
@@ -218,13 +218,11 @@ struct kstrie_compact {
         th.count      = count;
         th.keys_bytes = kb;
         th.set_compact(true);
-        th.set_eos(false);
         size_t nu = (th.node_size() + 7) / 8;
 
         uint64_t* node = mem.alloc_node(nu);
         hdr_type& h = hdr_type::from_node(node);
         h.set_compact(true);
-        h.set_eos(false);
         h.skip       = skip_len;
         h.count      = count;
         h.keys_bytes = kb;
@@ -327,18 +325,6 @@ struct kstrie_compact {
 
     // ------------------------------------------------------------------
     // rebuild -- unified insert path
-    //
-    // Handles all three skip match outcomes:
-    //   MATCHED:       no prepend, new entry added
-    //   MISMATCH:      prepend skip[ml..] to all keys, new entry added
-    //   KEY_EXHAUSTED: prepend skip[ml..] to all keys, new entry with len=0
-    //
-    // Steps:
-    //   1. Collect existing entries with prepend applied
-    //   2. Create new VALUE, add as entry
-    //   3. Sort entries
-    //   4. build_compact
-    //   5. finalize
     // ------------------------------------------------------------------
 
     static insert_result rebuild(uint64_t* node, hdr_type& h,
@@ -348,10 +334,9 @@ struct kstrie_compact {
         const uint8_t* skip_data = hdr_type::get_skip(node);
         uint32_t old_skip = h.skip_bytes();
 
-        // Compute new skip and prepend length
         uint8_t new_skip;
         uint32_t tail;
-        uint32_t suffix_off;  // offset into key_data where new suffix starts
+        uint32_t suffix_off;
 
         if (mr.status == match_status::MATCHED) {
             new_skip   = h.skip;
@@ -369,7 +354,6 @@ struct kstrie_compact {
 
         uint16_t new_count = h.count + 1;
 
-        // Allocate buffers
         size_t key_buf_size = h.keys_bytes
                               + h.count * tail
                               + new_suffix_len + 256;
@@ -382,7 +366,6 @@ struct kstrie_compact {
                                 ? stack_entries
                                 : new build_entry[new_count];
 
-        // Collect existing entries with prepend
         const uint8_t* index = h.get_index(node);
         int W = calc_W(h.count);
         const e* idx_arr    = idx_ptr(index, W);
@@ -407,7 +390,6 @@ struct kstrie_compact {
             ei++;
         }
 
-        // New entry
         uint64_t new_raw = 0;
         slots::store_value(&new_raw, 0, value);
 
@@ -422,7 +404,6 @@ struct kstrie_compact {
 
         assert(ei == new_count);
 
-        // Sort
         std::sort(entries, entries + new_count,
                   [](const build_entry& a, const build_entry& b) {
                       uint32_t min_len = std::min(a.key_len, b.key_len);
@@ -431,7 +412,6 @@ struct kstrie_compact {
                       return a.key_len < b.key_len;
                   });
 
-        // Build
         uint64_t* result = build_compact(trie.memory(),
                                           new_skip, skip_data,
                                           entries, new_count);
@@ -445,7 +425,8 @@ struct kstrie_compact {
     // ------------------------------------------------------------------
     // split_node -- split compact into bitmask parent + compact children
     //
-    // Entry with key_len==0 (if present) becomes bitmask parent EOS.
+    // Entry with key_len==0 (if present) becomes eos_child on the
+    // bitmask parent (a compact leaf with skip=0 and the value).
     // All other entries bucketed by first key byte.
     // ------------------------------------------------------------------
 
@@ -457,20 +438,20 @@ struct kstrie_compact {
         build_entry* all = new build_entry[N];
         collect_entries(node, h, all, key_buf);
 
-        // Check for zero-length key → bitmask parent EOS
-        bool parent_has_eos = false;
-        uint64_t parent_eos_raw = 0;
+        // Check for zero-length key → becomes eos_child
+        uint64_t* eos_leaf = nullptr;
         uint16_t data_start = 0;
 
         if (N > 0 && all[0].key_len == 0) {
-            parent_has_eos = true;
-            parent_eos_raw = all[0].raw_slot;
+            // Build a compact leaf: skip=0, one entry with key_len=0
+            build_entry eos_entry = all[0];
+            eos_leaf = build_compact(trie.memory(), 0, nullptr, &eos_entry, 1);
             data_start = 1;
         }
 
         uint16_t data_count = N - data_start;
 
-        // Bucket by first byte (entries are sorted, zero-len already handled)
+        // Bucket by first byte
         uint8_t  bucket_bytes[256];
         uint16_t bucket_start[256];
         uint16_t bucket_count[256];
@@ -525,19 +506,17 @@ struct kstrie_compact {
             delete[] child_entries;
         }
 
-        // Create bitmask parent (nullptr for eos_val: raw transfer below)
+        // Create bitmask parent
         uint64_t* parent = bitmask_ops::create_with_children(
             trie.memory(),
             h.skip, hdr_type::get_skip(node),
-            parent_has_eos, nullptr,
             bucket_bytes, children,
             static_cast<uint16_t>(n_buckets));
 
-        // Raw-transfer EOS slot (EOS is at slot[count], i.e. after children)
-        if (parent_has_eos) {
+        // Set eos_child if we had a zero-length key
+        if (eos_leaf) {
             hdr_type& ph = hdr_type::from_node(parent);
-            uint64_t* sb = ph.get_slots(parent);
-            sb[ph.count] = parent_eos_raw;
+            bitmask_ops::set_eos_child(parent, ph, eos_leaf);
         }
 
         trie.memory().free_node(node);

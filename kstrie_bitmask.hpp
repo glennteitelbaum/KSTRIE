@@ -148,7 +148,7 @@ struct kstrie_bitmask {
         size_t nu = needed_u64(skip_len, 0);
         uint64_t* node = mem.alloc_node(nu);
         hdr_type& h = hdr_type::from_node(node);
-        h.set_compact(false);
+        h.set_bitmask(true);
         h.skip       = skip_len;
         h.count      = 0;
         h.keys_bytes = 0;
@@ -172,7 +172,7 @@ struct kstrie_bitmask {
         size_t nu = needed_u64(skip_len, n_buckets);
         uint64_t* node = mem.alloc_node(nu);
         hdr_type& h = hdr_type::from_node(node);
-        h.set_compact(false);
+        h.set_bitmask(true);
         h.skip       = skip_len;
         h.count      = n_buckets;
         h.keys_bytes = 0;
