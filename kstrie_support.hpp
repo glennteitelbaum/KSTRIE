@@ -334,11 +334,14 @@ inline uint64_t* sentinel_ptr() noexcept {
 }
 
 // ============================================================================
-// e -- 16-byte index entry (raw byte layout, no byteswap)
+// e -- 16-byte comparable key (byteswapped for uint64 operator< comparison)
 //
-// Bytes [0..11]: key prefix (for comparison via memcmp)
+// Bytes [0..11]: key prefix (12 bytes)
 // Bytes [12..13]: offset (big-endian u16)
 // Bytes [14..15]: keynum (big-endian u16)
+//
+// After byteswap, operator< on array<uint64_t,2> gives correct
+// lexicographic ordering on key prefix bytes.
 // ============================================================================
 
 using e = std::array<uint64_t, 2>;
@@ -361,36 +364,40 @@ struct es {
     }
 };
 
-// cvt: raw memcpy (no byteswap)
+// cvt: memcpy + byteswap for uint64 comparison via operator<
 inline e cvt(const es& x) noexcept {
     e ret;
     std::memcpy(&ret, &x, 16);
+    if constexpr (std::endian::native == std::endian::little) {
+        ret[0] = __builtin_bswap64(ret[0]);
+        ret[1] = __builtin_bswap64(ret[1]);
+    }
     return ret;
 }
 
-// Build search prefix: zero-padded E_KEY_PREFIX bytes for memcmp
-inline void make_search_pfx(uint8_t* out, const uint8_t* k, uint32_t len) noexcept {
-    std::memset(out, 0, E_KEY_PREFIX);
-    uint32_t copy = len < static_cast<uint32_t>(E_KEY_PREFIX) ? len
-                         : static_cast<uint32_t>(E_KEY_PREFIX);
-    std::memcpy(out, k, copy);
+// Build search key: zero-padded E_KEY_PREFIX bytes, offset=0, keynum=0
+inline e make_search_key(const uint8_t* k, uint32_t len) noexcept {
+    es s;
+    s.setkey(reinterpret_cast<const char*>(k), static_cast<int>(len));
+    s.setoff(0);
+    s.setkeynum(0);
+    return cvt(s);
 }
 
-// Compare first E_KEY_PREFIX bytes of an e entry against a search prefix
-inline int e_prefix_cmp(const e& entry, const uint8_t* search_pfx) noexcept {
-    return std::memcmp(&entry, search_pfx, E_KEY_PREFIX);
+// Zero out offset + keynum (bottom 32 bits of ret[1] after byteswap)
+inline e e_prefix_only(e entry) noexcept {
+    entry[1] &= ~uint64_t(0xFFFFFFFF);
+    return entry;
 }
 
-// Read big-endian u16 at byte E_KEY_PREFIX (offset field)
+// Read offset: bits [31..16] of entry[1] after byteswap
 inline uint16_t e_offset(const e& entry) noexcept {
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(&entry);
-    return (static_cast<uint16_t>(p[E_KEY_PREFIX]) << 8) | p[E_KEY_PREFIX + 1];
+    return static_cast<uint16_t>((entry[1] >> 16) & 0xFFFF);
 }
 
-// Read big-endian u16 at byte E_KEY_PREFIX+2 (keynum field)
+// Read keynum: bits [15..0] of entry[1] after byteswap
 inline uint16_t e_keynum(const e& entry) noexcept {
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(&entry);
-    return (static_cast<uint16_t>(p[E_KEY_PREFIX + 2]) << 8) | p[E_KEY_PREFIX + 3];
+    return static_cast<uint16_t>(entry[1] & 0xFFFF);
 }
 
 static_assert(sizeof(e) == 16);

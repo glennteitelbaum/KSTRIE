@@ -111,7 +111,7 @@ struct kstrie_compact {
     // 3. Scan keys (always)
     //    → returns found/pos
     //
-    // Uses memcmp for all prefix comparisons (no byteswap).
+    // Uses operator< on byteswapped e for all prefix comparisons.
     // ------------------------------------------------------------------
 
     static search_pos search_in_index(const uint8_t* index, uint16_t N,
@@ -131,9 +131,8 @@ struct kstrie_compact {
             goto do_scan;
 
         {
-            // Build search prefix for memcmp (12 bytes, zero-padded)
-            uint8_t search_pfx[E_KEY_PREFIX];
-            make_search_pfx(search_pfx, suffix, suffix_len);
+            e search = make_search_key(suffix, suffix_len);
+            e search_pfx = e_prefix_only(search);
 
             const e* idx = idx_ptr(index, W);
 
@@ -145,7 +144,7 @@ struct kstrie_compact {
                 const e* hot = hot_ptr(index);
                 int i = 1;
                 while (i < W)
-                    i = 2 * i + (std::memcmp(search_pfx, &hot[i], E_KEY_PREFIX) >= 0 ? 1 : 0);
+                    i = 2 * i + (search >= hot[i] ? 1 : 0);
                 int group = i - W;
                 idx_start = group * IC / W;
                 idx_end   = (group + 1) * IC / W;
@@ -160,7 +159,7 @@ struct kstrie_compact {
 
             // Step 2: Scan idx entries
             for (int g = idx_start; g < idx_end; ++g) {
-                if (e_prefix_cmp(idx[g], search_pfx) > 0) {
+                if (e_prefix_only(idx[g]) > search_pfx) {
                     scan_end_key = static_cast<int>(e_keynum(idx[g]));
                     goto do_scan;
                 }
@@ -171,7 +170,7 @@ struct kstrie_compact {
             // Overflow: prefix may span the hot boundary (tier 3 only)
             if (W > 0) {
                 for (int g = idx_end; g < IC; ++g) {
-                    if (e_prefix_cmp(idx[g], search_pfx) > 0) {
+                    if (e_prefix_only(idx[g]) > search_pfx) {
                         scan_end_key = static_cast<int>(e_keynum(idx[g]));
                         goto do_scan;
                     }
@@ -303,15 +302,14 @@ struct kstrie_compact {
                 }
 
                 // Backup rule: walk back to first key with same e prefix
-                uint8_t nom_pfx[E_KEY_PREFIX];
-                make_search_pfx(nom_pfx, entries[nom].key, entries[nom].key_len);
+                e nom_key = make_search_key(entries[nom].key, entries[nom].key_len);
+                e nom_pfx = e_prefix_only(nom_key);
                 int min_pos = (i > 0) ? static_cast<int>(e_keynum(idx_arr[i - 1])) : 0;
                 int pos = nom;
                 while (pos > min_pos) {
-                    uint8_t prev_pfx[E_KEY_PREFIX];
-                    make_search_pfx(prev_pfx, entries[pos - 1].key,
-                                    entries[pos - 1].key_len);
-                    if (std::memcmp(prev_pfx, nom_pfx, E_KEY_PREFIX) != 0) break;
+                    e prev_key = make_search_key(entries[pos - 1].key,
+                                                  entries[pos - 1].key_len);
+                    if (e_prefix_only(prev_key) != nom_pfx) break;
                     pos--;
                 }
 
