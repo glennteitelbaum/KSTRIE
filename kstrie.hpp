@@ -8,12 +8,6 @@ namespace gteitelbaum {
 
 // ============================================================================
 // kstrie -- main trie class
-//
-// Router + helpers. Dispatches by node type.
-//
-// Node layout: [header] [skip] [index] [slots]
-//   - bitmask: slot[0]=sentinel, slot[1..count]=children, slot[count+1]=eos_child
-//   - compact: slot[0..count-1]=values, zero-length key for exact match
 // ============================================================================
 
 template <typename VALUE,
@@ -39,10 +33,6 @@ private:
     size_type size_{};
     mem_type  mem_{};
 
-    // ------------------------------------------------------------------
-    // Character mapping
-    // ------------------------------------------------------------------
-
     static void map_bytes_into(const uint8_t* src, uint8_t* dst,
                                uint32_t len) noexcept {
         for (uint32_t i = 0; i < len; ++i)
@@ -62,17 +52,9 @@ private:
         }
     }
 
-    // ------------------------------------------------------------------
-    // Init
-    // ------------------------------------------------------------------
-
     void init_empty_root() {
         root_ = sentinel_ptr();
     }
-
-    // ------------------------------------------------------------------
-    // Destroy tree (recursive)
-    // ------------------------------------------------------------------
 
     void destroy_tree(uint64_t* node) {
         if (!node) return;
@@ -82,21 +64,14 @@ private:
         uint64_t* slot_base = h.get_slots(node);
 
         if (h.is_compact()) {
-            // Compact: all slots are values
             slots_type::destroy_values(slot_base, 0, h.count);
         } else {
-            // Bitmap: slot[1..count] = children, slot[count+1] = eos_child
-            // slot[0] = sentinel, skip it
             for (uint16_t i = 1; i <= static_cast<uint16_t>(h.count + 1); ++i)
                 destroy_tree(slots_type::load_child(slot_base, i));
         }
 
         mem_.free_node(node);
     }
-
-    // ------------------------------------------------------------------
-    // Memory usage (recursive)
-    // ------------------------------------------------------------------
 
     size_type memory_usage_impl(const uint64_t* node) const noexcept {
         if (!node) return 0;
@@ -115,12 +90,11 @@ private:
     }
 
     // ------------------------------------------------------------------
-    // find_impl -- trie traversal
+    // find_impl -- read-path trie traversal
     //
-    // Sentinel nodes have skip=0, count=0, is_compact()=true.
-    // match_prefix returns MATCHED immediately (skip=0), then
-    // compact_type::find returns nullptr (count=0). No explicit
-    // sentinel check needed on the hot path.
+    // Uses match_skip_fast (memcmp) instead of match_prefix.
+    // Uses cached slots_off for all slot access.
+    // Sentinel: skip=0, count=0, is_compact()=true → returns nullptr.
     // ------------------------------------------------------------------
 
     const VALUE* find_impl(const uint8_t* key_data, uint32_t key_len) const noexcept {
@@ -135,14 +109,11 @@ private:
         for (;;) {
             hdr_type h = hdr_type::from_node(node);
 
-            // Match skip prefix
-            {
-                auto mr = skip_type::match_prefix(node, h, mapped, key_len, consumed);
-                if (mr.status != skip_type::match_status::MATCHED) break;
-                consumed = mr.consumed;
-            }
+            // memcmp skip matching
+            if (!skip_type::match_skip_fast(node, h, mapped, key_len, consumed))
+                break;
 
-            // Compact node — search within (including zero-length suffix)
+            // Compact node → search within
             if (h.is_compact()) {
                 result = compact_type::find(node, h, mapped + consumed,
                                              key_len - consumed);
@@ -155,7 +126,7 @@ private:
                 continue;
             }
 
-            // Bitmap dispatch — consume one byte, follow child
+            // Bitmap dispatch → consume one byte, follow child
             {
                 uint8_t byte = mapped[consumed++];
                 node = bitmask_type::find_child(node, h, byte);
@@ -172,10 +143,6 @@ private:
     }
 
 public:
-    // ------------------------------------------------------------------
-    // Construction
-    // ------------------------------------------------------------------
-
     kstrie() { init_empty_root(); }
     ~kstrie() { if (root_) destroy_tree(root_); }
 
@@ -200,19 +167,11 @@ public:
         return *this;
     }
 
-    // ------------------------------------------------------------------
-    // Capacity
-    // ------------------------------------------------------------------
-
     [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
     [[nodiscard]] size_type size() const noexcept { return size_; }
     [[nodiscard]] size_type memory_usage() const noexcept {
         return sizeof(*this) + memory_usage_impl(root_);
     }
-
-    // ------------------------------------------------------------------
-    // Lookup
-    // ------------------------------------------------------------------
 
     const VALUE* find(std::string_view key) const {
         return find_impl(
@@ -229,10 +188,6 @@ public:
         return find(key) != nullptr;
     }
 
-    // ------------------------------------------------------------------
-    // Modifiers (public)
-    // ------------------------------------------------------------------
-
     bool insert(std::string_view key, const VALUE& value) {
         const uint8_t* raw = reinterpret_cast<const uint8_t*>(key.data());
         uint32_t len = static_cast<uint32_t>(key.size());
@@ -240,7 +195,6 @@ public:
         uint8_t stack_buf[256];
         auto [mapped, heap_buf] = get_mapped(raw, len, stack_buf, sizeof(stack_buf));
 
-        // Sentinel — create leaf directly
         if (root_ == sentinel_ptr()) {
             root_ = add_child(mapped, len, value);
             delete[] heap_buf;
@@ -267,7 +221,6 @@ public:
         uint8_t stack_buf[256];
         auto [mapped, heap_buf] = get_mapped(raw, len, stack_buf, sizeof(stack_buf));
 
-        // Sentinel — create leaf directly
         if (root_ == sentinel_ptr()) {
             root_ = add_child(mapped, len, value);
             delete[] heap_buf;
@@ -299,7 +252,7 @@ public:
     }
 
     // ------------------------------------------------------------------
-    // insert_node -- recursive dispatch
+    // insert_node -- recursive dispatch (write-path, uses match_prefix)
     // ------------------------------------------------------------------
 
     insert_result insert_node(uint64_t* node, const uint8_t* key_data,
@@ -307,40 +260,33 @@ public:
                                uint32_t consumed, insert_mode mode) {
         hdr_type h = hdr_type::from_node(node);
 
-        // Match skip prefix
         auto mr = skip_type::match_prefix(node, h, key_data, key_len, consumed);
 
-        // Compact handles all three statuses (matched, mismatch, exhausted)
         if (h.is_compact())
             return compact_type::insert(node, h, key_data, key_len,
                                          value, consumed, mr, mode, mem_);
 
         // Bitmask: handle skip mismatch / key exhausted during skip
         if (mr.status == skip_type::match_status::MISMATCH) {
-            // Skip prefix diverges at mr.match_len bytes into the skip.
             const uint8_t* skip_data = hdr_type::get_skip(node);
             uint32_t old_skip = h.skip_bytes();
             uint32_t match_len = mr.match_len;
 
-            // Copy skip data before reskip frees the node
             uint8_t skip_copy[256];
             std::memcpy(skip_copy, skip_data, old_skip);
 
             uint8_t old_byte = skip_copy[match_len];
             uint8_t new_byte = key_data[consumed + match_len];
 
-            // Shorten old node's skip: remove common prefix + 1 divergence byte
             uint32_t new_old_skip = old_skip - match_len - 1;
             uint64_t* old_reskipped = bitmask_type::reskip(
                 node, h, mem_, static_cast<uint8_t>(new_old_skip),
                 skip_copy + match_len + 1);
 
-            // Create compact leaf for the new key
             uint32_t new_consumed = consumed + match_len + 1;
             uint64_t* leaf = add_child(key_data + new_consumed,
                                        key_len - new_consumed, value);
 
-            // Build parent bitmask with common prefix (must be sorted by byte)
             uint8_t bucket_idx[2];
             uint64_t* children[2];
             if (old_byte < new_byte) {
@@ -362,7 +308,6 @@ public:
             uint32_t old_skip = h.skip_bytes();
             uint32_t match_len = mr.match_len;
 
-            // Copy skip data before reskip frees the node
             uint8_t skip_copy[256];
             std::memcpy(skip_copy, skip_data, old_skip);
 
@@ -373,17 +318,14 @@ public:
                 node, h, mem_, static_cast<uint8_t>(new_old_skip),
                 skip_copy + match_len + 1);
 
-            // Create eos leaf
             uint64_t* eos_leaf = add_child(key_data + key_len, 0, value);
 
-            // Build parent with one child + eos
             uint8_t bucket_idx[1] = {old_byte};
             uint64_t* children[1] = {old_reskipped};
             uint64_t* parent = bitmask_type::create_with_children(
                 mem_, static_cast<uint8_t>(match_len), skip_copy,
                 bucket_idx, children, 1);
 
-            // Set eos_child on parent
             hdr_type& ph = hdr_type::from_node(parent);
             bitmask_type::set_eos_child(parent, ph, eos_leaf);
 
@@ -392,18 +334,15 @@ public:
 
         consumed = mr.consumed;
 
-        // Key exhausted → follow eos_child
         if (consumed == key_len) {
             uint64_t* eos = bitmask_type::eos_child(node, h);
 
             if (eos == sentinel_ptr()) {
-                // No EOS yet — create compact leaf with zero-length suffix
                 uint64_t* leaf = add_child(key_data + consumed, 0, value);
                 bitmask_type::set_eos_child(node, h, leaf);
                 return {node, insert_outcome::INSERTED};
             }
 
-            // EOS exists — descend
             insert_result r = insert_node(eos, key_data, key_len, value,
                                            consumed, mode);
             if (r.node != eos)
@@ -411,13 +350,11 @@ public:
             return {node, r.outcome};
         }
 
-        // Bitmask dispatch — consume one byte
         {
             uint8_t byte = key_data[consumed++];
             uint64_t* child = bitmask_type::find_child(node, h, byte);
 
             if (child == sentinel_ptr()) {
-                // No child — create compact leaf
                 uint64_t* leaf = add_child(key_data + consumed,
                                            key_len - consumed, value);
                 uint64_t* nn = bitmask_type::insert_child(node, h, mem_,
@@ -425,7 +362,6 @@ public:
                 return {nn, insert_outcome::INSERTED};
             }
 
-            // Child exists — recurse
             insert_result r = insert_node(child, key_data, key_len, value,
                                            consumed, mode);
             if (r.node != child)
@@ -434,19 +370,13 @@ public:
         }
     }
 
-    // ------------------------------------------------------------------
-    // add_child -- create compact leaf for a single suffix + value
-    //
-    // Suffix becomes skip prefix. Value stored as zero-length key entry.
-    // ------------------------------------------------------------------
-
     uint64_t* add_child(const uint8_t* suffix, uint32_t suffix_len,
                         const VALUE& value) {
         uint64_t raw = 0;
         slots_type::store_value(&raw, 0, value);
 
         typename compact_type::build_entry entry;
-        entry.key      = suffix;  // unused for key_len=0
+        entry.key      = suffix;
         entry.key_len  = 0;
         entry.raw_slot = raw;
 
@@ -454,10 +384,6 @@ public:
             static_cast<uint8_t>(suffix_len), suffix,
             &entry, 1);
     }
-
-    // ------------------------------------------------------------------
-    // add_child (bulk)
-    // ------------------------------------------------------------------
 
     struct child_entry {
         const uint8_t* suffix;
@@ -468,10 +394,6 @@ public:
     uint64_t* add_children(const child_entry* entries, size_t count) {
         return compact_type::create_from_entries(entries, count, mem_);
     }
-
-    // ------------------------------------------------------------------
-    // Accessor for memory
-    // ------------------------------------------------------------------
 
     mem_type& memory() noexcept { return mem_; }
 };

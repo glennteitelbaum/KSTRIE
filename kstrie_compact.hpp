@@ -14,20 +14,12 @@ class kstrie;
 //
 // Node layout:  [header 8B] [skip] [index] [slots]
 //
-// Index region = [hot: W*16 bytes] [idx: N*16 bytes] [keys: keys_bytes]
+// Index region (three-tier):
+//   Tier 1 (N<=16):  [keys]
+//   Tier 2 (17-256): [idx: IC*16] [keys]
+//   Tier 3 (>256):   [hot: W*16] [idx: IC*16] [keys]
+//
 // Slots region = [value_0] ... [value_{N-1}]
-//
-// Compact nodes store values directly. A key that matches the skip prefix
-// exactly is stored as a zero-length key entry in the index (sorts first).
-//
-// Insert strategy:
-//   Always build the result node unconditionally, then finalize checks
-//   constraints. If any violated, split into bitmask + compact children.
-//
-// VALUE ownership:
-//   - T* created exactly once on insert (via slots::store_value)
-//   - Moved between nodes by raw uint64_t memcpy
-//   - Deleted only on erase or tree destruction
 // ============================================================================
 
 template <typename VALUE, typename CHARMAP, typename ALLOC>
@@ -48,21 +40,17 @@ struct kstrie_compact {
     };
 
     // ------------------------------------------------------------------
-    // Index size (called by node_header::index_size)
-    //
-    // Tier 1 (N<=16):  [keys]
-    // Tier 2 (17-256): [idx: IC*16] [keys]
-    // Tier 3 (>256):   [hot: W*16] [idx: IC*16] [keys]
+    // Index size (write-path, called by node_header::index_size)
     // ------------------------------------------------------------------
 
     static size_t index_size(const hdr_type& h) noexcept {
         uint16_t N = h.count;
-        if (N == 0 && h.keys_bytes == 0) return 0;
+        uint16_t kb = approx_keys_bytes(h.slots_off, h.skip, N);
+        if (N == 0 && kb == 0) return 0;
         int IC = compact_ic(N);
         int W  = compact_hot_count(N);
         return align8(static_cast<size_t>(W) * 16 +
-                       static_cast<size_t>(IC) * 16 +
-                       h.keys_bytes);
+                       static_cast<size_t>(IC) * 16 + kb);
     }
 
     // ------------------------------------------------------------------
@@ -114,7 +102,16 @@ struct kstrie_compact {
     }
 
     // ------------------------------------------------------------------
-    // Search (three-tier)
+    // search_in_index -- coalesced three-tier pipeline
+    //
+    // 1. Scan hot (tier 3 only, skipped if W==0)
+    //    → narrows idx_start..idx_end
+    // 2. Scan idx (tier 2+3, skipped if IC==0)
+    //    → narrows scan_start_key, scan_start_off, scan_end_key
+    // 3. Scan keys (always)
+    //    → returns found/pos
+    //
+    // Uses memcmp for all prefix comparisons (no byteswap).
     // ------------------------------------------------------------------
 
     static search_pos search_in_index(const uint8_t* index, uint16_t N,
@@ -124,49 +121,46 @@ struct kstrie_compact {
         int W  = compact_hot_count(N);
         const uint8_t* keys = keys_ptr(index, W, IC);
 
-        // Tier 1: N <= 16, linear scan keys directly
-        if (IC == 0)
-            return scan_keys(keys, 0, N, suffix, suffix_len, 0);
-
-        const e* idx = idx_ptr(index, W);
-        e search_pfx = e_prefix_only(make_search_key(suffix, suffix_len));
-
+        // Key scan bounds (default: full range)
         int scan_start_key = 0;
         uint32_t scan_start_off = 0;
         int scan_end_key = N;
 
-        if (W == 0) {
-            // Tier 2: linear scan idx entries
-            for (int g = 0; g < IC; ++g) {
-                if (e_prefix_only(idx[g]) > search_pfx) {
-                    scan_end_key = static_cast<int>(e_keynum(idx[g]));
-                    goto do_scan;
+        // Skip hot + idx for tier 1 (IC==0)
+        if (IC == 0)
+            goto do_scan;
+
+        {
+            // Build search prefix for memcmp (12 bytes, zero-padded)
+            uint8_t search_pfx[E_KEY_PREFIX];
+            make_search_pfx(search_pfx, suffix, suffix_len);
+
+            const e* idx = idx_ptr(index, W);
+
+            int idx_start = 0;
+            int idx_end   = IC;
+
+            // Step 1: Scan hot (tier 3 only)
+            if (W > 0) {
+                const e* hot = hot_ptr(index);
+                int i = 1;
+                while (i < W)
+                    i = 2 * i + (std::memcmp(search_pfx, &hot[i], E_KEY_PREFIX) >= 0 ? 1 : 0);
+                int group = i - W;
+                idx_start = group * IC / W;
+                idx_end   = (group + 1) * IC / W;
+                if (idx_end > IC) idx_end = IC;
+
+                // Start from previous idx entry
+                if (idx_start > 0) {
+                    scan_start_key = static_cast<int>(e_keynum(idx[idx_start - 1]));
+                    scan_start_off = e_offset(idx[idx_start - 1]);
                 }
-                scan_start_key = static_cast<int>(e_keynum(idx[g]));
-                scan_start_off = e_offset(idx[g]);
-            }
-        } else {
-            // Tier 3: Eytzinger hot -> idx range -> key range
-            const e* hot = hot_ptr(index);
-            e search = make_search_key(suffix, suffix_len);
-
-            int i = 1;
-            while (i < W)
-                i = 2 * i + (search >= hot[i] ? 1 : 0);
-            int group = i - W;
-            int idx_start = group * IC / W;
-            int idx_end   = (group + 1) * IC / W;
-            if (idx_end > IC) idx_end = IC;
-
-            // Start from previous idx if available
-            if (idx_start > 0) {
-                scan_start_key = static_cast<int>(e_keynum(idx[idx_start - 1]));
-                scan_start_off = e_offset(idx[idx_start - 1]);
             }
 
-            // Narrow within idx range
+            // Step 2: Scan idx entries
             for (int g = idx_start; g < idx_end; ++g) {
-                if (e_prefix_only(idx[g]) > search_pfx) {
+                if (e_prefix_cmp(idx[g], search_pfx) > 0) {
                     scan_end_key = static_cast<int>(e_keynum(idx[g]));
                     goto do_scan;
                 }
@@ -174,23 +168,26 @@ struct kstrie_compact {
                 scan_start_off = e_offset(idx[g]);
             }
 
-            // Overflow: prefix may span the hot boundary
-            for (int g = idx_end; g < IC; ++g) {
-                if (e_prefix_only(idx[g]) > search_pfx) {
-                    scan_end_key = static_cast<int>(e_keynum(idx[g]));
-                    goto do_scan;
+            // Overflow: prefix may span the hot boundary (tier 3 only)
+            if (W > 0) {
+                for (int g = idx_end; g < IC; ++g) {
+                    if (e_prefix_cmp(idx[g], search_pfx) > 0) {
+                        scan_end_key = static_cast<int>(e_keynum(idx[g]));
+                        goto do_scan;
+                    }
                 }
             }
             scan_end_key = N;
         }
 
     do_scan:
+        // Step 3: Scan keys (always)
         return scan_keys(keys, scan_start_key, scan_end_key,
                          suffix, suffix_len, scan_start_off);
     }
 
     // ------------------------------------------------------------------
-    // find
+    // find -- read-path, uses cached slots_off
     // ------------------------------------------------------------------
 
     static const VALUE* find(const uint64_t* node, const hdr_type& h,
@@ -200,7 +197,8 @@ struct kstrie_compact {
         auto [found, pos] = search_in_index(index, h.count, suffix, suffix_len);
         if (!found) return nullptr;
 
-        const uint64_t* sb = h.get_slots(const_cast<uint64_t*>(node));
+        // Cached slots access: node + slots_off
+        const uint64_t* sb = node + h.slots_off;
         return &slots::load_value(sb, pos);
     }
 
@@ -218,7 +216,7 @@ struct kstrie_compact {
         int IC = compact_ic(N);
         int W  = compact_hot_count(N);
         const uint8_t* keys = keys_ptr(index, W, IC);
-        const uint64_t* sb  = h.get_slots(const_cast<uint64_t*>(node));
+        const uint64_t* sb  = node + h.slots_off;
 
         const uint8_t* kp = keys;
         size_t buf_off = 0;
@@ -235,7 +233,7 @@ struct kstrie_compact {
     }
 
     // ------------------------------------------------------------------
-    // build_compact
+    // build_compact -- sets slots_off in header
     // ------------------------------------------------------------------
 
     static uint64_t* build_compact(mem_type& mem,
@@ -247,19 +245,15 @@ struct kstrie_compact {
         for (uint16_t i = 0; i < count; ++i)
             kb += 2 + static_cast<uint16_t>(entries[i].key_len);
 
-        hdr_type th{};
-        th.skip       = skip_len;
-        th.count      = count;
-        th.keys_bytes = kb;
-        th.set_compact(true);
-        size_t nu = (th.node_size() + 7) / 8;
+        uint16_t so = compute_compact_slots_off(skip_len, count, kb);
+        size_t nu = (static_cast<size_t>(so) * 8 + static_cast<size_t>(count) * 8 + 7) / 8;
 
         uint64_t* node = mem.alloc_node(nu);
         hdr_type& h = hdr_type::from_node(node);
         h.set_compact(true);
-        h.skip       = skip_len;
-        h.count      = count;
-        h.keys_bytes = kb;
+        h.skip      = skip_len;
+        h.count     = count;
+        h.slots_off = so;
 
         if (skip_len > 0 && skip_data)
             std::memcpy(hdr_type::get_skip(node), skip_data, skip_len);
@@ -301,30 +295,26 @@ struct kstrie_compact {
             e* idx_arr = idx_ptr(index, W);
 
             for (int i = 0; i < IC; ++i) {
-                // Compute nominal key position
                 int nom;
                 if (W > 0) {
-                    // Tier 3: stride 8, idx[0] -> key[0]
-                    nom = i * 8;
+                    nom = i * 8;   // Tier 3: stride 8
                 } else {
-                    // Tier 2: spread evenly
-                    nom = (i + 1) * count / (IC + 1);
+                    nom = (i + 1) * count / (IC + 1);   // Tier 2: spread
                 }
 
                 // Backup rule: walk back to first key with same e prefix
-                e nom_pfx = e_prefix_only(
-                    make_search_key(entries[nom].key, entries[nom].key_len));
+                uint8_t nom_pfx[E_KEY_PREFIX];
+                make_search_pfx(nom_pfx, entries[nom].key, entries[nom].key_len);
                 int min_pos = (i > 0) ? static_cast<int>(e_keynum(idx_arr[i - 1])) : 0;
                 int pos = nom;
                 while (pos > min_pos) {
-                    e prev_pfx = e_prefix_only(
-                        make_search_key(entries[pos - 1].key,
-                                        entries[pos - 1].key_len));
-                    if (prev_pfx != nom_pfx) break;
+                    uint8_t prev_pfx[E_KEY_PREFIX];
+                    make_search_pfx(prev_pfx, entries[pos - 1].key,
+                                    entries[pos - 1].key_len);
+                    if (std::memcmp(prev_pfx, nom_pfx, E_KEY_PREFIX) != 0) break;
                     pos--;
                 }
 
-                // Build e entry: key prefix + byte offset + key number
                 es s;
                 s.setkey(reinterpret_cast<const char*>(entries[pos].key),
                          static_cast<int>(entries[pos].key_len));
@@ -333,7 +323,6 @@ struct kstrie_compact {
                 idx_arr[i] = cvt(s);
             }
 
-            // Build hot (tier 3 only)
             if (W > 0) {
                 e* hot = hot_ptr(index);
                 hot[0] = e{};
@@ -350,7 +339,7 @@ struct kstrie_compact {
     }
 
     // ------------------------------------------------------------------
-    // finalize -- free old node, post-check, split if needed
+    // finalize
     // ------------------------------------------------------------------
 
     static insert_result finalize(uint64_t* old_node, uint64_t* new_node,
@@ -374,7 +363,6 @@ struct kstrie_compact {
                                  const VALUE& value, uint32_t consumed,
                                  match_result mr, insert_mode mode,
                                  mem_type& mem) {
-        // MATCHED: check for existing entry (update/found short-circuits)
         if (mr.status == match_status::MATCHED) {
             uint32_t suffix_len = key_len - mr.consumed;
             const uint8_t* suffix = key_data + mr.consumed;
@@ -426,9 +414,9 @@ struct kstrie_compact {
 
         uint16_t new_count = h.count + 1;
 
-        size_t key_buf_size = h.keys_bytes
-                              + h.count * tail
-                              + new_suffix_len + 256;
+        // Use approx_keys_bytes for buffer sizing
+        uint16_t akb = approx_keys_bytes(h.slots_off, h.skip, h.count);
+        size_t key_buf_size = akb + h.count * tail + new_suffix_len + 256;
         uint8_t stack_keys[4096];
         uint8_t* key_buf = (key_buf_size <= sizeof(stack_keys))
                             ? stack_keys : new uint8_t[key_buf_size];
@@ -442,7 +430,7 @@ struct kstrie_compact {
         int IC = compact_ic(h.count);
         int W  = compact_hot_count(h.count);
         const uint8_t* keys = keys_ptr(index, W, IC);
-        const uint64_t* sb  = h.get_slots(node);
+        const uint64_t* sb  = node + h.slots_off;
 
         size_t buf_off = 0;
         uint16_t ei = 0;
@@ -499,27 +487,22 @@ struct kstrie_compact {
     }
 
     // ------------------------------------------------------------------
-    // split_node -- split compact into bitmask parent + compact children
-    //
-    // Entry with key_len==0 (if present) becomes eos_child on the
-    // bitmask parent (a compact leaf with skip=0 and the value).
-    // All other entries bucketed by first key byte.
+    // split_node
     // ------------------------------------------------------------------
 
     static insert_result split_node(uint64_t* node, hdr_type& h,
                                      mem_type& mem) {
         uint16_t N = h.count;
 
-        uint8_t* key_buf = new uint8_t[h.keys_bytes + 256];
+        uint16_t akb = approx_keys_bytes(h.slots_off, h.skip, N);
+        uint8_t* key_buf = new uint8_t[akb + 256];
         build_entry* all = new build_entry[N];
         collect_entries(node, h, all, key_buf);
 
-        // Check for zero-length key → becomes eos_child
         uint64_t* eos_leaf = nullptr;
         uint16_t data_start = 0;
 
         if (N > 0 && all[0].key_len == 0) {
-            // Build a compact leaf: skip=0, one entry with key_len=0
             build_entry eos_entry = all[0];
             eos_leaf = build_compact(mem, 0, nullptr, &eos_entry, 1);
             data_start = 1;
@@ -527,7 +510,6 @@ struct kstrie_compact {
 
         uint16_t data_count = N - data_start;
 
-        // Bucket by first byte
         uint8_t  bucket_bytes[256];
         uint16_t bucket_start[256];
         uint16_t bucket_count[256];
@@ -550,7 +532,6 @@ struct kstrie_compact {
             }
         }
 
-        // Create child for each bucket
         uint64_t* children[256];
         for (int b = 0; b < n_buckets; ++b) {
             uint16_t start = bucket_start[b];
@@ -567,11 +548,9 @@ struct kstrie_compact {
                 data_cnt++;
             }
 
-            children[b] = build_compact(mem,
-                                         0, nullptr,
+            children[b] = build_compact(mem, 0, nullptr,
                                          child_entries, data_cnt);
 
-            // Recursive: child might still violate
             hdr_type& ch = hdr_type::from_node(children[b]);
             if (ch.count > COMPACT_MAX ||
                 ch.alloc_u64 > COMPACT_MAX_ALLOC_U64) {
@@ -582,14 +561,12 @@ struct kstrie_compact {
             delete[] child_entries;
         }
 
-        // Create bitmask parent
         uint64_t* parent = bitmask_ops::create_with_children(
             mem,
             h.skip, hdr_type::get_skip(node),
             bucket_bytes, children,
             static_cast<uint16_t>(n_buckets));
 
-        // Set eos_child if we had a zero-length key
         if (eos_leaf) {
             hdr_type& ph = hdr_type::from_node(parent);
             bitmask_ops::set_eos_child(parent, ph, eos_leaf);
@@ -603,7 +580,7 @@ struct kstrie_compact {
     }
 
     // ------------------------------------------------------------------
-    // create_from_entries -- bulk build from child_entry array
+    // create_from_entries
     // ------------------------------------------------------------------
 
     static uint64_t* create_from_entries(
@@ -621,8 +598,7 @@ struct kstrie_compact {
             be[i].raw_slot = raw;
         }
 
-        uint64_t* node = build_compact(mem,
-                                         0, nullptr,
+        uint64_t* node = build_compact(mem, 0, nullptr,
                                          be, static_cast<uint16_t>(count));
         delete[] be;
         return node;

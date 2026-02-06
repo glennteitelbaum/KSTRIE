@@ -232,62 +232,82 @@ struct kstrie_slots {
     }
 };
 
+// ============================================================================
+// node_header -- 8 bytes
+//
+// slots_off: cached offset from node start to slots region, in u64 units.
+// Read path: get_slots(node) = node + slots_off. One add, zero arithmetic.
+// Write path computes keys_bytes locally, stores slots_off in header.
+// ============================================================================
+
 template <typename VALUE, typename CHARMAP, typename ALLOC>
 struct node_header {
-    uint16_t alloc_u64;
-    uint16_t count;
-    uint16_t keys_bytes;
-    uint8_t  skip;
-    uint8_t  flags;
+    uint16_t alloc_u64;     // allocation size in u64 units (0 = sentinel)
+    uint16_t count;         // compact: entry count, bitmask: child count
+    uint16_t slots_off;     // offset to slots region in u64 units
+    uint8_t  skip;          // prefix byte count (0 = no prefix)
+    uint8_t  flags;         // bit0: is_bitmask (0=compact, 1=bitmask)
+
     static constexpr uint8_t SKIP_CONTINUATION = 255;
     static constexpr uint8_t SKIP_MAX_INLINE   = 254;
+
     [[nodiscard]] bool is_compact()      const noexcept { return !(flags & 1); }
     [[nodiscard]] bool is_bitmap()       const noexcept { return flags & 1; }
     [[nodiscard]] bool is_continuation() const noexcept { return skip == SKIP_CONTINUATION; }
     [[nodiscard]] bool is_sentinel()     const noexcept { return alloc_u64 == 0; }
+
     [[nodiscard]] uint32_t skip_bytes() const noexcept {
         return skip == SKIP_CONTINUATION ? SKIP_MAX_INLINE : skip;
     }
+
     void set_compact(bool v) noexcept { if (v) flags &= ~uint8_t(1); else flags |= 1; }
     void set_bitmask(bool v) noexcept { if (v) flags |= 1; else flags &= ~uint8_t(1); }
+
     void copy_from(const node_header& src) noexcept {
         uint16_t saved = alloc_u64; *this = src; alloc_u64 = saved;
     }
+
     [[nodiscard]] uint16_t total_slots() const noexcept {
         return is_compact() ? count : static_cast<uint16_t>(count + 2);
     }
+
     static constexpr size_t header_size() noexcept { return 8; }
+
     [[nodiscard]] size_t skip_size() const noexcept {
         uint32_t sb = skip_bytes();
         return sb > 0 ? ((sb + 7) & ~size_t(7)) : 0;
     }
+
+    // Write-path only: compute index size by dispatching to type
     [[nodiscard]] size_t index_size() const noexcept;
-    [[nodiscard]] size_t slots_size() const noexcept {
-        return kstrie_slots<VALUE>::size_bytes(total_slots());
-    }
+
+    // node_size via slots_off
     [[nodiscard]] size_t node_size() const noexcept {
-        return header_size() + skip_size() + index_size() + slots_size();
+        return static_cast<size_t>(slots_off) * 8 + static_cast<size_t>(total_slots()) * 8;
     }
+
     static uint8_t* get_skip(uint64_t* node) noexcept {
         return reinterpret_cast<uint8_t*>(node) + header_size();
     }
     static const uint8_t* get_skip(const uint64_t* node) noexcept {
         return reinterpret_cast<const uint8_t*>(node) + header_size();
     }
+
     [[nodiscard]] uint8_t* get_index(uint64_t* node) const noexcept {
         return reinterpret_cast<uint8_t*>(node) + header_size() + skip_size();
     }
     [[nodiscard]] const uint8_t* get_index(const uint64_t* node) const noexcept {
         return reinterpret_cast<const uint8_t*>(node) + header_size() + skip_size();
     }
+
+    // Fast slots access: single pointer add
     [[nodiscard]] uint64_t* get_slots(uint64_t* node) const noexcept {
-        return reinterpret_cast<uint64_t*>(
-            reinterpret_cast<uint8_t*>(node) + header_size() + skip_size() + index_size());
+        return node + slots_off;
     }
     [[nodiscard]] const uint64_t* get_slots(const uint64_t* node) const noexcept {
-        return reinterpret_cast<const uint64_t*>(
-            reinterpret_cast<const uint8_t*>(node) + header_size() + skip_size() + index_size());
+        return node + slots_off;
     }
+
     static node_header& from_node(uint64_t* node) noexcept {
         return *reinterpret_cast<node_header*>(node);
     }
@@ -296,6 +316,7 @@ struct node_header {
     }
 };
 
+// Deferred index_size (write-path only)
 template <typename VALUE, typename CHARMAP, typename ALLOC>
 size_t node_header<VALUE, CHARMAP, ALLOC>::index_size() const noexcept {
     if (is_compact())
@@ -311,6 +332,14 @@ inline constexpr std::array<uint64_t, 5> EMPTY_NODE_STORAGE alignas(64) = {};
 inline uint64_t* sentinel_ptr() noexcept {
     return const_cast<uint64_t*>(EMPTY_NODE_STORAGE.data());
 }
+
+// ============================================================================
+// e -- 16-byte index entry (raw byte layout, no byteswap)
+//
+// Bytes [0..11]: key prefix (for comparison via memcmp)
+// Bytes [12..13]: offset (big-endian u16)
+// Bytes [14..15]: keynum (big-endian u16)
+// ============================================================================
 
 using e = std::array<uint64_t, 2>;
 
@@ -332,36 +361,36 @@ struct es {
     }
 };
 
+// cvt: raw memcpy (no byteswap)
 inline e cvt(const es& x) noexcept {
     e ret;
     std::memcpy(&ret, &x, 16);
-    if constexpr (std::endian::native == std::endian::little) {
-        ret[0] = std::byteswap(ret[0]);
-        ret[1] = std::byteswap(ret[1]);
-    }
     return ret;
 }
 
-inline e make_search_key(const uint8_t* k, uint32_t len) noexcept {
-    es s;
-    s.setkey(reinterpret_cast<const char*>(k), static_cast<int>(len));
-    s.setoff(0);
-    s.setkeynum(0);
-    return cvt(s);
+// Build search prefix: zero-padded E_KEY_PREFIX bytes for memcmp
+inline void make_search_pfx(uint8_t* out, const uint8_t* k, uint32_t len) noexcept {
+    std::memset(out, 0, E_KEY_PREFIX);
+    uint32_t copy = len < static_cast<uint32_t>(E_KEY_PREFIX) ? len
+                         : static_cast<uint32_t>(E_KEY_PREFIX);
+    std::memcpy(out, k, copy);
 }
 
-inline e e_prefix_only(e entry) noexcept {
-    constexpr int suffix_bits = (16 - E_KEY_PREFIX) * 8;  // 32
-    entry[1] &= ~((uint64_t(1) << suffix_bits) - 1);
-    return entry;
+// Compare first E_KEY_PREFIX bytes of an e entry against a search prefix
+inline int e_prefix_cmp(const e& entry, const uint8_t* search_pfx) noexcept {
+    return std::memcmp(&entry, search_pfx, E_KEY_PREFIX);
 }
 
+// Read big-endian u16 at byte E_KEY_PREFIX (offset field)
 inline uint16_t e_offset(const e& entry) noexcept {
-    return static_cast<uint16_t>((entry[1] >> 16) & 0xFFFF);
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&entry);
+    return (static_cast<uint16_t>(p[E_KEY_PREFIX]) << 8) | p[E_KEY_PREFIX + 1];
 }
 
+// Read big-endian u16 at byte E_KEY_PREFIX+2 (keynum field)
 inline uint16_t e_keynum(const e& entry) noexcept {
-    return static_cast<uint16_t>(entry[1] & 0xFFFF);
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&entry);
+    return (static_cast<uint16_t>(p[E_KEY_PREFIX + 2]) << 8) | p[E_KEY_PREFIX + 3];
 }
 
 static_assert(sizeof(e) == 16);
@@ -376,9 +405,6 @@ inline int calc_W(int ic) noexcept {
 }
 
 // Three-tier compact index layout
-// N <= 16:   no idx, no hot (linear scan keys)
-// 17-256:    idx only, no hot (spread positions)
-// N > 256:   idx + hot (stride 8, idx[0]->key[0])
 inline constexpr int compact_ic(uint16_t N) noexcept {
     if (N <= 16) return 0;
     if (N <= 256) return N / 16;
@@ -395,19 +421,36 @@ inline constexpr int idx_count(uint16_t N) noexcept {
 }
 
 inline constexpr std::size_t hot_off() noexcept { return 0; }
-
 inline std::size_t idx_off(int ec) noexcept { return (ec + 1) * 16; }
+inline std::size_t keys_off(uint16_t N, int ec) noexcept { return idx_off(ec) + idx_count(N) * 16; }
 
-inline std::size_t keys_off(uint16_t N, int ec) noexcept {
-    return idx_off(ec) + idx_count(N) * 16;
+// Compact index size from count + keys_bytes
+inline std::size_t compact_index_bytes(uint16_t count, uint16_t keys_bytes) noexcept {
+    if (count == 0 && keys_bytes == 0) return 0;
+    int IC = compact_ic(count);
+    int W  = compact_hot_count(count);
+    return align8(static_cast<size_t>(W) * 16 +
+                   static_cast<size_t>(IC) * 16 +
+                   keys_bytes);
 }
 
-inline std::size_t compact_index_size(uint16_t count, uint16_t keys_bytes) noexcept {
-    if (count == 0) return 0;
-    int ic = idx_count(count);
-    int W  = calc_W(ic);
-    int ec = W > 0 ? W - 1 : 0;
-    return align8(keys_off(count, ec) + keys_bytes);
+// Compute compact slots_off in u64 units
+inline uint16_t compute_compact_slots_off(uint8_t skip_len, uint16_t count,
+                                           uint16_t keys_bytes) noexcept {
+    size_t skip_aligned = skip_len > 0 ? ((skip_len + 7) & ~size_t(7)) : 0;
+    size_t idx_bytes = compact_index_bytes(count, keys_bytes);
+    return static_cast<uint16_t>((8 + skip_aligned + idx_bytes) / 8);
+}
+
+// Approximate keys_bytes from slots_off (overestimates by <=7 due to align8)
+inline uint16_t approx_keys_bytes(uint16_t slots_off_u64, uint8_t skip_len,
+                                   uint16_t count) noexcept {
+    size_t skip_aligned = skip_len > 0 ? ((skip_len + 7) & ~size_t(7)) : 0;
+    size_t index_total = static_cast<size_t>(slots_off_u64) * 8 - 8 - skip_aligned;
+    int IC = compact_ic(count);
+    int W  = compact_hot_count(count);
+    size_t overhead = static_cast<size_t>(W) * 16 + static_cast<size_t>(IC) * 16;
+    return static_cast<uint16_t>(index_total > overhead ? index_total - overhead : 0);
 }
 
 template <class T>
@@ -496,15 +539,39 @@ struct kstrie_memory {
     }
 };
 
+// ============================================================================
+// kstrie_skip
+//
+// match_skip_fast: read-path. memcmp, pass/fail.
+// match_prefix: write-path. byte-by-byte, returns match_len.
+// ============================================================================
+
 template <typename VALUE, typename CHARMAP, typename ALLOC>
 struct kstrie_skip {
     using hdr_type = node_header<VALUE, CHARMAP, ALLOC>;
+
     enum class match_status : uint8_t { MATCHED, MISMATCH, KEY_EXHAUSTED };
+
     struct match_result {
         match_status status;
         uint32_t     consumed;
         uint32_t     match_len;
     };
+
+    // Read-path: memcmp skip prefix
+    static bool match_skip_fast(const uint64_t* node, const hdr_type& h,
+                                const uint8_t* key, uint32_t key_len,
+                                uint32_t& consumed) noexcept {
+        uint32_t sb = h.skip_bytes();
+        if (sb == 0) return true;
+        if (key_len - consumed < sb) return false;
+        if (std::memcmp(hdr_type::get_skip(node), key + consumed, sb) != 0)
+            return false;
+        consumed += sb;
+        return true;
+    }
+
+    // Write-path: byte-by-byte with match_len
     static match_result match_prefix(const uint64_t*& node, hdr_type& h,
                                      const uint8_t* mapped_key,
                                      uint32_t key_len, uint32_t consumed) noexcept {
@@ -528,6 +595,7 @@ struct kstrie_skip {
         }
         return {match_status::MATCHED, consumed, 0};
     }
+
     static match_result match_prefix(uint64_t*& node, hdr_type& h,
                                      const uint8_t* mapped_key,
                                      uint32_t key_len, uint32_t consumed) noexcept {
@@ -536,6 +604,7 @@ struct kstrie_skip {
         node = const_cast<uint64_t*>(cnode);
         return r;
     }
+
     static uint32_t find_lcp(const uint8_t* a, uint32_t a_len,
                              const uint8_t* b, uint32_t b_len) noexcept {
         uint32_t max_cmp = std::min(a_len, b_len);
@@ -543,6 +612,7 @@ struct kstrie_skip {
         while (ml < max_cmp && a[ml] == b[ml]) ++ml;
         return ml;
     }
+
     static size_t size(hdr_type h) noexcept { return h.skip_size(); }
 };
 

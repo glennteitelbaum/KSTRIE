@@ -19,6 +19,12 @@ struct kstrie_bitmask {
         return BITMAP_BYTES;
     }
 
+    // Compute bitmask slots_off in u64 units
+    static uint16_t compute_slots_off(uint8_t skip_len) noexcept {
+        size_t skip_aligned = skip_len > 0 ? ((skip_len + 7) & ~size_t(7)) : 0;
+        return static_cast<uint16_t>((8 + skip_aligned + BITMAP_BYTES) / 8);
+    }
+
     static bitmap_type* get_bitmap(uint64_t* node, const hdr_type& h) noexcept {
         return reinterpret_cast<bitmap_type*>(h.get_index(node));
     }
@@ -52,21 +58,22 @@ struct kstrie_bitmask {
         return do_find_pop(bm->words, idx);
     }
 
+    // Read-path: find_child uses cached slots_off
     static uint64_t* find_child(const uint64_t* node, const hdr_type& h,
                                 uint8_t idx) noexcept {
         int slot = find_slot(node, h, idx);
-        const uint64_t* sb = h.get_slots(const_cast<uint64_t*>(node));
+        const uint64_t* sb = node + h.slots_off;
         return slots::load_child(sb, slot);
     }
 
     static uint64_t* eos_child(const uint64_t* node, const hdr_type& h) noexcept {
-        const uint64_t* sb = h.get_slots(const_cast<uint64_t*>(node));
+        const uint64_t* sb = node + h.slots_off;
         return slots::load_child(sb, h.count + 1);
     }
 
     static void set_eos_child(uint64_t* node, const hdr_type& h,
                               uint64_t* child) noexcept {
-        uint64_t* sb = h.get_slots(node);
+        uint64_t* sb = node + h.slots_off;
         slots::store_child(sb, h.count + 1, child);
     }
 
@@ -90,9 +97,9 @@ struct kstrie_bitmask {
         uint64_t* node = mem.alloc_node(nu);
         hdr_type& h = hdr_type::from_node(node);
         h.set_bitmask(true);
-        h.skip       = skip_len;
-        h.count      = 0;
-        h.keys_bytes = 0;
+        h.skip      = skip_len;
+        h.count     = 0;
+        h.slots_off = compute_slots_off(skip_len);
         if (skip_len > 0 && skip_data)
             std::memcpy(hdr_type::get_skip(node), skip_data, skip_len);
         init_slots(h.get_slots(node), 0);
@@ -108,9 +115,9 @@ struct kstrie_bitmask {
         uint64_t* node = mem.alloc_node(nu);
         hdr_type& h = hdr_type::from_node(node);
         h.set_bitmask(true);
-        h.skip       = skip_len;
-        h.count      = n_buckets;
-        h.keys_bytes = 0;
+        h.skip      = skip_len;
+        h.count     = n_buckets;
+        h.slots_off = compute_slots_off(skip_len);
         if (skip_len > 0 && skip_data)
             std::memcpy(hdr_type::get_skip(node), skip_data, skip_len);
         bitmap_type* bm = get_bitmap(node, h);
@@ -146,7 +153,8 @@ struct kstrie_bitmask {
         uint64_t* new_node = mem.alloc_node(new_nu);
         hdr_type& nh = hdr_type::from_node(new_node);
         nh.copy_from(h);
-        nh.count = new_count;
+        nh.count     = new_count;
+        nh.slots_off = compute_slots_off(h.skip);
         if (h.skip > 0)
             std::memcpy(hdr_type::get_skip(new_node),
                         hdr_type::get_skip(node), h.skip_bytes());
@@ -164,8 +172,6 @@ struct kstrie_bitmask {
         return new_node;
     }
 
-    // Re-create bitmask node with a different (shorter) skip prefix.
-    // Copies bitmap and all slots. Frees old node.
     static uint64_t* reskip(uint64_t* node, hdr_type& h, mem_type& mem,
                             uint8_t new_skip_len,
                             const uint8_t* new_skip_data) {
@@ -173,20 +179,15 @@ struct kstrie_bitmask {
         uint64_t* nn = mem.alloc_node(nu);
         hdr_type& nh = hdr_type::from_node(nn);
         nh.copy_from(h);
-        nh.skip = new_skip_len;
-
+        nh.skip      = new_skip_len;
+        nh.slots_off = compute_slots_off(new_skip_len);
         if (new_skip_len > 0 && new_skip_data)
             std::memcpy(hdr_type::get_skip(nn), new_skip_data, new_skip_len);
-
-        // Copy bitmap
         *get_bitmap(nn, nh) = *get_bitmap(node, h);
-
-        // Copy all slots (sentinel + children + eos_child)
         const uint64_t* old_sb = h.get_slots(node);
         uint64_t* new_sb = nh.get_slots(nn);
         slots::copy_slots(new_sb, 0, old_sb, 0,
                           static_cast<size_t>(h.count) + 2);
-
         mem.free_node(node);
         return nn;
     }
