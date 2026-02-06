@@ -14,10 +14,11 @@ class kstrie;
 //
 // Node layout:  [header 8B] [skip] [index] [slots]
 //
-// Index region (three-tier):
-//   Tier 1 (N<=16):  [keys]
-//   Tier 2 (17-256): [idx: IC*16] [keys]
-//   Tier 3 (>256):   [hot: W*16] [idx: IC*16] [keys]
+// Index region (IC = N/8, sentinel at idx[IC]):
+//   [hot: W*16] [idx: (IC+1)*16] [keys]
+//   W=0 for N<256. W=calc_W(IC) for N>=256.
+//   idx[0..IC-1] = stride entries at key(0), key(8), key(16)...
+//   idx[IC]      = sentinel (0xFF prefix, offset/keynum of last key)
 //
 // Slots region = [value_0] ... [value_{N-1}]
 // ============================================================================
@@ -46,11 +47,11 @@ struct kstrie_compact {
     static size_t index_size(const hdr_type& h) noexcept {
         uint16_t N = h.count;
         uint16_t kb = approx_keys_bytes(h.slots_off, h.skip, N);
-        if (N == 0 && kb == 0) return 0;
+        if (N == 0) [[unlikely]] return 0;
         int IC = compact_ic(N);
         int W  = compact_hot_count(N);
         return align8(static_cast<size_t>(W) * 16 +
-                       static_cast<size_t>(IC) * 16 + kb);
+                       static_cast<size_t>(IC + 1) * 16 + kb);
     }
 
     // ------------------------------------------------------------------
@@ -91,27 +92,32 @@ struct kstrie_compact {
                                 int end_key, const uint8_t* suffix,
                                 uint32_t suffix_len,
                                 uint32_t start_off) noexcept {
+        search_pos ret = {false, end_key};
         const uint8_t* kp = keys + start_off;
+        KSTRIE_ASSERT(end_key - start_key <= COMPACT_MAX_SCAN);
         for (int ki = start_key; ki < end_key; ++ki) {
             int cmp = key_cmp(kp, suffix, suffix_len);
-            if (cmp == 0) return {true, ki};
-            if (cmp > 0)  return {false, ki};
+            if (cmp >= 0) [[unlikely]] {
+                ret = {(cmp == 0), ki};
+                break;
+            }
             kp = key_next(kp);
         }
-        return {false, end_key};
+        return ret;
     }
 
     // ------------------------------------------------------------------
-    // search_in_index -- coalesced three-tier pipeline
+    // search_in_index -- unified pipeline with sentinel idx entry
     //
-    // 1. Scan hot (tier 3 only, skipped if W==0)
-    //    → narrows idx_start..idx_end
-    // 2. Scan idx (tier 2+3, skipped if IC==0)
-    //    → narrows scan_start_key, scan_start_off, scan_end_key
-    // 3. Scan keys (always)
-    //    → returns found/pos
+    // idx[0..IC-1] = stride entries, idx[IC] = sentinel (0xFF prefix).
+    // Sentinel guarantees idx scan loop termination for all N>0.
+    // No IC==0 branch. No idx_end. No scan_end_key.
     //
-    // Uses operator< on byteswapped e for all prefix comparisons.
+    // 1. Build search key (unconditional)
+    // 2. Hot traversal (N>=256 only): narrows idx_start
+    // 3. Idx scan: forward from idx_start until idx[g] > search
+    //    (sentinel fires for small N where IC=0)
+    // 4. Key scan: from scan_start_key to N
     // ------------------------------------------------------------------
 
     static search_pos search_in_index(const uint8_t* index, uint16_t N,
@@ -119,71 +125,42 @@ struct kstrie_compact {
                                       uint32_t suffix_len) noexcept {
         int IC = compact_ic(N);
         int W  = compact_hot_count(N);
-        const uint8_t* keys = keys_ptr(index, W, IC);
+        const e* idx = idx_ptr(index, W);
+        const uint8_t* keys = keys_ptr(index, W, IC + 1);
 
-        // Key scan bounds (default: full range)
+        e search = make_search_key(suffix, suffix_len);
+
         int scan_start_key = 0;
         uint32_t scan_start_off = 0;
-        int scan_end_key = N;
 
-        // Skip hot + idx for tier 1 (IC==0)
-        if (IC == 0)
-            goto do_scan;
+        int idx_start = 0;
 
-        {
-            e search = make_search_key(suffix, suffix_len);
+        // Hot traversal (N>=256 only)
+        if (W > 0) [[unlikely]] {
+            KSTRIE_ASSERT(W <= COMPACT_MAX_W);
+            const e* hot = hot_ptr(index);
+            int i = 1;
+            while (i < W) /* [[unpredictable]] */
+                i = 2 * i + (search >= hot[i] ? 1 : 0);
+            int group = i - W;
+            idx_start = group * IC / W;
 
-            const e* idx = idx_ptr(index, W);
-
-            int idx_start = 0;
-            int idx_end   = IC;
-
-            // Step 1: Scan hot (tier 3 only)
-            if (W > 0) {
-                const e* hot = hot_ptr(index);
-                int i = 1;
-                while (i < W)
-                    i = 2 * i + (search >= hot[i] ? 1 : 0);
-                int group = i - W;
-                idx_start = group * IC / W;
-                idx_end   = (group + 1) * IC / W;
-                if (idx_end > IC) idx_end = IC;
-
-                // Start from previous idx entry
-                if (idx_start > 0) {
-                    scan_start_key = static_cast<int>(e_keynum(idx[idx_start - 1]));
-                    scan_start_off = e_offset(idx[idx_start - 1]);
-                }
+            if (idx_start > 0) [[likely]] {
+                scan_start_key = static_cast<int>(e_keynum(idx[idx_start - 1]));
+                scan_start_off = e_offset(idx[idx_start - 1]);
             }
-
-            // Step 2: Scan idx entries
-            // search has 0xFFFF in offset+keynum, so any idx entry with
-            // same prefix compares <= search. idx[g] > search means
-            // prefix is strictly greater.
-            for (int g = idx_start; g < idx_end; ++g) {
-                if (idx[g] > search) {
-                    scan_end_key = static_cast<int>(e_keynum(idx[g]));
-                    goto do_scan;
-                }
-                scan_start_key = static_cast<int>(e_keynum(idx[g]));
-                scan_start_off = e_offset(idx[g]);
-            }
-
-            // Overflow: prefix may span the hot boundary (tier 3 only)
-            if (W > 0) {
-                for (int g = idx_end; g < IC; ++g) {
-                    if (idx[g] > search) {
-                        scan_end_key = static_cast<int>(e_keynum(idx[g]));
-                        goto do_scan;
-                    }
-                }
-            }
-            scan_end_key = N;
         }
 
-    do_scan:
-        // Step 3: Scan keys (always)
-        return scan_keys(keys, scan_start_key, scan_end_key,
+        // Idx scan — sentinel at idx[IC] guarantees termination
+        KSTRIE_ASSERT(IC <= COMPACT_MAX_IC);
+        for (int g = idx_start; ; ++g) {
+            if (idx[g] > search) [[unlikely]] break;
+            scan_start_key = static_cast<int>(e_keynum(idx[g]));
+            scan_start_off = e_offset(idx[g]);
+        }
+
+        // Key scan — terminates via cmp>=0 or ki==N
+        return scan_keys(keys, scan_start_key, N,
                          suffix, suffix_len, scan_start_off);
     }
 
@@ -194,13 +171,14 @@ struct kstrie_compact {
     static const VALUE* find(const uint64_t* node, const hdr_type& h,
                              const uint8_t* suffix,
                              uint32_t suffix_len) noexcept {
+        if (h.count == 0) [[unlikely]] return nullptr;
         const uint8_t* index = h.get_index(const_cast<uint64_t*>(node));
         auto [found, pos] = search_in_index(index, h.count, suffix, suffix_len);
-        if (!found) return nullptr;
+        if (!found) /* [[unpredictable]] */ return nullptr;
 
         // Cached slots access: node + slots_off
         const uint64_t* sb = node + h.slots_off;
-        return &slots::load_value(sb, pos);
+        return slots::load_value(sb, pos);
     }
 
     // ------------------------------------------------------------------
@@ -216,7 +194,7 @@ struct kstrie_compact {
         const uint8_t* index = h.get_index(const_cast<uint64_t*>(node));
         int IC = compact_ic(N);
         int W  = compact_hot_count(N);
-        const uint8_t* keys = keys_ptr(index, W, IC);
+        const uint8_t* keys = keys_ptr(index, W, IC + 1);
         const uint64_t* sb  = node + h.slots_off;
 
         const uint8_t* kp = keys;
@@ -264,7 +242,7 @@ struct kstrie_compact {
     }
 
     // ------------------------------------------------------------------
-    // write_index_and_slots (three-tier idx with backup rule)
+    // write_index_and_slots (sentinel idx entry at idx[IC])
     // ------------------------------------------------------------------
 
     static void write_index_and_slots(uint64_t* node, const hdr_type& h,
@@ -273,7 +251,7 @@ struct kstrie_compact {
         uint8_t* index = h.get_index(node);
         int IC = compact_ic(count);
         int W  = compact_hot_count(count);
-        uint8_t* key_dst = keys_ptr(index, W, IC);
+        uint8_t* key_dst = keys_ptr(index, W, IC + 1);
 
         // Write all keys sequentially, track byte offsets
         uint16_t stack_offsets[256];
@@ -291,17 +269,13 @@ struct kstrie_compact {
             key_off += 2 + entries[i].key_len;
         }
 
-        // Build idx entries (tier 2 and 3 only)
-        if (IC > 0) {
+        // Build idx entries: stride entries + sentinel
+        if (count > 0) {
             e* idx_arr = idx_ptr(index, W);
 
+            // Stride entries at key(0), key(8), key(16)...
             for (int i = 0; i < IC; ++i) {
-                int nom;
-                if (W > 0) {
-                    nom = i * 8;   // Tier 3: stride 8
-                } else {
-                    nom = (i + 1) * count / (IC + 1);   // Tier 2: spread
-                }
+                int nom = i * 8;
 
                 // Backup rule: walk back to first key with same e prefix
                 e nom_key = make_search_key(entries[nom].key, entries[nom].key_len);
@@ -311,7 +285,7 @@ struct kstrie_compact {
                 while (pos > min_pos) {
                     e prev_key = make_search_key(entries[pos - 1].key,
                                                   entries[pos - 1].key_len);
-                    if (e_prefix_only(prev_key) != nom_pfx) break;
+                    if (e_prefix_only(prev_key) != nom_pfx) [[likely]] break;
                     pos--;
                 }
 
@@ -323,7 +297,22 @@ struct kstrie_compact {
                 idx_arr[i] = cvt(s);
             }
 
-            if (W > 0) {
+            // Sentinel at idx[IC]:
+            //   prefix [0..11]: all 0xFF — guarantees idx[g] > search for
+            //     any search key, because search prefix is real key bytes
+            //     and 0xFF > any real byte. This terminates the idx scan loop.
+            //   offset [12..13]: offset of last key (write-path utility)
+            //   keynum [14..15]: count-1 (write-path utility)
+            // The offset/keynum are never reached during comparison because
+            // the 0xFF prefix dominates before those fields are compared.
+            es sentinel;
+            std::memcpy(sentinel.D.data(), SENTINEL_PREFIX, E_KEY_PREFIX);
+            sentinel.setoff(key_offsets[count - 1]);
+            sentinel.setkeynum(static_cast<uint16_t>(count - 1));
+            idx_arr[IC] = cvt(sentinel);
+
+            // Hot tree over stride entries only (not sentinel)
+            if (W > 0) [[unlikely]] {
                 e* hot = hot_ptr(index);
                 hot[0] = e{};
                 build_eyt(idx_arr, IC, hot);
@@ -339,17 +328,35 @@ struct kstrie_compact {
     }
 
     // ------------------------------------------------------------------
-    // finalize
+    // has_sentinel_collision -- check if last entry collides with
+    // sentinel prefix (E_KEY_PREFIX leading 0xFF bytes).
+    // Only last entry can collide since 0xFF sorts highest.
+    // ------------------------------------------------------------------
+
+    static bool has_sentinel_collision(const build_entry* entries,
+                                       uint16_t count) noexcept {
+        if (count == 0) [[unlikely]] return false;
+        const auto& last = entries[count - 1];
+        if (last.key_len < static_cast<uint32_t>(E_KEY_PREFIX)) [[likely]]
+            return false;
+        return std::memcmp(last.key, SENTINEL_PREFIX, E_KEY_PREFIX) == 0;
+    }
+
+    // ------------------------------------------------------------------
+    // finalize -- free old node, post-check constraints, split if needed
     // ------------------------------------------------------------------
 
     static insert_result finalize(uint64_t* old_node, uint64_t* new_node,
                                    uint32_t max_key_len,
+                                   const build_entry* entries,
+                                   uint16_t count,
                                    mem_type& mem) {
         mem.free_node(old_node);
         hdr_type& h = hdr_type::from_node(new_node);
         if (h.count > COMPACT_MAX ||
             h.alloc_u64 > COMPACT_MAX_ALLOC_U64 ||
-            max_key_len > COMPACT_MAX_KEY_LEN)
+            max_key_len > COMPACT_MAX_KEY_LEN ||
+            has_sentinel_collision(entries, count)) [[unlikely]]
             return split_node(new_node, h, mem);
         return {new_node, insert_outcome::INSERTED};
     }
@@ -363,15 +370,15 @@ struct kstrie_compact {
                                  const VALUE& value, uint32_t consumed,
                                  match_result mr, insert_mode mode,
                                  mem_type& mem) {
-        if (mr.status == match_status::MATCHED) {
+        if (mr.status == match_status::MATCHED) [[likely]] {
             uint32_t suffix_len = key_len - mr.consumed;
             const uint8_t* suffix = key_data + mr.consumed;
 
             const uint8_t* index = h.get_index(node);
             auto [found, pos] = search_in_index(index, h.count,
                                                  suffix, suffix_len);
-            if (found) {
-                if (mode == insert_mode::INSERT)
+            if (found) /* [[unpredictable]] */ {
+                if (mode == insert_mode::INSERT) [[likely]]
                     return {node, insert_outcome::FOUND};
                 uint64_t* sb = h.get_slots(node);
                 slots::destroy_value(sb, pos);
@@ -429,7 +436,7 @@ struct kstrie_compact {
         const uint8_t* index = h.get_index(node);
         int IC = compact_ic(h.count);
         int W  = compact_hot_count(h.count);
-        const uint8_t* keys = keys_ptr(index, W, IC);
+        const uint8_t* keys = keys_ptr(index, W, IC + 1);
         const uint64_t* sb  = node + h.slots_off;
 
         size_t buf_off = 0;
@@ -480,10 +487,14 @@ struct kstrie_compact {
                                           new_skip, skip_data,
                                           entries, new_count);
 
+        // finalize before freeing entries — collision check reads entries
+        insert_result ir = finalize(node, result, max_key_len,
+                                     entries, new_count, mem);
+
         if (entries != stack_entries) delete[] entries;
         if (key_buf != stack_keys)   delete[] key_buf;
 
-        return finalize(node, result, max_key_len, mem);
+        return ir;
     }
 
     // ------------------------------------------------------------------
@@ -507,8 +518,6 @@ struct kstrie_compact {
             eos_leaf = build_compact(mem, 0, nullptr, &eos_entry, 1);
             data_start = 1;
         }
-
-        uint16_t data_count = N - data_start;
 
         uint8_t  bucket_bytes[256];
         uint16_t bucket_start[256];
@@ -553,7 +562,7 @@ struct kstrie_compact {
 
             hdr_type& ch = hdr_type::from_node(children[b]);
             if (ch.count > COMPACT_MAX ||
-                ch.alloc_u64 > COMPACT_MAX_ALLOC_U64) {
+                ch.alloc_u64 > COMPACT_MAX_ALLOC_U64) [[unlikely]] {
                 auto sr = split_node(children[b], ch, mem);
                 children[b] = sr.node;
             }

@@ -14,6 +14,13 @@
 #include <utility>
 #include <vector>
 
+// Debug: assert checks condition. Release: [[assume]] informs optimizer.
+#ifdef KSTRIE_DEBUG
+  #define KSTRIE_ASSERT(cond) assert(cond)
+#else
+  #define KSTRIE_ASSERT(cond) [[assume(cond)]]
+#endif
+
 namespace gteitelbaum {
 
 template <typename ALLOC>
@@ -204,16 +211,24 @@ struct kstrie_slots {
         if constexpr (IS_INLINE) { base[index] = 0; std::memcpy(&base[index], &v, sizeof(VALUE)); }
         else { auto* p = new VALUE(v); std::memcpy(&base[index], &p, sizeof(p)); }
     }
-    static VALUE& load_value(uint64_t* base, size_t index) noexcept {
-        if constexpr (IS_INLINE) return *reinterpret_cast<VALUE*>(&base[index]);
-        else { VALUE* p; std::memcpy(&p, &base[index], sizeof(p)); return *p; }
+    static VALUE* load_value(uint64_t* base, size_t index) noexcept {
+        if constexpr (IS_INLINE) {
+            return reinterpret_cast<VALUE*>(&base[index]);
+        } else {
+            return reinterpret_cast<VALUE*>(base[index]);
+        }
     }
-    static const VALUE& load_value(const uint64_t* base, size_t index) noexcept {
-        if constexpr (IS_INLINE) return *reinterpret_cast<const VALUE*>(&base[index]);
-        else { VALUE* p; std::memcpy(&p, &base[index], sizeof(p)); return *p; }
+    static const VALUE* load_value(const uint64_t* base, size_t index) noexcept {
+        if constexpr (IS_INLINE) {
+            return reinterpret_cast<const VALUE*>(&base[index]);
+        } else {
+            return reinterpret_cast<const VALUE*>(base[index]);
+        }
     }
     static void destroy_value(uint64_t* base, size_t index) {
-        if constexpr (!IS_INLINE) { VALUE* p; std::memcpy(&p, &base[index], sizeof(p)); delete p; }
+        if constexpr (!IS_INLINE) {
+            delete reinterpret_cast<VALUE*>(base[index]);
+        }
     }
     static void destroy_values(uint64_t* base, size_t start, size_t count) {
         if constexpr (!IS_INLINE) { for (size_t i = 0; i < count; ++i) destroy_value(base, start + i); }
@@ -365,25 +380,40 @@ struct es {
 };
 
 // cvt: memcpy + byteswap for uint64 comparison via operator<
+// (write-path: builds idx entries from es struct)
 inline e cvt(const es& x) noexcept {
     e ret;
     std::memcpy(&ret, &x, 16);
     if constexpr (std::endian::native == std::endian::little) {
-        ret[0] = __builtin_bswap64(ret[0]);
-        ret[1] = __builtin_bswap64(ret[1]);
+        ret[0] = std::byteswap(ret[0]);
+        ret[1] = std::byteswap(ret[1]);
     }
     return ret;
 }
 
-// Build search key: zero-padded E_KEY_PREFIX bytes, offset=0xFFFF, keynum=0xFFFF
+// Read-path: self-contained search key construction.
+// Zero-padded E_KEY_PREFIX bytes, offset=0xFFFF, keynum=0xFFFF.
 // Max-padded tail means any idx entry with same prefix compares <= search,
 // so raw operator> gives correct "prefix is greater" without masking.
+// Inlined: memcpy + byteswap, no es/cvt indirection.
 inline e make_search_key(const uint8_t* k, uint32_t len) noexcept {
-    es s;
-    s.setkey(reinterpret_cast<const char*>(k), static_cast<int>(len));
-    s.setoff(0xFFFF);
-    s.setkeynum(0xFFFF);
-    return cvt(s);
+    alignas(16) uint8_t buf[16];
+    std::memset(buf, 0, 16);
+    uint32_t copy_len = (len < static_cast<uint32_t>(E_KEY_PREFIX))
+                        ? len : static_cast<uint32_t>(E_KEY_PREFIX);
+    std::memcpy(buf, k, copy_len);
+    buf[E_KEY_PREFIX]     = 0xFF;
+    buf[E_KEY_PREFIX + 1] = 0xFF;
+    buf[E_KEY_PREFIX + 2] = 0xFF;
+    buf[E_KEY_PREFIX + 3] = 0xFF;
+
+    e ret;
+    std::memcpy(&ret, buf, 16);
+    if constexpr (std::endian::native == std::endian::little) {
+        ret[0] = std::byteswap(ret[0]);
+        ret[1] = std::byteswap(ret[1]);
+    }
+    return ret;
 }
 
 // Zero out offset + keynum (write-path only, for prefix equality checks)
@@ -413,15 +443,20 @@ inline int calc_W(int ic) noexcept {
     return std::bit_ceil(static_cast<unsigned>((ic + 3) / 4));
 }
 
-// Three-tier compact index layout
+// ============================================================================
+// Compact index layout -- uniform IC with hot threshold
+//
+//   Tier 1 (N<=8):   [keys]                           IC=0, W=0
+//   Tier 2 (9-255):  [idx: IC*16] [keys]              IC=N/8, W=0
+//   Tier 3 (>=256):  [hot: W*16] [idx: IC*16] [keys]  IC=N/8, W=calc_W(IC)
+// ============================================================================
+
 inline constexpr int compact_ic(uint16_t N) noexcept {
-    if (N <= 16) return 0;
-    if (N <= 256) return N / 16;
     return N / 8;
 }
 
 inline constexpr int compact_hot_count(uint16_t N) noexcept {
-    if (N <= 256) return 0;
+    if (N < 256) [[likely]] return 0;
     return calc_W(compact_ic(N));
 }
 
@@ -433,13 +468,13 @@ inline constexpr std::size_t hot_off() noexcept { return 0; }
 inline std::size_t idx_off(int ec) noexcept { return (ec + 1) * 16; }
 inline std::size_t keys_off(uint16_t N, int ec) noexcept { return idx_off(ec) + idx_count(N) * 16; }
 
-// Compact index size from count + keys_bytes
+// Compact index size from count + keys_bytes (IC+1 entries: IC stride + 1 sentinel)
 inline std::size_t compact_index_bytes(uint16_t count, uint16_t keys_bytes) noexcept {
-    if (count == 0 && keys_bytes == 0) return 0;
+    if (count == 0) [[unlikely]] return 0;
     int IC = compact_ic(count);
     int W  = compact_hot_count(count);
     return align8(static_cast<size_t>(W) * 16 +
-                   static_cast<size_t>(IC) * 16 +
+                   static_cast<size_t>(IC + 1) * 16 +
                    keys_bytes);
 }
 
@@ -458,7 +493,7 @@ inline uint16_t approx_keys_bytes(uint16_t slots_off_u64, uint8_t skip_len,
     size_t index_total = static_cast<size_t>(slots_off_u64) * 8 - 8 - skip_aligned;
     int IC = compact_ic(count);
     int W  = compact_hot_count(count);
-    size_t overhead = static_cast<size_t>(W) * 16 + static_cast<size_t>(IC) * 16;
+    size_t overhead = static_cast<size_t>(W) * 16 + static_cast<size_t>(IC + 1) * 16;
     return static_cast<uint16_t>(index_total > overhead ? index_total - overhead : 0);
 }
 
@@ -512,6 +547,21 @@ inline constexpr uint32_t COMPACT_MAX           = 4096;
 inline constexpr size_t   COMPACT_MAX_ALLOC_U64  = 256 * 256;
 inline constexpr uint32_t COMPACT_MAX_KEY_LEN    = E_KEY_PREFIX;
 
+// Compile-time bounds for read-path assertions.
+// Max IC = COMPACT_MAX / 8 = 512.
+inline constexpr int      COMPACT_MAX_IC         = COMPACT_MAX / 8;
+inline constexpr int      COMPACT_MAX_W          = COMPACT_MAX_IC;
+// Stride per idx entry = 8 keys.  Backup rule can pull start back
+// by up to E_KEY_PREFIX positions.  Max scan window = stride + backup.
+inline constexpr int      COMPACT_MAX_SCAN       = 8 + E_KEY_PREFIX;
+
+// Sentinel prefix: all 0xFF. Used for idx sentinel construction and
+// collision detection. Any key suffix with E_KEY_PREFIX leading 0xFF
+// bytes collides with sentinel and must force a split.
+inline constexpr uint8_t SENTINEL_PREFIX[E_KEY_PREFIX] = {
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
+};
+
 enum class insert_mode : uint8_t { INSERT, UPDATE };
 enum class insert_outcome : uint8_t { INSERTED, UPDATED, FOUND };
 
@@ -540,10 +590,10 @@ struct kstrie_memory {
         return p;
     }
     void free_node(uint64_t* p) {
-        if (!p) return;
+        if (!p) [[unlikely]] return;
         uint16_t au;
         std::memcpy(&au, p, sizeof(au));
-        if (au == 0) return;
+        if (au == 0) [[unlikely]] return;
         std::allocator_traits<ALLOC>::deallocate(alloc_, p, au);
     }
 };
@@ -572,10 +622,10 @@ struct kstrie_skip {
                                 const uint8_t* key, uint32_t key_len,
                                 uint32_t& consumed) noexcept {
         uint32_t sb = h.skip_bytes();
-        if (sb == 0) return true;
-        if (key_len - consumed < sb) return false;
+        if (sb == 0) [[likely]] return true;
+        if (key_len - consumed < sb) [[unlikely]] return false;
         if (std::memcmp(hdr_type::get_skip(node), key + consumed, sb) != 0)
-            return false;
+            /* [[unpredictable]] */ return false;
         consumed += sb;
         return true;
     }
@@ -588,16 +638,18 @@ struct kstrie_skip {
             uint32_t sb = h.skip_bytes();
             uint32_t remaining = key_len - consumed;
             const uint8_t* prefix = hdr_type::get_skip(const_cast<uint64_t*>(node));
-            if (remaining < sb) {
+            if (remaining < sb) [[unlikely]] {
                 uint32_t ml = 0;
                 while (ml < remaining && mapped_key[consumed + ml] == prefix[ml]) ++ml;
-                return {ml < remaining ? match_status::MISMATCH : match_status::KEY_EXHAUSTED, consumed, ml};
+                return {ml < remaining ? match_status::MISMATCH
+                                       : match_status::KEY_EXHAUSTED, consumed, ml};
             }
             uint32_t ml = 0;
             while (ml < sb && mapped_key[consumed + ml] == prefix[ml]) ++ml;
-            if (ml < sb) return {match_status::MISMATCH, consumed, ml};
+            if (ml < sb) /* [[unpredictable]] */
+                return {match_status::MISMATCH, consumed, ml};
             consumed += sb;
-            if (!h.is_continuation()) break;
+            if (!h.is_continuation()) [[likely]] break;
             node = *reinterpret_cast<const uint64_t* const*>(
                 hdr_type::get_skip(const_cast<uint64_t*>(node)) + h.skip_bytes());
             h = hdr_type::from_node(node);

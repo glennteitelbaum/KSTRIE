@@ -90,49 +90,47 @@ private:
     }
 
     // ------------------------------------------------------------------
-    // find_impl -- read-path trie traversal
+    // find_inner -- hot loop for trie traversal
     //
-    // Uses match_skip_fast (memcmp) instead of match_prefix.
-    // Uses cached slots_off for all slot access.
-    // Sentinel: skip=0, count=0, is_compact()=true → returns nullptr.
+    // Skip mismatch → return nullptr directly (no ambiguous post-loop).
+    // is_compact() is the ONLY path to break.
+    // After loop: unconditional compact find.
+    // ------------------------------------------------------------------
+
+    const VALUE* find_inner(const uint8_t* mapped, uint32_t key_len) const noexcept {
+        const uint64_t* node = root_;
+        uint32_t consumed = 0;
+
+        hdr_type h{};
+        for (;;) {
+            h = hdr_type::from_node(node);
+
+            if (!skip_type::match_skip_fast(node, h, mapped, key_len, consumed))
+                [[unlikely]] return nullptr;
+
+            if (h.is_compact()) [[unlikely]]
+                break;
+
+            if (consumed == key_len) [[unlikely]] {
+                node = bitmask_type::eos_child(node, h);
+            } else {
+                node = bitmask_type::find_child(node, h, mapped[consumed++]);
+            }
+        }
+
+        return compact_type::find(node, h, mapped + consumed,
+                                   key_len - consumed);
+    }
+
+    // ------------------------------------------------------------------
+    // find_impl -- wrapper: mapping + heap ownership
     // ------------------------------------------------------------------
 
     const VALUE* find_impl(const uint8_t* key_data, uint32_t key_len) const noexcept {
         uint8_t stack_buf[256];
         auto [mapped, heap_buf] = get_mapped(key_data, key_len,
                                               stack_buf, sizeof(stack_buf));
-
-        const uint64_t* node = root_;
-        uint32_t consumed = 0;
-        const VALUE* result = nullptr;
-
-        for (;;) {
-            hdr_type h = hdr_type::from_node(node);
-
-            // memcmp skip matching
-            if (!skip_type::match_skip_fast(node, h, mapped, key_len, consumed))
-                break;
-
-            // Compact node → search within
-            if (h.is_compact()) {
-                result = compact_type::find(node, h, mapped + consumed,
-                                             key_len - consumed);
-                break;
-            }
-
-            // Bitmask: key exhausted → follow eos_child
-            if (consumed == key_len) {
-                node = bitmask_type::eos_child(node, h);
-                continue;
-            }
-
-            // Bitmap dispatch → consume one byte, follow child
-            {
-                uint8_t byte = mapped[consumed++];
-                node = bitmask_type::find_child(node, h, byte);
-            }
-        }
-
+        const VALUE* result = find_inner(mapped, key_len);
         delete[] heap_buf;
         return result;
     }
