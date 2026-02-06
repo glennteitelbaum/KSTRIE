@@ -49,14 +49,19 @@ struct kstrie_compact {
 
     // ------------------------------------------------------------------
     // Index size (called by node_header::index_size)
+    //
+    // Tier 1 (N<=16):  [keys]
+    // Tier 2 (17-256): [idx: IC*16] [keys]
+    // Tier 3 (>256):   [hot: W*16] [idx: IC*16] [keys]
     // ------------------------------------------------------------------
 
     static size_t index_size(const hdr_type& h) noexcept {
         uint16_t N = h.count;
         if (N == 0 && h.keys_bytes == 0) return 0;
-        int W = calc_W(N);
+        int IC = compact_ic(N);
+        int W  = compact_hot_count(N);
         return align8(static_cast<size_t>(W) * 16 +
-                       static_cast<size_t>(N) * 16 +
+                       static_cast<size_t>(IC) * 16 +
                        h.keys_bytes);
     }
 
@@ -67,7 +72,6 @@ struct kstrie_compact {
     static e* hot_ptr(uint8_t* index) noexcept {
         return reinterpret_cast<e*>(index);
     }
-
     static const e* hot_ptr(const uint8_t* index) noexcept {
         return reinterpret_cast<const e*>(index);
     }
@@ -75,21 +79,19 @@ struct kstrie_compact {
     static e* idx_ptr(uint8_t* index, int W) noexcept {
         return reinterpret_cast<e*>(index + W * 16);
     }
-
     static const e* idx_ptr(const uint8_t* index, int W) noexcept {
         return reinterpret_cast<const e*>(index + W * 16);
     }
 
-    static uint8_t* keys_ptr(uint8_t* index, int W, int N) noexcept {
-        return index + W * 16 + N * 16;
+    static uint8_t* keys_ptr(uint8_t* index, int W, int IC) noexcept {
+        return index + W * 16 + IC * 16;
     }
-
-    static const uint8_t* keys_ptr(const uint8_t* index, int W, int N) noexcept {
-        return index + W * 16 + N * 16;
+    static const uint8_t* keys_ptr(const uint8_t* index, int W, int IC) noexcept {
+        return index + W * 16 + IC * 16;
     }
 
     // ------------------------------------------------------------------
-    // Search
+    // scan_keys -- linear scan keys region
     // ------------------------------------------------------------------
 
     struct search_pos {
@@ -97,58 +99,94 @@ struct kstrie_compact {
         int  pos;
     };
 
+    static search_pos scan_keys(const uint8_t* keys, int start_key,
+                                int end_key, const uint8_t* suffix,
+                                uint32_t suffix_len,
+                                uint32_t start_off) noexcept {
+        const uint8_t* kp = keys + start_off;
+        for (int ki = start_key; ki < end_key; ++ki) {
+            int cmp = key_cmp(kp, suffix, suffix_len);
+            if (cmp == 0) return {true, ki};
+            if (cmp > 0)  return {false, ki};
+            kp = key_next(kp);
+        }
+        return {false, end_key};
+    }
+
+    // ------------------------------------------------------------------
+    // Search (three-tier)
+    // ------------------------------------------------------------------
+
     static search_pos search_in_index(const uint8_t* index, uint16_t N,
                                       const uint8_t* suffix,
                                       uint32_t suffix_len) noexcept {
-        int W = calc_W(N);
-        e search = make_search_key(suffix, suffix_len);
+        int IC = compact_ic(N);
+        int W  = compact_hot_count(N);
+        const uint8_t* keys = keys_ptr(index, W, IC);
 
-        int scan_start, scan_end;
+        // Tier 1: N <= 16, linear scan keys directly
+        if (IC == 0)
+            return scan_keys(keys, 0, N, suffix, suffix_len, 0);
+
+        const e* idx = idx_ptr(index, W);
+        e search_pfx = e_prefix_only(make_search_key(suffix, suffix_len));
+
+        int scan_start_key = 0;
+        uint32_t scan_start_off = 0;
+        int scan_end_key = N;
+
         if (W == 0) {
-            scan_start = 0;
-            scan_end   = N;
+            // Tier 2: linear scan idx entries
+            for (int g = 0; g < IC; ++g) {
+                if (e_prefix_only(idx[g]) > search_pfx) {
+                    scan_end_key = static_cast<int>(e_keynum(idx[g]));
+                    goto do_scan;
+                }
+                scan_start_key = static_cast<int>(e_keynum(idx[g]));
+                scan_start_off = e_offset(idx[g]);
+            }
         } else {
+            // Tier 3: Eytzinger hot -> idx range -> key range
             const e* hot = hot_ptr(index);
+            e search = make_search_key(suffix, suffix_len);
+
             int i = 1;
             while (i < W)
                 i = 2 * i + (search >= hot[i] ? 1 : 0);
             int group = i - W;
-            scan_start = group * static_cast<int>(N) / W;
-            scan_end   = (group + 1) * static_cast<int>(N) / W;
-            if (scan_end > N) scan_end = N;
-        }
+            int idx_start = group * IC / W;
+            int idx_end   = (group + 1) * IC / W;
+            if (idx_end > IC) idx_end = IC;
 
-        const e* idx    = idx_ptr(index, W);
-        const uint8_t* keys = keys_ptr(index, W, N);
-        e search_pfx = e_prefix_only(search);
-
-        for (int i = scan_start; i < scan_end; ++i) {
-            e entry_pfx = e_prefix_only(idx[i]);
-            if (entry_pfx < search_pfx) continue;
-            if (entry_pfx > search_pfx) return {false, i};
-
-            uint16_t off = e_offset(idx[i]);
-            int cmp = key_cmp(keys + off, suffix, suffix_len);
-            if (cmp == 0) return {true, i};
-            if (cmp > 0)  return {false, i};
-        }
-
-        if (W > 0 && scan_end < N) {
-            e next_pfx = e_prefix_only(idx[scan_end]);
-            if (next_pfx == search_pfx) {
-                for (int i = scan_end; i < N; ++i) {
-                    if (e_prefix_only(idx[i]) != search_pfx)
-                        return {false, i};
-                    uint16_t off = e_offset(idx[i]);
-                    int cmp = key_cmp(keys + off, suffix, suffix_len);
-                    if (cmp == 0) return {true, i};
-                    if (cmp > 0)  return {false, i};
-                }
-                return {false, N};
+            // Start from previous idx if available
+            if (idx_start > 0) {
+                scan_start_key = static_cast<int>(e_keynum(idx[idx_start - 1]));
+                scan_start_off = e_offset(idx[idx_start - 1]);
             }
+
+            // Narrow within idx range
+            for (int g = idx_start; g < idx_end; ++g) {
+                if (e_prefix_only(idx[g]) > search_pfx) {
+                    scan_end_key = static_cast<int>(e_keynum(idx[g]));
+                    goto do_scan;
+                }
+                scan_start_key = static_cast<int>(e_keynum(idx[g]));
+                scan_start_off = e_offset(idx[g]);
+            }
+
+            // Overflow: prefix may span the hot boundary
+            for (int g = idx_end; g < IC; ++g) {
+                if (e_prefix_only(idx[g]) > search_pfx) {
+                    scan_end_key = static_cast<int>(e_keynum(idx[g]));
+                    goto do_scan;
+                }
+            }
+            scan_end_key = N;
         }
 
-        return {false, scan_end};
+    do_scan:
+        return scan_keys(keys, scan_start_key, scan_end_key,
+                         suffix, suffix_len, scan_start_off);
     }
 
     // ------------------------------------------------------------------
@@ -167,7 +205,7 @@ struct kstrie_compact {
     }
 
     // ------------------------------------------------------------------
-    // collect_entries
+    // collect_entries (walk keys sequentially)
     // ------------------------------------------------------------------
 
     static uint16_t collect_entries(const uint64_t* node, const hdr_type& h,
@@ -177,22 +215,22 @@ struct kstrie_compact {
         if (N == 0) return 0;
 
         const uint8_t* index = h.get_index(const_cast<uint64_t*>(node));
-        int W = calc_W(N);
-        const e* idx          = idx_ptr(index, W);
-        const uint8_t* keys   = keys_ptr(index, W, N);
-        const uint64_t* sb    = h.get_slots(const_cast<uint64_t*>(node));
+        int IC = compact_ic(N);
+        int W  = compact_hot_count(N);
+        const uint8_t* keys = keys_ptr(index, W, IC);
+        const uint64_t* sb  = h.get_slots(const_cast<uint64_t*>(node));
 
+        const uint8_t* kp = keys;
         size_t buf_off = 0;
         for (uint16_t i = 0; i < N; ++i) {
-            uint16_t off  = e_offset(idx[i]);
-            uint16_t klen = read_u16(keys + off);
-            std::memcpy(key_buf + buf_off, keys + off + 2, klen);
+            uint16_t klen = read_u16(kp);
+            std::memcpy(key_buf + buf_off, kp + 2, klen);
             out[i].key      = key_buf + buf_off;
             out[i].key_len  = klen;
             out[i].raw_slot = sb[i];
             buf_off += klen;
+            kp += 2 + klen;
         }
-
         return N;
     }
 
@@ -231,42 +269,81 @@ struct kstrie_compact {
     }
 
     // ------------------------------------------------------------------
-    // write_index_and_slots
+    // write_index_and_slots (three-tier idx with backup rule)
     // ------------------------------------------------------------------
 
     static void write_index_and_slots(uint64_t* node, const hdr_type& h,
                                        const build_entry* entries,
                                        uint16_t count) noexcept {
-        if (count > 0) {
-            uint8_t* index = h.get_index(node);
-            int W = calc_W(count);
-            e* idx_arr       = idx_ptr(index, W);
-            uint8_t* key_dst = keys_ptr(index, W, count);
+        uint8_t* index = h.get_index(node);
+        int IC = compact_ic(count);
+        int W  = compact_hot_count(count);
+        uint8_t* key_dst = keys_ptr(index, W, IC);
 
-            uint16_t key_off = 0;
-            for (uint16_t i = 0; i < count; ++i) {
-                write_u16(key_dst + key_off,
-                          static_cast<uint16_t>(entries[i].key_len));
-                if (entries[i].key_len > 0)
-                    std::memcpy(key_dst + key_off + 2,
-                                entries[i].key, entries[i].key_len);
+        // Write all keys sequentially, track byte offsets
+        uint16_t stack_offsets[256];
+        uint16_t* key_offsets = (count <= 256)
+            ? stack_offsets : new uint16_t[count];
 
+        uint16_t key_off = 0;
+        for (uint16_t i = 0; i < count; ++i) {
+            key_offsets[i] = key_off;
+            write_u16(key_dst + key_off,
+                      static_cast<uint16_t>(entries[i].key_len));
+            if (entries[i].key_len > 0)
+                std::memcpy(key_dst + key_off + 2,
+                            entries[i].key, entries[i].key_len);
+            key_off += 2 + entries[i].key_len;
+        }
+
+        // Build idx entries (tier 2 and 3 only)
+        if (IC > 0) {
+            e* idx_arr = idx_ptr(index, W);
+
+            for (int i = 0; i < IC; ++i) {
+                // Compute nominal key position
+                int nom;
+                if (W > 0) {
+                    // Tier 3: stride 8, idx[0] -> key[0]
+                    nom = i * 8;
+                } else {
+                    // Tier 2: spread evenly
+                    nom = (i + 1) * count / (IC + 1);
+                }
+
+                // Backup rule: walk back to first key with same e prefix
+                e nom_pfx = e_prefix_only(
+                    make_search_key(entries[nom].key, entries[nom].key_len));
+                int min_pos = (i > 0) ? static_cast<int>(e_keynum(idx_arr[i - 1])) : 0;
+                int pos = nom;
+                while (pos > min_pos) {
+                    e prev_pfx = e_prefix_only(
+                        make_search_key(entries[pos - 1].key,
+                                        entries[pos - 1].key_len));
+                    if (prev_pfx != nom_pfx) break;
+                    pos--;
+                }
+
+                // Build e entry: key prefix + byte offset + key number
                 es s;
-                s.setkey(reinterpret_cast<const char*>(entries[i].key),
-                         static_cast<int>(entries[i].key_len));
-                s.setoff(key_off);
+                s.setkey(reinterpret_cast<const char*>(entries[pos].key),
+                         static_cast<int>(entries[pos].key_len));
+                s.setoff(key_offsets[pos]);
+                s.setkeynum(static_cast<uint16_t>(pos));
                 idx_arr[i] = cvt(s);
-
-                key_off += 2 + entries[i].key_len;
             }
 
+            // Build hot (tier 3 only)
             if (W > 0) {
                 e* hot = hot_ptr(index);
                 hot[0] = e{};
-                build_eyt(idx_arr, count, hot);
+                build_eyt(idx_arr, IC, hot);
             }
         }
 
+        if (key_offsets != stack_offsets) delete[] key_offsets;
+
+        // Write slots
         uint64_t* sb = h.get_slots(node);
         for (uint16_t i = 0; i < count; ++i)
             sb[i] = entries[i].raw_slot;
@@ -362,22 +439,22 @@ struct kstrie_compact {
                                 : new build_entry[new_count];
 
         const uint8_t* index = h.get_index(node);
-        int W = calc_W(h.count);
-        const e* idx_arr    = idx_ptr(index, W);
-        const uint8_t* keys = keys_ptr(index, W, h.count);
+        int IC = compact_ic(h.count);
+        int W  = compact_hot_count(h.count);
+        const uint8_t* keys = keys_ptr(index, W, IC);
         const uint64_t* sb  = h.get_slots(node);
 
         size_t buf_off = 0;
         uint16_t ei = 0;
         uint32_t max_key_len = new_suffix_len;
+        const uint8_t* kp = keys;
 
         for (uint16_t i = 0; i < h.count; ++i) {
-            uint16_t off  = e_offset(idx_arr[i]);
-            uint16_t klen = read_u16(keys + off);
+            uint16_t klen = read_u16(kp);
 
             uint8_t* dst = key_buf + buf_off;
             if (tail > 0) std::memcpy(dst, prepend, tail);
-            std::memcpy(dst + tail, keys + off + 2, klen);
+            std::memcpy(dst + tail, kp + 2, klen);
 
             uint32_t entry_len = klen + tail;
             entries[ei].key      = dst;
@@ -386,6 +463,7 @@ struct kstrie_compact {
             if (entry_len > max_key_len) max_key_len = entry_len;
             buf_off += entry_len;
             ei++;
+            kp += 2 + klen;
         }
 
         uint64_t new_raw = 0;
