@@ -164,6 +164,33 @@ struct kstrie_bitmask {
         return new_node;
     }
 
+    // Re-create bitmask node with a different (shorter) skip prefix.
+    // Copies bitmap and all slots. Frees old node.
+    static uint64_t* reskip(uint64_t* node, hdr_type& h, mem_type& mem,
+                            uint8_t new_skip_len,
+                            const uint8_t* new_skip_data) {
+        size_t nu = needed_u64(new_skip_len, h.count);
+        uint64_t* nn = mem.alloc_node(nu);
+        hdr_type& nh = hdr_type::from_node(nn);
+        nh.copy_from(h);
+        nh.skip = new_skip_len;
+
+        if (new_skip_len > 0 && new_skip_data)
+            std::memcpy(hdr_type::get_skip(nn), new_skip_data, new_skip_len);
+
+        // Copy bitmap
+        *get_bitmap(nn, nh) = *get_bitmap(node, h);
+
+        // Copy all slots (sentinel + children + eos_child)
+        const uint64_t* old_sb = h.get_slots(node);
+        uint64_t* new_sb = nh.get_slots(nn);
+        slots::copy_slots(new_sb, 0, old_sb, 0,
+                          static_cast<size_t>(h.count) + 2);
+
+        mem.free_node(node);
+        return nn;
+    }
+
     static void replace_child(uint64_t* node, const hdr_type& h,
                               uint8_t idx, uint64_t* new_child) noexcept {
         int slot = find_slot(node, h, idx);

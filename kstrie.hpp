@@ -315,7 +315,81 @@ public:
             return compact_type::insert(node, h, key_data, key_len,
                                          value, consumed, mr, mode, mem_);
 
-        // Bitmask: only MATCHED reaches here
+        // Bitmask: handle skip mismatch / key exhausted during skip
+        if (mr.status == skip_type::match_status::MISMATCH) {
+            // Skip prefix diverges at mr.match_len bytes into the skip.
+            const uint8_t* skip_data = hdr_type::get_skip(node);
+            uint32_t old_skip = h.skip_bytes();
+            uint32_t match_len = mr.match_len;
+
+            // Copy skip data before reskip frees the node
+            uint8_t skip_copy[256];
+            std::memcpy(skip_copy, skip_data, old_skip);
+
+            uint8_t old_byte = skip_copy[match_len];
+            uint8_t new_byte = key_data[consumed + match_len];
+
+            // Shorten old node's skip: remove common prefix + 1 divergence byte
+            uint32_t new_old_skip = old_skip - match_len - 1;
+            uint64_t* old_reskipped = bitmask_type::reskip(
+                node, h, mem_, static_cast<uint8_t>(new_old_skip),
+                skip_copy + match_len + 1);
+
+            // Create compact leaf for the new key
+            uint32_t new_consumed = consumed + match_len + 1;
+            uint64_t* leaf = add_child(key_data + new_consumed,
+                                       key_len - new_consumed, value);
+
+            // Build parent bitmask with common prefix (must be sorted by byte)
+            uint8_t bucket_idx[2];
+            uint64_t* children[2];
+            if (old_byte < new_byte) {
+                bucket_idx[0] = old_byte;  bucket_idx[1] = new_byte;
+                children[0] = old_reskipped; children[1] = leaf;
+            } else {
+                bucket_idx[0] = new_byte;  bucket_idx[1] = old_byte;
+                children[0] = leaf;        children[1] = old_reskipped;
+            }
+            uint64_t* parent = bitmask_type::create_with_children(
+                mem_, static_cast<uint8_t>(match_len), skip_copy,
+                bucket_idx, children, 2);
+
+            return {parent, insert_outcome::INSERTED};
+        }
+
+        if (mr.status == skip_type::match_status::KEY_EXHAUSTED) {
+            const uint8_t* skip_data = hdr_type::get_skip(node);
+            uint32_t old_skip = h.skip_bytes();
+            uint32_t match_len = mr.match_len;
+
+            // Copy skip data before reskip frees the node
+            uint8_t skip_copy[256];
+            std::memcpy(skip_copy, skip_data, old_skip);
+
+            uint8_t old_byte = skip_copy[match_len];
+
+            uint32_t new_old_skip = old_skip - match_len - 1;
+            uint64_t* old_reskipped = bitmask_type::reskip(
+                node, h, mem_, static_cast<uint8_t>(new_old_skip),
+                skip_copy + match_len + 1);
+
+            // Create eos leaf
+            uint64_t* eos_leaf = add_child(key_data + key_len, 0, value);
+
+            // Build parent with one child + eos
+            uint8_t bucket_idx[1] = {old_byte};
+            uint64_t* children[1] = {old_reskipped};
+            uint64_t* parent = bitmask_type::create_with_children(
+                mem_, static_cast<uint8_t>(match_len), skip_copy,
+                bucket_idx, children, 1);
+
+            // Set eos_child on parent
+            hdr_type& ph = hdr_type::from_node(parent);
+            bitmask_type::set_eos_child(parent, ph, eos_leaf);
+
+            return {parent, insert_outcome::INSERTED};
+        }
+
         consumed = mr.consumed;
 
         // Key exhausted → follow eos_child
