@@ -349,152 +349,26 @@ inline uint64_t* sentinel_ptr() noexcept {
 }
 
 // ============================================================================
-// e -- 16-byte comparable key (byteswapped for uint64 operator< comparison)
-//
-// Bytes [0..11]: key prefix (12 bytes)
-// Bytes [12..13]: offset (big-endian u16)
-// Bytes [14..15]: keynum (big-endian u16)
-//
-// After byteswap, operator< on array<uint64_t,2> gives correct
-// lexicographic ordering on key prefix bytes.
+// Layout helpers
 // ============================================================================
-
-using e = std::array<uint64_t, 2>;
-
-inline constexpr int E_KEY_PREFIX = 12;
-
-struct es {
-    std::array<char, 16> D;
-    void setkey(const char* k, int len) noexcept {
-        std::memset(D.data(), 0, 16);
-        std::memcpy(D.data(), k, std::min(len, E_KEY_PREFIX));
-    }
-    void setoff(uint16_t off) noexcept {
-        D[E_KEY_PREFIX]     = static_cast<char>(off >> 8);
-        D[E_KEY_PREFIX + 1] = static_cast<char>(off & 0xFF);
-    }
-    void setkeynum(uint16_t kn) noexcept {
-        D[E_KEY_PREFIX + 2] = static_cast<char>(kn >> 8);
-        D[E_KEY_PREFIX + 3] = static_cast<char>(kn & 0xFF);
-    }
-};
-
-// cvt: memcpy + byteswap for uint64 comparison via operator<
-// (write-path: builds idx entries from es struct)
-inline e cvt(const es& x) noexcept {
-    e ret;
-    std::memcpy(&ret, &x, 16);
-    if constexpr (std::endian::native == std::endian::little) {
-        ret[0] = std::byteswap(ret[0]);
-        ret[1] = std::byteswap(ret[1]);
-    }
-    return ret;
-}
-
-// Read-path: self-contained search key construction.
-// Zero-padded E_KEY_PREFIX bytes, offset=0xFFFF, keynum=0xFFFF.
-// Max-padded tail means any idx entry with same prefix compares <= search,
-// so raw operator> gives correct "prefix is greater" without masking.
-// Inlined: memcpy + byteswap, no es/cvt indirection.
-inline e make_search_key(const uint8_t* k, uint32_t len) noexcept {
-    alignas(16) uint8_t buf[16];
-    std::memset(buf, 0, 16);
-    uint32_t copy_len = (len < static_cast<uint32_t>(E_KEY_PREFIX))
-                        ? len : static_cast<uint32_t>(E_KEY_PREFIX);
-    std::memcpy(buf, k, copy_len);
-    buf[E_KEY_PREFIX]     = 0xFF;
-    buf[E_KEY_PREFIX + 1] = 0xFF;
-    buf[E_KEY_PREFIX + 2] = 0xFF;
-    buf[E_KEY_PREFIX + 3] = 0xFF;
-
-    e ret;
-    std::memcpy(&ret, buf, 16);
-    if constexpr (std::endian::native == std::endian::little) {
-        ret[0] = std::byteswap(ret[0]);
-        ret[1] = std::byteswap(ret[1]);
-    }
-    return ret;
-}
-
-// Zero out offset + keynum (write-path only, for prefix equality checks)
-inline e e_prefix_only(e entry) noexcept {
-    entry[1] &= ~uint64_t(0xFFFFFFFF);
-    return entry;
-}
-
-// Read offset: bits [31..16] of entry[1] after byteswap
-inline uint16_t e_offset(const e& entry) noexcept {
-    return static_cast<uint16_t>((entry[1] >> 16) & 0xFFFF);
-}
-
-// Read keynum: bits [15..0] of entry[1] after byteswap
-inline uint16_t e_keynum(const e& entry) noexcept {
-    return static_cast<uint16_t>(entry[1] & 0xFFFF);
-}
-
-static_assert(sizeof(e) == 16);
 
 inline constexpr std::size_t align8(std::size_t n) noexcept {
     return (n + 7) & ~std::size_t(7);
 }
 
-inline int calc_W(int ic) noexcept {
-    if (ic <= 4) return 0;
-    return std::bit_ceil(static_cast<unsigned>((ic + 3) / 4));
-}
-
-// ============================================================================
-// Compact index layout -- uniform IC with hot threshold
-//
-//   Tier 1 (N<=8):   [keys]                           IC=0, W=0
-//   Tier 2 (9-255):  [idx: IC*16] [keys]              IC=N/8, W=0
-//   Tier 3 (>=256):  [hot: W*16] [idx: IC*16] [keys]  IC=N/8, W=calc_W(IC)
-// ============================================================================
-
-inline constexpr int compact_ic(uint16_t N) noexcept {
-    return N / 8;
-}
-
-inline constexpr int compact_hot_count(uint16_t N) noexcept {
-    if (N < 256) [[likely]] return 0;
-    return calc_W(compact_ic(N));
-}
-
-inline constexpr int idx_count(uint16_t N) noexcept {
-    return N > 0 ? (N + 7) / 8 : 0;
-}
-
-inline constexpr std::size_t hot_off() noexcept { return 0; }
-inline std::size_t idx_off(int ec) noexcept { return (ec + 1) * 16; }
-inline std::size_t keys_off(uint16_t N, int ec) noexcept { return idx_off(ec) + idx_count(N) * 16; }
-
-// Compact index size from count + keys_bytes (IC+1 entries: IC stride + 1 sentinel)
-inline std::size_t compact_index_bytes(uint16_t count, uint16_t keys_bytes) noexcept {
-    if (count == 0) [[unlikely]] return 0;
-    int IC = compact_ic(count);
-    int W  = compact_hot_count(count);
-    return align8(static_cast<size_t>(W) * 16 +
-                   static_cast<size_t>(IC + 1) * 16 +
-                   keys_bytes);
-}
-
-// Compute compact slots_off in u64 units
-inline uint16_t compute_compact_slots_off(uint8_t skip_len, uint16_t count,
+// Compute compact slots_off in u64 units.
+// Layout: [header 8B] [skip] [keys] [slots]
+inline uint16_t compute_compact_slots_off(uint8_t skip_len,
                                            uint16_t keys_bytes) noexcept {
     size_t skip_aligned = skip_len > 0 ? ((skip_len + 7) & ~size_t(7)) : 0;
-    size_t idx_bytes = compact_index_bytes(count, keys_bytes);
-    return static_cast<uint16_t>((8 + skip_aligned + idx_bytes) / 8);
+    return static_cast<uint16_t>((8 + skip_aligned + align8(keys_bytes)) / 8);
 }
 
-// Approximate keys_bytes from slots_off (overestimates by <=7 due to align8)
-inline uint16_t approx_keys_bytes(uint16_t slots_off_u64, uint8_t skip_len,
-                                   uint16_t count) noexcept {
+// Recover approximate keys_bytes from slots_off (overestimates by <=7 due to align8)
+inline uint16_t approx_keys_bytes(uint16_t slots_off_u64, uint8_t skip_len) noexcept {
     size_t skip_aligned = skip_len > 0 ? ((skip_len + 7) & ~size_t(7)) : 0;
-    size_t index_total = static_cast<size_t>(slots_off_u64) * 8 - 8 - skip_aligned;
-    int IC = compact_ic(count);
-    int W  = compact_hot_count(count);
-    size_t overhead = static_cast<size_t>(W) * 16 + static_cast<size_t>(IC + 1) * 16;
-    return static_cast<uint16_t>(index_total > overhead ? index_total - overhead : 0);
+    size_t total = static_cast<size_t>(slots_off_u64) * 8;
+    return static_cast<uint16_t>(total - 8 - skip_aligned);
 }
 
 template <class T>
@@ -523,44 +397,7 @@ inline const uint8_t* key_next(const uint8_t* kp) noexcept {
     return kp + 2 + read_u16(kp);
 }
 
-inline void build_eyt_rec(const e* b, int n, e* hot, int i, int& k) noexcept {
-    if (i > n) return;
-    build_eyt_rec(b, n, hot, 2 * i, k);
-    hot[i] = b[k++];
-    build_eyt_rec(b, n, hot, 2 * i + 1, k);
-}
-
-inline int build_eyt(const e* idx, int ic, e* hot) noexcept {
-    int W = calc_W(ic);
-    if (W == 0) return 0;
-    int ec = W - 1;
-    e stack_buf[128];
-    e* boundaries = (ec <= 128) ? stack_buf : new e[ec];
-    for (int i = 0; i < ec; ++i) boundaries[i] = idx[(i + 1) * ic / W];
-    int k = 0;
-    build_eyt_rec(boundaries, ec, hot, 1, k);
-    if (boundaries != stack_buf) delete[] boundaries;
-    return ec;
-}
-
-inline constexpr uint32_t COMPACT_MAX           = 4096;
-inline constexpr size_t   COMPACT_MAX_ALLOC_U64  = 256 * 256;
-inline constexpr uint32_t COMPACT_MAX_KEY_LEN    = E_KEY_PREFIX;
-
-// Compile-time bounds for read-path assertions.
-// Max IC = COMPACT_MAX / 8 = 512.
-inline constexpr int      COMPACT_MAX_IC         = COMPACT_MAX / 8;
-inline constexpr int      COMPACT_MAX_W          = COMPACT_MAX_IC;
-// Stride per idx entry = 8 keys.  Backup rule can pull start back
-// by up to E_KEY_PREFIX positions.  Max scan window = stride + backup.
-inline constexpr int      COMPACT_MAX_SCAN       = 8 + E_KEY_PREFIX;
-
-// Sentinel prefix: all 0xFF. Used for idx sentinel construction and
-// collision detection. Any key suffix with E_KEY_PREFIX leading 0xFF
-// bytes collides with sentinel and must force a split.
-inline constexpr uint8_t SENTINEL_PREFIX[E_KEY_PREFIX] = {
-    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
-};
+inline constexpr uint32_t COMPACT_MAX           = 32;
 
 enum class insert_mode : uint8_t { INSERT, UPDATE };
 enum class insert_outcome : uint8_t { INSERTED, UPDATED, FOUND };
