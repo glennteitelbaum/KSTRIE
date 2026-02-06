@@ -132,7 +132,6 @@ struct kstrie_compact {
 
         {
             e search = make_search_key(suffix, suffix_len);
-            e search_pfx = e_prefix_only(search);
 
             const e* idx = idx_ptr(index, W);
 
@@ -158,8 +157,11 @@ struct kstrie_compact {
             }
 
             // Step 2: Scan idx entries
+            // search has 0xFFFF in offset+keynum, so any idx entry with
+            // same prefix compares <= search. idx[g] > search means
+            // prefix is strictly greater.
             for (int g = idx_start; g < idx_end; ++g) {
-                if (e_prefix_only(idx[g]) > search_pfx) {
+                if (idx[g] > search) {
                     scan_end_key = static_cast<int>(e_keynum(idx[g]));
                     goto do_scan;
                 }
@@ -170,7 +172,7 @@ struct kstrie_compact {
             // Overflow: prefix may span the hot boundary (tier 3 only)
             if (W > 0) {
                 for (int g = idx_end; g < IC; ++g) {
-                    if (e_prefix_only(idx[g]) > search_pfx) {
+                    if (idx[g] > search) {
                         scan_end_key = static_cast<int>(e_keynum(idx[g]));
                         goto do_scan;
                     }

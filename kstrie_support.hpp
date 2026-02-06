@@ -375,16 +375,18 @@ inline e cvt(const es& x) noexcept {
     return ret;
 }
 
-// Build search key: zero-padded E_KEY_PREFIX bytes, offset=0, keynum=0
+// Build search key: zero-padded E_KEY_PREFIX bytes, offset=0xFFFF, keynum=0xFFFF
+// Max-padded tail means any idx entry with same prefix compares <= search,
+// so raw operator> gives correct "prefix is greater" without masking.
 inline e make_search_key(const uint8_t* k, uint32_t len) noexcept {
     es s;
     s.setkey(reinterpret_cast<const char*>(k), static_cast<int>(len));
-    s.setoff(0);
-    s.setkeynum(0);
+    s.setoff(0xFFFF);
+    s.setkeynum(0xFFFF);
     return cvt(s);
 }
 
-// Zero out offset + keynum (bottom 32 bits of ret[1] after byteswap)
+// Zero out offset + keynum (write-path only, for prefix equality checks)
 inline e e_prefix_only(e entry) noexcept {
     entry[1] &= ~uint64_t(0xFFFFFFFF);
     return entry;
