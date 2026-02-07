@@ -101,6 +101,19 @@ struct bitmap_n {
             masked = words[w];
         }
     }
+
+    [[nodiscard]] int find_prev_set(int start) const noexcept {
+        constexpr int MAX_BITS = WORDS * 64;
+        if (start < 0) return -1;
+        if (start >= MAX_BITS) start = MAX_BITS - 1;
+        int w = start >> 6;
+        uint64_t masked = words[w] & (~uint64_t(0) >> (63 - (start & 63)));
+        while (true) {
+            if (masked) return w * 64 + 63 - std::countl_zero(masked);
+            if (--w < 0) return -1;
+            masked = words[w];
+        }
+    }
 };
 
 using bitmap_256 = bitmap_n<4>;
