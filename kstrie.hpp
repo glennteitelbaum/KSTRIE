@@ -523,8 +523,15 @@ private:
 
         erase_info r = erase_node(child, key, key_len, consumed);
 
-        if (r.status != erase_status::PENDING)
+        if (r.status == erase_status::MISSING)
             return r;
+
+        if (r.status == erase_status::DONE) {
+            // Child handled it. Update our pointer if it changed.
+            if (r.leaf != child)
+                bitmask_type::replace_child(node, h, byte, r.leaf);
+            return {0, erase_status::DONE, node, 0};
+        }
 
         // PENDING from child. Count total at this level.
         uint32_t total = r.desc;
@@ -694,7 +701,22 @@ public:
     };
 
     uint64_t* add_children(const child_entry* entries, size_t count) {
-        return compact_type::create_from_entries(entries, count, mem_);
+        if (count == 0)
+            return mem_.alloc_node(1);
+
+        using be = typename compact_type::build_entry;
+        be* arr = new be[count];
+        for (size_t i = 0; i < count; ++i) {
+            uint64_t raw = 0;
+            slots_type::store_value(&raw, 0, *entries[i].value);
+            arr[i].key      = entries[i].suffix;
+            arr[i].key_len  = entries[i].suffix_len;
+            arr[i].raw_slot = raw;
+        }
+        uint64_t* node = compact_type::build_compact(
+            mem_, 0, nullptr, arr, static_cast<uint16_t>(count));
+        delete[] arr;
+        return node;
     }
 
     mem_type& memory() noexcept { return mem_; }

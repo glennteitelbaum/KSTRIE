@@ -6,9 +6,6 @@ namespace gteitelbaum {
 template <typename VALUE, typename CHARMAP, typename ALLOC>
 struct kstrie_bitmask;
 
-template <typename VALUE, typename CHARMAP, typename ALLOC>
-class kstrie;
-
 // ============================================================================
 // kstrie_compact -- compact (leaf) node operations
 //
@@ -39,7 +36,6 @@ struct kstrie_compact {
     using mem_type     = kstrie_memory<ALLOC>;
     using skip_type    = kstrie_skip<VALUE, CHARMAP, ALLOC>;
     using bitmask_ops  = kstrie_bitmask<VALUE, CHARMAP, ALLOC>;
-    using trie_type    = kstrie<VALUE, CHARMAP, ALLOC>;
     using match_result = typename skip_type::match_result;
     using match_status = typename skip_type::match_status;
 
@@ -412,91 +408,6 @@ struct kstrie_compact {
         delete[] key_buf;
 
         return {parent, insert_outcome::INSERTED};
-    }
-
-    // ------------------------------------------------------------------
-    // create_from_entries -- bulk build from child_entry array
-    // ------------------------------------------------------------------
-
-    static uint64_t* create_from_entries(
-            const typename trie_type::child_entry* entries,
-            size_t count, mem_type& mem) {
-        if (count == 0)
-            return mem.alloc_node(1);
-
-        build_entry* be = new build_entry[count];
-        for (size_t i = 0; i < count; ++i) {
-            uint64_t raw = 0;
-            slots::store_value(&raw, 0, *entries[i].value);
-            be[i].key      = entries[i].suffix;
-            be[i].key_len  = entries[i].suffix_len;
-            be[i].raw_slot = raw;
-        }
-
-        uint64_t* node = build_compact(mem, 0, nullptr,
-                                         be, static_cast<uint16_t>(count));
-        delete[] be;
-        return node;
-    }
-
-    // ------------------------------------------------------------------
-    // erase -- remove entry from compact node
-    //
-    // Returns sentinel if node becomes empty.
-    // Rebuilds compact without the erased entry.
-    // ------------------------------------------------------------------
-
-    static erase_result erase(uint64_t* node, hdr_type& h,
-                              const uint8_t* suffix, uint32_t suffix_len,
-                              mem_type& mem) {
-        const uint8_t* keys = keys_ptr(node, h);
-        auto [found, pos] = search(keys, h.count, suffix, suffix_len);
-        if (!found) return {node, false};
-
-        uint64_t* sb = h.get_slots(node);
-        slots::destroy_value(sb, pos);
-
-        if (h.count == 1) {
-            mem.free_node(node);
-            return {sentinel_ptr(), true};
-        }
-
-        uint16_t new_count = h.count - 1;
-
-        build_entry stack_entries[33];
-        build_entry* entries = (new_count <= 33)
-            ? stack_entries : new build_entry[new_count];
-
-        uint16_t approx_kb = approx_keys_bytes(h.slots_off, h.skip);
-        uint8_t stack_keys[4096];
-        uint8_t* key_buf = (approx_kb <= sizeof(stack_keys))
-            ? stack_keys : new uint8_t[approx_kb];
-
-        const uint8_t* kp = keys;
-        size_t buf_off = 0;
-        uint16_t ei = 0;
-        for (uint16_t i = 0; i < h.count; ++i) {
-            uint16_t klen = read_u16(kp);
-            if (i != static_cast<uint16_t>(pos)) {
-                std::memcpy(key_buf + buf_off, kp + 2, klen);
-                entries[ei].key      = key_buf + buf_off;
-                entries[ei].key_len  = klen;
-                entries[ei].raw_slot = sb[i];
-                buf_off += klen;
-                ei++;
-            }
-            kp += 2 + klen;
-        }
-
-        uint64_t* result = build_compact(mem, h.skip,
-                                          hdr_type::get_skip(node),
-                                          entries, new_count);
-        mem.free_node(node);
-
-        if (entries != stack_entries) delete[] entries;
-        if (key_buf != stack_keys)   delete[] key_buf;
-
-        return {result, true};
     }
 
     // ------------------------------------------------------------------
