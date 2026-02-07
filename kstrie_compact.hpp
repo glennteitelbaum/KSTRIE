@@ -221,6 +221,9 @@ struct kstrie_compact {
             }
         }
 
+        if (mode == insert_mode::ASSIGN)
+            return {node, insert_outcome::FOUND};
+
         return rebuild(node, h, key_data, key_len, value, consumed, mr, mem);
     }
 

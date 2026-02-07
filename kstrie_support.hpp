@@ -442,7 +442,7 @@ inline const uint8_t* key_next(const uint8_t* kp) noexcept {
 
 inline constexpr uint32_t COMPACT_MAX           = 32;
 
-enum class insert_mode : uint8_t { INSERT, UPDATE };
+enum class insert_mode : uint8_t { INSERT, UPSERT, ASSIGN };
 enum class insert_outcome : uint8_t { INSERTED, UPDATED, FOUND };
 
 struct insert_result {

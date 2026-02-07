@@ -247,57 +247,15 @@ public:
     // ------------------------------------------------------------------
 
     bool insert(std::string_view key, const VALUE& value) {
-        const uint8_t* raw = reinterpret_cast<const uint8_t*>(key.data());
-        uint32_t len = static_cast<uint32_t>(key.size());
-
-        uint8_t stack_buf[256];
-        auto [mapped, heap_buf] = get_mapped<CHARMAP>(raw, len,
-                                              stack_buf, sizeof(stack_buf));
-
-        if (root_ == sentinel_ptr()) {
-            root_ = add_child(mapped, len, value);
-            delete[] heap_buf;
-            size_++;
-            return true;
-        }
-
-        insert_result r = insert_node(root_, mapped, len, value, 0,
-                                       insert_mode::INSERT);
-        root_ = r.node;
-        delete[] heap_buf;
-
-        if (r.outcome == insert_outcome::INSERTED) {
-            size_++;
-            return true;
-        }
-        return false;
+        return modify_impl(key, value, insert_mode::INSERT);
     }
 
     bool insert_or_assign(std::string_view key, const VALUE& value) {
-        const uint8_t* raw = reinterpret_cast<const uint8_t*>(key.data());
-        uint32_t len = static_cast<uint32_t>(key.size());
+        return modify_impl(key, value, insert_mode::UPSERT);
+    }
 
-        uint8_t stack_buf[256];
-        auto [mapped, heap_buf] = get_mapped<CHARMAP>(raw, len,
-                                              stack_buf, sizeof(stack_buf));
-
-        if (root_ == sentinel_ptr()) {
-            root_ = add_child(mapped, len, value);
-            delete[] heap_buf;
-            size_++;
-            return true;
-        }
-
-        insert_result r = insert_node(root_, mapped, len, value, 0,
-                                       insert_mode::UPDATE);
-        root_ = r.node;
-        delete[] heap_buf;
-
-        if (r.outcome == insert_outcome::INSERTED) {
-            size_++;
-            return true;
-        }
-        return false;
+    bool assign(std::string_view key, const VALUE& value) {
+        return modify_impl(key, value, insert_mode::ASSIGN);
     }
 
     size_type erase(std::string_view key) {
@@ -342,13 +300,6 @@ public:
     // ------------------------------------------------------------------
     // Utilities
     // ------------------------------------------------------------------
-
-    bool update(std::string_view key, const VALUE& value) {
-        VALUE* p = find(key);
-        if (!p) return false;
-        *p = value;
-        return true;
-    }
 
     size_type count(std::string_view key) const {
         return contains(key) ? 1 : 0;
@@ -603,6 +554,39 @@ private:
     // Insert internals
     // ------------------------------------------------------------------
 
+    bool modify_impl(std::string_view key, const VALUE& value,
+                     insert_mode mode) {
+        const uint8_t* raw = reinterpret_cast<const uint8_t*>(key.data());
+        uint32_t len = static_cast<uint32_t>(key.size());
+
+        uint8_t stack_buf[256];
+        auto [mapped, heap_buf] = get_mapped<CHARMAP>(raw, len,
+                                              stack_buf, sizeof(stack_buf));
+
+        if (root_ == sentinel_ptr()) {
+            if (mode == insert_mode::ASSIGN) {
+                delete[] heap_buf;
+                return false;
+            }
+            root_ = add_child(mapped, len, value);
+            delete[] heap_buf;
+            size_++;
+            return true;
+        }
+
+        insert_result r = insert_node(root_, mapped, len, value, 0, mode);
+        root_ = r.node;
+        delete[] heap_buf;
+
+        if (r.outcome == insert_outcome::INSERTED) {
+            size_++;
+            return true;
+        }
+        if (r.outcome == insert_outcome::UPDATED)
+            return true;
+        return false;
+    }
+
     insert_result insert_node(uint64_t* node, const uint8_t* key_data,
                                uint32_t key_len, const VALUE& value,
                                uint32_t consumed, insert_mode mode) {
@@ -615,6 +599,9 @@ private:
                                          value, consumed, mr, mode, mem_);
 
         if (mr.status == skip_type::match_status::MISMATCH) {
+            if (mode == insert_mode::ASSIGN)
+                return {node, insert_outcome::FOUND};
+
             const uint8_t* skip_data = hdr_type::get_skip(node);
             uint32_t old_skip = h.skip_bytes();
             uint32_t match_len = mr.match_len;
@@ -651,6 +638,9 @@ private:
         }
 
         if (mr.status == skip_type::match_status::KEY_EXHAUSTED) {
+            if (mode == insert_mode::ASSIGN)
+                return {node, insert_outcome::FOUND};
+
             const uint8_t* skip_data = hdr_type::get_skip(node);
             uint32_t old_skip = h.skip_bytes();
             uint32_t match_len = mr.match_len;
@@ -681,6 +671,8 @@ private:
 
         if (consumed == key_len) {
             if (!h.has_eos()) {
+                if (mode == insert_mode::ASSIGN)
+                    return {node, insert_outcome::FOUND};
                 uint64_t* nn = bitmask_type::set_eos_value(node, h, mem_, value);
                 return {nn, insert_outcome::INSERTED};
             }
@@ -695,6 +687,8 @@ private:
             uint64_t* child = bitmask_type::find_child(node, h, byte);
 
             if (child == sentinel_ptr()) {
+                if (mode == insert_mode::ASSIGN)
+                    return {node, insert_outcome::FOUND};
                 uint64_t* leaf = add_child(key_data + consumed,
                                            key_len - consumed, value);
                 uint64_t* nn = bitmask_type::insert_child(node, h, mem_,
