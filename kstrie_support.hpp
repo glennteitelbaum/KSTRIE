@@ -8,11 +8,8 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
-#include <string>
-#include <string_view>
 #include <type_traits>
 #include <utility>
-#include <vector>
 
 // Debug: assert checks condition. Release: [[assume]] informs optimizer.
 #ifdef KSTRIE_DEBUG

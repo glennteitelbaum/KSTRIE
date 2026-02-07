@@ -4,6 +4,8 @@
 #include "kstrie_compact.hpp"
 #include "kstrie_support.hpp"
 #include <limits>
+#include <string>
+#include <string_view>
 
 namespace gteitelbaum {
 
