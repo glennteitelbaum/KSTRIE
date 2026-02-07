@@ -442,6 +442,21 @@ struct insert_result {
     insert_outcome outcome;
 };
 
+enum class erase_status : uint8_t {
+    MISSING,    // key not found
+    PENDING,    // found but not yet erased
+    DONE        // erased
+};
+
+struct erase_info {
+    uint32_t     desc;   // PENDING: descendant count excluding erased
+    erase_status status;
+    uint64_t*    leaf;   // PENDING: node containing the entry. DONE: replacement node.
+    int          pos;    // PENDING: position in leaf (-1 = eos)
+};
+
+inline constexpr uint32_t COMPACT_COLLAPSE = COMPACT_MAX / 2;
+
 struct search_result {
     bool     found;
     int      pos;

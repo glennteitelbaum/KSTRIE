@@ -438,6 +438,126 @@ struct kstrie_compact {
         delete[] be;
         return node;
     }
+
+    // ------------------------------------------------------------------
+    // erase -- remove entry from compact node
+    //
+    // Returns sentinel if node becomes empty.
+    // Rebuilds compact without the erased entry.
+    // ------------------------------------------------------------------
+
+    static erase_result erase(uint64_t* node, hdr_type& h,
+                              const uint8_t* suffix, uint32_t suffix_len,
+                              mem_type& mem) {
+        const uint8_t* keys = keys_ptr(node, h);
+        auto [found, pos] = search(keys, h.count, suffix, suffix_len);
+        if (!found) return {node, false};
+
+        uint64_t* sb = h.get_slots(node);
+        slots::destroy_value(sb, pos);
+
+        if (h.count == 1) {
+            mem.free_node(node);
+            return {sentinel_ptr(), true};
+        }
+
+        uint16_t new_count = h.count - 1;
+
+        build_entry stack_entries[33];
+        build_entry* entries = (new_count <= 33)
+            ? stack_entries : new build_entry[new_count];
+
+        uint16_t approx_kb = approx_keys_bytes(h.slots_off, h.skip);
+        uint8_t stack_keys[4096];
+        uint8_t* key_buf = (approx_kb <= sizeof(stack_keys))
+            ? stack_keys : new uint8_t[approx_kb];
+
+        const uint8_t* kp = keys;
+        size_t buf_off = 0;
+        uint16_t ei = 0;
+        for (uint16_t i = 0; i < h.count; ++i) {
+            uint16_t klen = read_u16(kp);
+            if (i != static_cast<uint16_t>(pos)) {
+                std::memcpy(key_buf + buf_off, kp + 2, klen);
+                entries[ei].key      = key_buf + buf_off;
+                entries[ei].key_len  = klen;
+                entries[ei].raw_slot = sb[i];
+                buf_off += klen;
+                ei++;
+            }
+            kp += 2 + klen;
+        }
+
+        uint64_t* result = build_compact(mem, h.skip,
+                                          hdr_type::get_skip(node),
+                                          entries, new_count);
+        mem.free_node(node);
+
+        if (entries != stack_entries) delete[] entries;
+        if (key_buf != stack_keys)   delete[] key_buf;
+
+        return {result, true};
+    }
+
+    // ------------------------------------------------------------------
+    // reskip -- rebuild compact with a new skip prefix
+    // ------------------------------------------------------------------
+
+    static uint64_t* reskip(uint64_t* node, hdr_type& h, mem_type& mem,
+                            uint8_t new_skip_len,
+                            const uint8_t* new_skip_data) {
+        uint16_t approx_kb = approx_keys_bytes(h.slots_off, h.skip);
+        uint8_t stack_keys[4096];
+        uint8_t* key_buf = (approx_kb <= sizeof(stack_keys))
+            ? stack_keys : new uint8_t[approx_kb];
+
+        build_entry stack_entries[33];
+        build_entry* entries = (h.count <= 33)
+            ? stack_entries : new build_entry[h.count];
+
+        collect_entries(node, h, entries, key_buf);
+        uint64_t* result = build_compact(mem, new_skip_len, new_skip_data,
+                                          entries, h.count);
+        mem.free_node(node);
+
+        if (entries != stack_entries) delete[] entries;
+        if (key_buf != stack_keys)   delete[] key_buf;
+
+        return result;
+    }
+
+    // ------------------------------------------------------------------
+    // erase_in_place -- remove entry at pos, rewrite keys/slots in place
+    //
+    // Always fits (result is strictly smaller).
+    // ------------------------------------------------------------------
+
+    static void erase_in_place(uint64_t* node, hdr_type& h, int pos) {
+        uint8_t* keys = keys_ptr(node, h);
+        uint64_t* sb = h.get_compact_slots(node);
+
+        slots::destroy_value(sb, pos);
+
+        // Walk to key at pos
+        uint8_t* kp = keys;
+        for (int i = 0; i < pos; ++i)
+            kp = const_cast<uint8_t*>(key_next(kp));
+
+        uint16_t klen = read_u16(kp);
+        uint8_t* after = kp + 2 + klen;
+
+        // Shift remaining keys left (up to slots start)
+        uint8_t* keys_end = reinterpret_cast<uint8_t*>(sb);
+        ptrdiff_t remaining = keys_end - after;
+        if (remaining > 0)
+            std::memmove(kp, after, remaining);
+
+        // Shift slots left
+        if (pos < h.count - 1)
+            slots::move_slots(sb, pos, sb, pos + 1, h.count - 1 - pos);
+
+        hdr_type::from_node(node).count--;
+    }
 };
 
 } // namespace gteitelbaum

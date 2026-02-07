@@ -244,9 +244,315 @@ public:
     }
 
     size_type erase(std::string_view key) {
-        (void)key;
-        return 0;  // STUB
+        if (root_ == sentinel_ptr()) return 0;
+
+        const uint8_t* raw = reinterpret_cast<const uint8_t*>(key.data());
+        uint32_t len = static_cast<uint32_t>(key.size());
+
+        uint8_t stack_buf[256];
+        auto [mapped, heap_buf] = get_mapped(raw, len, stack_buf, sizeof(stack_buf));
+
+        erase_info r = erase_node(root_, mapped, len, 0);
+        delete[] heap_buf;
+
+        if (r.status == erase_status::MISSING)
+            return 0;
+
+        if (r.status == erase_status::DONE) {
+            root_ = r.leaf;
+            size_--;
+            return 1;
+        }
+
+        // PENDING reached root: collapse entire tree
+        if (r.desc == 0) {
+            // Tree becomes empty after erase
+            do_leaf_erase(r.leaf, r.pos);
+            destroy_tree(root_);
+            root_ = sentinel_ptr();
+        } else {
+            root_ = collapse_node(root_, r.leaf, r.pos);
+        }
+        size_--;
+        return 1;
     }
+
+private:
+
+    // ------------------------------------------------------------------
+    // do_leaf_erase -- erase at the leaf (compact in-place or eos removal)
+    // ------------------------------------------------------------------
+
+    void do_leaf_erase(uint64_t* leaf, int pos) {
+        if (pos >= 0) {
+            hdr_type& lh = hdr_type::from_node(leaf);
+            compact_type::erase_in_place(leaf, lh, pos);
+        } else {
+            hdr_type& lh = hdr_type::from_node(leaf);
+            bitmask_type::remove_eos_value(leaf, lh);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // count_descendants -- count all values in subtree, bail at MAX+1
+    // ------------------------------------------------------------------
+
+    uint32_t count_descendants(const uint64_t* node) const {
+        if (node == sentinel_ptr()) return 0;
+        hdr_type h = hdr_type::from_node(node);
+
+        if (h.is_compact()) return h.count;
+
+        uint32_t total = h.has_eos() ? 1 : 0;
+        for (uint16_t ci = 0; ci < h.count; ++ci) {
+            total += count_descendants(bitmask_type::child_by_slot(node, h, ci));
+            if (total > COMPACT_MAX) return total;
+        }
+        return total;
+    }
+
+    // ------------------------------------------------------------------
+    // collect_subtree -- recursive gather of all entries
+    //
+    // Builds keys relative to post-skip content of the collapse root.
+    // The collapse root's skip becomes the new compact's skip.
+    //
+    // collect_inner: called on child nodes (prepends skip to prefix).
+    // collect_post_skip: called at a node after skip is handled.
+    // ------------------------------------------------------------------
+
+    using build_entry = typename compact_type::build_entry;
+
+    void collect_inner(const uint64_t* node,
+                       uint8_t* prefix, uint32_t prefix_len,
+                       build_entry* out, uint8_t* key_buf,
+                       size_t& buf_off, uint32_t& ei,
+                       const uint64_t* skip_leaf, int skip_pos) const {
+        if (node == sentinel_ptr()) return;
+        hdr_type h = hdr_type::from_node(node);
+
+        uint32_t sb = h.skip_bytes();
+        if (sb > 0) {
+            std::memcpy(prefix + prefix_len,
+                        hdr_type::get_skip(node), sb);
+            prefix_len += sb;
+        }
+
+        collect_post_skip(node, h, prefix, prefix_len,
+                          out, key_buf, buf_off, ei,
+                          skip_leaf, skip_pos);
+    }
+
+    void collect_post_skip(const uint64_t* node, const hdr_type& h,
+                           uint8_t* prefix, uint32_t prefix_len,
+                           build_entry* out, uint8_t* key_buf,
+                           size_t& buf_off, uint32_t& ei,
+                           const uint64_t* skip_leaf, int skip_pos) const {
+        if (h.is_compact()) {
+            const uint8_t* keys = compact_type::keys_ptr(node, h);
+            const uint64_t* sb = h.get_compact_slots(node);
+            const uint8_t* kp = keys;
+            for (uint16_t i = 0; i < h.count; ++i) {
+                uint16_t klen = read_u16(kp);
+                if (node != skip_leaf ||
+                    static_cast<int>(i) != skip_pos) {
+                    uint8_t* dst = key_buf + buf_off;
+                    if (prefix_len > 0)
+                        std::memcpy(dst, prefix, prefix_len);
+                    std::memcpy(dst + prefix_len, kp + 2, klen);
+                    out[ei].key      = dst;
+                    out[ei].key_len  = prefix_len + klen;
+                    out[ei].raw_slot = sb[i];
+                    buf_off += prefix_len + klen;
+                    ei++;
+                }
+                kp += 2 + klen;
+            }
+        } else {
+            // Bitmask: collect eos + children
+            if (h.has_eos()) {
+                bool skip = (node == skip_leaf && skip_pos == -1);
+                if (!skip) {
+                    uint8_t* dst = key_buf + buf_off;
+                    if (prefix_len > 0)
+                        std::memcpy(dst, prefix, prefix_len);
+                    out[ei].key      = dst;
+                    out[ei].key_len  = prefix_len;
+                    const uint64_t* bsb = h.get_bitmap_slots(node);
+                    out[ei].raw_slot = bsb[h.count + 1];
+                    buf_off += prefix_len;
+                    ei++;
+                }
+            }
+
+            const auto* bm = bitmask_type::get_bitmap(node, h);
+            int idx = bm->find_next_set(0);
+            for (uint16_t ci = 0; ci < h.count; ++ci) {
+                uint64_t* child = bitmask_type::child_by_slot(node, h, ci);
+                prefix[prefix_len] = static_cast<uint8_t>(idx);
+                collect_inner(child, prefix, prefix_len + 1,
+                              out, key_buf, buf_off, ei,
+                              skip_leaf, skip_pos);
+                idx = bm->find_next_set(idx + 1);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // free_subtree_nodes -- free all node allocations in subtree
+    //
+    // Does NOT destroy values (they've been moved via raw_slot).
+    // Caller must destroy the skipped entry's value separately.
+    // ------------------------------------------------------------------
+
+    void free_subtree_nodes(uint64_t* node) {
+        if (node == sentinel_ptr()) return;
+        hdr_type h = hdr_type::from_node(node);
+
+        if (!h.is_compact()) {
+            for (uint16_t ci = 0; ci < h.count; ++ci)
+                free_subtree_nodes(bitmask_type::child_by_slot(node, h, ci));
+        }
+
+        mem_.free_node(node);
+    }
+
+    // ------------------------------------------------------------------
+    // collapse_node -- gather all entries (minus erased), build compact
+    //
+    // Destroys the erased value. Frees old subtree. Returns new compact
+    // (or sentinel if empty). New compact inherits the node's skip.
+    // ------------------------------------------------------------------
+
+    uint64_t* collapse_node(uint64_t* node, uint64_t* skip_leaf, int skip_pos) {
+        hdr_type h = hdr_type::from_node(node);
+
+        // Destroy the erased value
+        if (skip_pos >= 0) {
+            hdr_type& lh = hdr_type::from_node(skip_leaf);
+            uint64_t* lsb = lh.get_compact_slots(skip_leaf);
+            slots_type::destroy_value(lsb, skip_pos);
+        } else {
+            hdr_type& lh = hdr_type::from_node(skip_leaf);
+            uint64_t* lsb = lh.get_bitmap_slots(skip_leaf);
+            slots_type::destroy_value(lsb, lh.count + 1);
+        }
+
+        // Collect all entries except the erased one
+        build_entry stack_entries[COMPACT_MAX + 1];
+        uint8_t stack_keys[4096];
+        size_t buf_off = 0;
+        uint32_t ei = 0;
+        uint8_t prefix[256];
+
+        collect_post_skip(node, h, prefix, 0,
+                          stack_entries, stack_keys, buf_off, ei,
+                          skip_leaf, skip_pos);
+
+        uint64_t* result;
+        if (ei == 0) {
+            result = sentinel_ptr();
+        } else {
+            // Entries from collect are already sorted (tree order)
+            result = compact_type::build_compact(
+                mem_, h.skip, hdr_type::get_skip(node),
+                stack_entries, static_cast<uint16_t>(ei));
+        }
+
+        // Free old subtree nodes
+        free_subtree_nodes(node);
+
+        return result;
+    }
+
+    // ------------------------------------------------------------------
+    // erase_node -- recursive dispatch
+    //
+    // Returns {desc, PENDING, leaf, pos} up the stack.
+    // Each bitmask level counts total descendants.
+    //   total > COLLAPSE && total <= COMPACT_MAX → collapse this subtree
+    //   total > COMPACT_MAX → can't collapse, erase at leaf
+    //   total <= COLLAPSE → keep PENDING, let parent decide
+    // ------------------------------------------------------------------
+
+    erase_info erase_node(uint64_t* node, const uint8_t* key,
+                          uint32_t key_len, uint32_t consumed) {
+        hdr_type h = hdr_type::from_node(node);
+
+        auto mr = skip_type::match_prefix(node, h, key, key_len, consumed);
+        if (mr.status != skip_type::match_status::MATCHED)
+            return {0, erase_status::MISSING, nullptr, 0};
+        consumed = mr.consumed;
+
+        // --- Compact leaf ---
+        if (h.is_compact()) {
+            const uint8_t* keys = compact_type::keys_ptr(node, h);
+            auto [found, pos] = compact_type::search(
+                keys, h.count, key + consumed, key_len - consumed);
+            if (!found)
+                return {0, erase_status::MISSING, nullptr, 0};
+            return {static_cast<uint32_t>(h.count - 1),
+                    erase_status::PENDING, node, pos};
+        }
+
+        // --- Bitmask: EOS ---
+        if (consumed == key_len) {
+            if (!h.has_eos())
+                return {0, erase_status::MISSING, nullptr, 0};
+
+            // Count children's descendants
+            uint32_t total = 0;
+            for (uint16_t ci = 0; ci < h.count; ++ci) {
+                total += count_descendants(
+                    bitmask_type::child_by_slot(node, h, ci));
+                if (total > COMPACT_MAX) break;
+            }
+
+            if (total > COMPACT_COLLAPSE) {
+                bitmask_type::remove_eos_value(node, h);
+                return {0, erase_status::DONE, node, 0};
+            }
+            return {total, erase_status::PENDING, node, -1};
+        }
+
+        // --- Bitmask: dispatch byte ---
+        uint8_t byte = key[consumed++];
+        uint64_t* child = bitmask_type::find_child(node, h, byte);
+        if (child == sentinel_ptr())
+            return {0, erase_status::MISSING, nullptr, 0};
+
+        erase_info r = erase_node(child, key, key_len, consumed);
+
+        if (r.status != erase_status::PENDING)
+            return r;
+
+        // PENDING from child. Count total at this level.
+        uint32_t total = r.desc;
+        if (h.has_eos()) total++;
+
+        for (uint16_t ci = 0; ci < h.count && total <= COMPACT_MAX; ++ci) {
+            uint64_t* c = bitmask_type::child_by_slot(node, h, ci);
+            if (c != child)
+                total += count_descendants(c);
+        }
+
+        if (total > COMPACT_COLLAPSE) {
+            if (total <= COMPACT_MAX) {
+                // Collapse this subtree into one compact
+                uint64_t* compact = collapse_node(node, r.leaf, r.pos);
+                return {0, erase_status::DONE, compact, 0};
+            } else {
+                // Can't collapse at this level. Erase at leaf.
+                do_leaf_erase(r.leaf, r.pos);
+                return {0, erase_status::DONE, node, 0};
+            }
+        }
+
+        // total <= COLLAPSE, keep bubbling
+        return {total, erase_status::PENDING, r.leaf, r.pos};
+    }
+
+public:
 
     void clear() noexcept {
         if (root_) destroy_tree(root_);

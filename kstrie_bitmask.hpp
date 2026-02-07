@@ -117,6 +117,16 @@ struct kstrie_bitmask {
         slots::store_value(sb, h.count + 1, value);
     }
 
+    // Remove eos value in place. Destroys value, clears flag.
+    static void remove_eos_value(uint64_t* node, hdr_type& h) {
+        assert(h.has_eos());
+        uint64_t* sb = h.get_bitmap_slots(node);
+        slots::destroy_value(sb, h.count + 1);
+        sb[h.count + 1] = 0;
+        h.set_has_eos(false);
+        hdr_type::from_node(node).set_has_eos(false);
+    }
+
     // Write raw eos slot (used by split_node to move values without create/destroy).
     // May realloc. Caller must NOT have already set has_eos.
     static uint64_t* add_eos_raw(uint64_t* node, hdr_type& h, mem_type& mem,
