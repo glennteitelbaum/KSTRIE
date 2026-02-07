@@ -1,552 +1,324 @@
-# kstrie — Design Concepts
-
-`kstrie` is a memory-compressed ordered associative container for variable-length byte-string keys. It provides the same interface as `std::map<std::string, VALUE>`, including bidirectional iterators and ordered traversal.
-
-```cpp
-namespace gteitelbaum {
-template<typename VALUE, typename ALLOC = std::allocator<uint64_t>>
-class kstrie;
-}
-```
-
----
-
-## 1. Trie Fundamentals
-
-A **trie** (prefix tree) stores keys by decomposing them into a sequence of symbols. Each node represents a prefix; children represent extensions of that prefix. For byte strings, a naive trie has up to 256 children per node.
-
-**Standard trie problems:**
-- **Memory overhead**: Each node stores up to 256 pointers (2KB per node)
-- **Cache inefficiency**: Following pointers causes random memory access
-- **Pointer chasing**: O(key_length) memory indirections
-
-**kstrie solutions:**
-- **Compact leaves**: Store sorted key suffixes in flat arrays
-- **Bitmap256 compression**: Only allocate pointers for occupied byte values
-- **Skip compression**: Collapse single-path chains into prefix bytes
-- **Eytzinger search**: Branchless binary search with predictable memory access
-
----
-
-## 2. Node Types
+# kstrie — Compressed Trie Concepts
 
-kstrie uses exactly two node types:
-
-### 2.1 Compact Node
-
-A flat, sorted array of key suffixes and values. Used when entry count ≤ 4096.
-
-```
-┌─────────────────────────────────────────────────┐
-│ NodeHeader (8B)                                 │
-├─────────────────────────────────────────────────┤
-│ prefix[skip_bytes] (if skip > 0)                │
-├─────────────────────────────────────────────────┤
-│ eos_value (if has_eos)                          │
-├─────────────────────────────────────────────────┤
-│ hot[ec+1] : E (16B each) ← Eytzinger boundaries │
-├─────────────────────────────────────────────────┤
-│ idx[ic] : E (16B each)                          │
-├─────────────────────────────────────────────────┤
-│ keys[] : packed [u16 len][bytes...]             │
-├─────────────────────────────────────────────────┤
-│ values[N] : value_slot_type                     │
-└─────────────────────────────────────────────────┘
-```
+## What is a Trie?
 
-**Constraints:**
-- Maximum 4096 entries (`COMPACT_MAX`)
-- Keys limited to 65535 bytes (uint16_t length prefix)
-- No support for "BIG" keys (heap-allocated key storage) — keys are stored inline
+A trie (prefix tree) stores keys character-by-character, sharing common prefixes. Each node branches on the next character in the key. For the keys `cat`, `car`, `card`:
 
-### 2.2 Bitmap Node
+| Level | Branch | Notes |
+|-------|--------|-------|
+| root → `c` | one child | shared prefix |
+| `c` → `a` | one child | shared prefix |
+| `a` → `t`, `r` | two children | first split |
+| `r` → ∅, `d` | value for `car`, plus child | `car` terminates here |
+| `d` → ∅ | value for `card` | `card` terminates here |
 
-A 256-way dispatch node using bitmap compression. Created when a compact node exceeds capacity.
+The key insight: lookup cost is **O(M)** where M is key length, independent of how many entries exist. A `std::map` (red-black tree) is O(M·log N) because it does O(log N) string comparisons, each costing O(M).
 
-```
-┌─────────────────────────────────────────────────┐
-│ NodeHeader (8B)                                 │
-├─────────────────────────────────────────────────┤
-│ prefix[skip_bytes] (if skip > 0)                │
-├─────────────────────────────────────────────────┤
-│ eos_value (if has_eos)                          │
-├─────────────────────────────────────────────────┤
-│ bitmap (32B) : Bitmap256                        │
-├─────────────────────────────────────────────────┤
-│ children[popcount] : uint64_t*                  │
-└─────────────────────────────────────────────────┘
-```
+A naive trie wastes space. Every character consumes a node, and internal nodes that branch on only one character add overhead without information. `http://example.com/page1` and `http://example.com/page2` share 24 characters — a naive trie creates 24 single-child nodes before the first useful branch.
 
-Each child pointer leads to another node (compact or bitmap).
+## How kstrie Differs
 
----
+kstrie uses two optimizations to eliminate waste:
 
-## 3. Skip Compression
+**Skip compression.** Instead of one node per character, a sequence of single-child nodes collapses into a *skip prefix* stored in the parent. The 24 shared bytes of `http://example.com/page` become a single skip prefix, not 24 nodes.
 
-When all keys in a subtree share a common prefix, that prefix is stored once in the node header rather than redundantly in every key.
+**Compact leaf nodes.** Instead of branching one character at a time near the leaves, a compact node stores multiple key suffixes in a flat sorted array. A node holding `page1` and `page2` stores both suffixes directly rather than branching on `1` vs `2` through additional nodes.
 
-```
-Before:  Node with keys ["https://example.com/a", "https://example.com/b", ...]
-         Each key stores full 20+ byte prefix
+### Standard Trie (7 nodes)
 
-After:   Node with skip=20, prefix="https://example.com/"
-         Keys store only ["a", "b", ...]
-```
+For keys `cat`=1, `car`=2, `card`=3:
 
-**Encoding (uint8_t skip field):**
-- `skip = 0`: No prefix
-- `skip = 1-254`: Prefix is exactly `skip` bytes
-- `skip = 255`: Continuation — 254 bytes here, child node has more prefix
+| Node | Type | Skip | Content |
+|------|------|------|---------|
+| root | branch | — | children: `c` |
+| c | branch | — | children: `a` |
+| a | branch | — | children: `t`, `r` |
+| t | leaf | — | value=1 |
+| r | branch | — | value=2, children: `d` |
+| d | leaf | — | value=3 |
 
-**Continuation nodes:** For prefixes longer than 254 bytes (rare), a chain of continuation nodes is used:
-```
-Prefix of 400 bytes:
-  Node A: skip=255, prefix[0..253], child_ptr → Node B
-  Node B: skip=146, prefix[0..145], then normal data
-```
+### kstrie (2 nodes)
 
-Continuation nodes have:
-- `skip = 255` (continuation marker)
-- 254 bytes of prefix stored inline
-- Single child pointer immediately after prefix
-- No bitmap, no compact data — just prefix + pointer
+| Node | Type | Skip | Content |
+|------|------|------|---------|
+| root | compact | `ca` | suffixes: `r`→2, `rd`→3, `t`→1 |
 
-**Properties:**
-- 254 bytes covers virtually all real-world prefixes (URLs, paths, identifiers)
-- Header is only 8 bytes total (skip is uint8_t, not uint32_t)
-- Prefix bytes stored immediately after header, 8-byte aligned
-- Applied recursively during node splits
-- Dramatically reduces memory for keys with common prefixes
+One node. Skip prefix `ca` is checked once, then the sorted suffix array `[r, rd, t]` is scanned. If the dataset grows and this node exceeds compact limits, it splits into a bitmask parent + compact children.
 
-**Detection:** During split, if all entries share a common first byte, that byte becomes part of the skip prefix. This repeats until divergence.
+For a larger example — URLs sharing `https://api.example.com/`:
 
----
+| Node | Type | Skip | Content |
+|------|------|------|---------|
+| root | bitmask | `https://api.example.com/` | children: `u`, `v` |
+| child-u | compact | `sers/` | suffixes: `alice`→1, `bob`→2 |
+| child-v | compact | — | suffixes: `1/data`→3, `2/data`→4 |
 
-## 4. Why 4096?
+The 25-byte common prefix is stored once. Each compact leaf holds related suffixes in a flat array.
 
-The compact node capacity of 4096 entries is chosen for several reasons:
+## Skip Prefix
 
-1. **Split distribution**: When a compact node splits into a bitmap node, entries are distributed across up to 256 children (one per byte value). With 4096 entries: 4096 / 256 = 16 entries per child on average. This keeps children small enough for efficient linear scans.
+Every node (compact or bitmask) can have a skip prefix: a byte sequence that must match the search key before the node's contents are consulted.
 
-2. **Cache efficiency**: At 4096 entries with ~16-byte average keys:
-   - hot array: ~1KB
-   - idx array: ~8KB
-   - keys: ~64KB
-   - Total: ~80KB, fits in L2 cache
+**Match outcomes:**
 
-3. **Search depth**: log₂(128) = 7 Eytzinger comparisons + 4 idx scans + 8 key scans = 19 comparisons max
+| Result | Meaning | Action |
+|--------|---------|--------|
+| MATCHED | All skip bytes match key | Proceed to node contents |
+| MISMATCH | Skip and key diverge at byte i | Insert: split here. Find: not found |
+| KEY_EXHAUSTED | Key ends before skip does | Insert: split here. Find: not found |
 
-4. **Post-split child size**: After split, each child averages 16 entries — small enough that the three-tier search (Eytzinger → idx → keys) degenerates to simple linear scan, which is optimal for such small N.
+**Rule: a skip can only decrease.** When a new key causes a mismatch at position i within a skip of length S, the skip shrinks to i. The remaining S−i−1 bytes are pushed into a new child. This is the only structural change to skips — they never grow.
 
----
+**Maximum skip length:** 254 bytes. Byte 255 is reserved for continuation nodes (chained skips for keys longer than 254 bytes).
 
-## 5. Three-Tier Search Architecture
+## Node Types
 
-Search within a compact node uses three levels of indexing, all based on a unified 16-byte **E** structure:
+### Compact Node
 
-```cpp
-using E = std::array<uint64_t, 2>;
+A compact node stores a flat sorted list of key suffixes and their values. It is the leaf-level workhorse.
 
-// Layout (big-endian for comparison):
-// k[0]: bytes 0-7 of key
-// k[1]: bytes 8-13 in high 48 bits, offset in low 16 bits
-```
+**Memory layout:**
 
-Both hot and idx arrays use the same E type, enabling consistent 16-byte lexicographic comparison via `std::array`'s built-in `<=` operator.
+| Region | Size | Contents |
+|--------|------|----------|
+| Header | 8 bytes | alloc_u64, count, keys_bytes, skip, flags |
+| Skip | 0–254 bytes (8-aligned) | Skip prefix bytes |
+| Index | variable (8-aligned) | Sorted key entries: `[len₀][key₀][len₁][key₁]...` |
+| Slots | count × 8 bytes | One value per entry, positional |
 
-### Tier 1: Eytzinger Hot Array (log₂(ec) comparisons)
+Each key entry in the index region is: 2-byte length prefix + raw key bytes. Entries are sorted lexicographically. Slot i corresponds to key entry i.
 
-Branchless binary search on 16-byte key prefixes narrows to a **window** of ~4 idx entries.
+**Header bit layout:**
 
-### Tier 2: Idx Linear Scan (≤4 comparisons)
+| Field | Bytes | Bits | Range | Purpose |
+|-------|-------|------|-------|---------|
+| alloc_u64 | 0–1 | 16 | 0–65535 | Allocation size in 8-byte units |
+| count | 2–3 | 16 | 0–4096 | Number of entries |
+| keys_bytes | 4–5 | 16 | 0–65535 | Total bytes in key data |
+| skip | 6 | 8 | 0–255 | Skip prefix length |
+| flags | 7 | 8 | bit 0 | 0 = compact, 1 = bitmask |
 
-One E per 8 keys. Same 16-byte comparison identifies the correct 8-key block. The offset (low 16 bits of k[1]) points to the key data.
+**Limits:**
 
-### Tier 3: Key Linear Scan (≤8 comparisons)
+| Constraint | Value | Enforced by |
+|------------|-------|-------------|
+| Max entries | 4,096 | `COMPACT_MAX` |
+| Max allocation | 256×256 u64 | `COMPACT_MAX_ALLOC_U64` |
+| Max individual key suffix | 14 bytes | `COMPACT_MAX_KEY_LEN` |
 
-Full key comparison against packed keys in `keys[]` array.
+When any limit is exceeded, the node splits into a bitmask parent with compact children (see Split below).
 
-**Total comparisons**: O(log N) + O(4) + O(8) ≈ 7 + 4 + 8 = 19 for N=4096
+**Read (find):** Linear scan through sorted keys with early exit. Compare each key entry against the search suffix. O(K) where K is the entry count in this node (bounded by 4,096, typically much smaller).
 
----
+**Insert:** Check if key exists (update or return FOUND depending on mode). If new, rebuild the entire node: collect existing entries, add the new one, sort, write fresh node. O(K) rebuild.
 
-## 6. Eytzinger Layout
+**Assign:** Same path as insert, but returns immediately (no allocation) if the key doesn't exist. When the key is found, overwrites the value in-place.
 
-### 6.1 Traditional Eytzinger
+**Erase:** Locate the entry, destroy its value, rebuild without it. O(K).
 
-The Eytzinger layout stores a binary search tree in a flat array where:
-- Root is at index 1
-- Left child of node `i` is at `2i`
-- Right child of node `i` is at `2i + 1`
+**Iterate:** Keys are stored sorted, so forward iteration walks the key array left to right. Reverse walks right to left. The iterator descends from the root on each `++`/`--` call, so each step is O(M) where M is key length.
 
-This enables **branchless** traversal:
-```cpp
-int i = 1;
-while (i <= n) {
-    i = 2*i + (arr[i] <= key);  // No branch, just arithmetic
-}
-```
+### Bitmask Node
 
-Modern CPUs can execute this without branch misprediction penalties (~15 cycles each on cache miss).
+A bitmask node is a fanout node that branches on a single byte. It uses a bitmap to track which byte values have children, and a branchless popcount lookup to find the child slot.
 
-### 6.2 Our Modification: Complete Tree Padding
+**Memory layout:**
 
-Standard Eytzinger requires the tree to be complete (all levels full except possibly the last). For arbitrary `ic` (idx count), we force a complete tree:
+| Region | Size | Contents |
+|--------|------|----------|
+| Header | 8 bytes | Same fields as compact |
+| Skip | 0–254 bytes (8-aligned) | Skip prefix bytes |
+| Bitmap | 8–32 bytes | Which byte values have children |
+| Slots | (count+2) × 8 bytes | `[sentinel][child₀]...[child_{n-1}][eos_child]` |
 
-```cpp
-W = bit_ceil((ic + 3) / 4)    // Window count (power of 2)
-ec = W - 1                     // Eytzinger nodes (always 2^k - 1)
-```
+**Bitmap sizing:** Depends on the character map's unique count.
 
-**Boundary placement:**
-```cpp
-boundary[i] = idx[(i + 1) * ic / W]    // for i in [0, ec)
-```
+| Unique values | Bitmap words (u64) | Bitmap bytes |
+|---------------|-------------------|--------------|
+| ≤64 | 1 | 8 |
+| ≤128 | 2 | 16 |
+| ≤256 (identity) | 4 | 32 |
 
-This distributes `ic` idx entries across `W` windows. Each window contains 3-4 idx entries.
+**Slot layout:**
 
-**Window calculation after traversal:**
-```cpp
-// After Eytzinger traversal terminates at leaf position i:
-int window = i - ec - 1;
-int idx_base = window * ic / W;
-int idx_end = min(idx_base + 4, ic);
-```
+| Slot index | Contents | Purpose |
+|------------|----------|---------|
+| 0 | sentinel pointer | Branchless miss target |
+| 1 to count | child node pointers | Ordered by bitmap position |
+| count+1 | eos_child pointer | End-of-string value holder |
 
-### 6.3 Why This Works
+The sentinel at slot 0 is the key to branchless lookup. The bitmap probe returns 0 for absent bytes (which maps to the sentinel) or a 1-based index for present bytes. No branch needed — the sentinel is a globally shared empty node.
 
-For `ec = 2^k - 1` (complete tree):
-- Leaf positions are `[ec+1, 2*ec+1]` — exactly `ec+1 = W` positions
-- The formula `window = i - ec - 1` maps leaves linearly to windows `[0, W-1]`
-- Each window covers `ic/W` idx entries ≈ 4 (since `W ≈ ic/4`)
+**Read (find):** Extract byte from key. Compute popcount-based slot index from bitmap. Load child pointer. If slot index is 0, the byte isn't present — the sentinel is followed, which always returns "not found." O(1) per level.
 
-**Example (N=4096, ic=512):**
-- W = 128, ec = 127
-- 7 Eytzinger comparisons (log₂ 128)
-- Each window has exactly 4 idx entries
-- 4 idx comparisons + 8 key comparisons
+**Insert child:** Set the bitmap bit. Shift existing child pointers right to make room at the correct position. Store the new child pointer. May reallocate if the node outgrew its allocation. O(C) where C is child count at this node.
 
-**Example (N=65, ic=9):**
-- W = 4, ec = 3
-- 2 Eytzinger comparisons
-- Windows have [2, 2, 2, 3] idx entries
+**Erase child:** Clear the bitmap bit. Shift child pointers left. O(C).
 
----
+**Iterate:** Use `find_next_set` / `find_prev_set` on the bitmap to enumerate children in order. Descend into each child recursively.
 
-## 7. Branchless 16-Byte Key Comparison
+## End of String (EOS)
 
-Both hot and idx arrays use the **E** structure — a 16-byte comparable key stored as `std::array<uint64_t, 2>`.
+A key can terminate at any point in the trie — including at a bitmask node's skip boundary, before any branching byte is consumed. For example, inserting both `cat` and `cats`: `cat` terminates where `cats` still has an `s` to consume.
 
-### 7.1 Building E from Key Bytes
+**In compact nodes:** EOS is simply a zero-length key entry in the sorted array. It naturally sorts first (empty string < everything). No special handling needed.
 
-```cpp
-struct ES {
-    std::array<char, 16> D;
-    
-    void setkey(const char* k, int len) noexcept {
-        memset(D.data(), 0, 16);
-        memcpy(D.data(), k, min(len, 14));
-    }
-    
-    void setoff(uint16_t off) noexcept {
-        D[14] = off >> 8;
-        D[15] = off & 0xFF;
-    }
-};
+**In bitmask nodes:** The eos_child occupies slot `[count+1]`, after all branching children. It points to either:
 
-E cvt(const ES& x) noexcept {
-    E ret;
-    memcpy(&ret, &x, 16);
-    if constexpr (std::endian::native == std::endian::little) {
-        ret[0] = std::byteswap(ret[0]);
-        ret[1] = std::byteswap(ret[1]);
-    }
-    return ret;
-}
-```
+| Value | Meaning |
+|-------|---------|
+| sentinel pointer | No key terminates here |
+| compact leaf node | A compact node with skip=0 holding the value as a zero-length key entry |
 
-On x86-64, `cvt()` compiles to two `movbe` (move with byte swap) instructions — load and swap in one operation.
+This keeps the design uniform — bitmask nodes never store values directly. All values live in compact nodes.
 
-### 7.2 Comparison
+## Split (Compact → Bitmask + Children)
 
-`std::array<uint64_t, 2>` provides lexicographic `<=` out of the box:
+When a compact node exceeds its limits after an insert, it splits:
 
-```cpp
-i = 2*i + (hot[i] <= skey);
-```
+1. Collect all entries from the overfull compact node
+2. If any entry has key_len=0 (EOS), set it aside for eos_child
+3. Bucket remaining entries by their first key byte
+4. For each bucket: create a compact child with suffixes stripped of the first byte
+5. Create a bitmask parent with the original skip, bitmap set for each bucket byte
+6. Attach eos_child if one exists
+7. Free the old compact node
+8. If any child still violates limits, recursively split it
 
-Assembly for `a <= b` where both are `std::array<uint64_t, 2>`:
-```asm
-cmp     rdi, rdx      ; a[0] vs b[0]
-setb    al            ; al = (a[0] < b[0])
-je      .L5           ; if equal, check second element
-ret
-.L5:
-cmp     rcx, rsi      ; b[1] vs a[1]  
-setnb   al            ; al = (a[1] <= b[1])
-ret
-```
+Before split (compact with skip `ca`, 5 entries):
 
-One conditional branch, but highly predictable — either first 8 bytes usually match or they don't.
-
-### 7.3 Why 16 Bytes?
-
-With 8-byte hot keys, a degenerate case exists: if all keys share the same first 8 bytes (e.g., all start with "ABCDEFGH"), Eytzinger can't distinguish them and always lands in the wrong window.
-
-With 16 bytes (14 key bytes + 2 offset bytes):
-- Keys must share first 14 bytes to degenerate — extremely rare
-- The offset breaks ties deterministically
-- hot array grows from ~1KB to ~2KB at N=4096 — still fits L1 cache
-
-**Cache behavior:**
-- hot array is ~2KB for N=4096
-- Accessed sequentially (indices 1, 2/3, 4-7, 8-15, ...)
-- Prefetcher handles this well; typically 2-3 cache misses total
-
----
-
-## 8. Value Storage
-
-Values are stored inline or by pointer depending on size:
-
-```cpp
-static constexpr bool value_inline =
-    sizeof(VALUE) <= 8 && std::is_trivially_copyable_v<VALUE>;
-
-using value_slot_type = std::conditional_t<value_inline, VALUE, VALUE*>;
-```
-
-**Inline (≤8 bytes):** Value stored directly in the slot. No heap allocation.
-
-**Pointer (>8 bytes):** Heap-allocated via rebound allocator. Pointer stored in slot.
-
-This avoids wasting memory on padding for small values while supporting arbitrarily large value types.
-
----
-
-## 9. Bitmap256
-
-The `Bitmap256` structure compresses a 256-way branch:
-
-```cpp
-struct Bitmap256 {
-    uint64_t words[4];  // 256 bits = 32 bytes
-    
-    bool has_bit(uint8_t idx);
-    int find_slot(uint8_t idx);     // Returns dense array position
-    int count_below(uint8_t idx);   // popcount of bits below idx
-    void set_bit(uint8_t idx);
-    void clear_bit(uint8_t idx);
-};
-```
-
-**Dense child array:** Only occupied byte values have child pointers. If bytes {0x61, 0x62, 0x7A} are present, `children[3]` holds 3 pointers.
-
-**Slot calculation:**
-```cpp
-int find_slot(uint8_t idx) {
-    if (!has_bit(idx)) return -1;
-    return count_below(idx);  // Uses popcount intrinsic
-}
-```
-
-On x86-64-v3+, `popcount` compiles to a single `POPCNT` instruction.
-
----
-
-## 10. Compact vs Bitmap Split Decision
-
-When inserting into a full compact node (count = 4096):
-
-1. **Bucket all entries** by first suffix byte (0-255)
-2. **Check skip compression**: If all entries share the same first byte, strip it and add to skip prefix. Repeat.
-3. **Create bitmap node** with children for each occupied byte
-4. **Create child compact nodes** for each bucket (typically 16 entries each)
-
-**Skip compression during split:**
-```
-Before split:
-  Compact node with 4096 keys all starting with 'x'
+| Key suffix | Value |
+|------------|-------|
+| (empty) | 10 |
+| `r` | 2 |
+| `rd` | 3 |
+| `rds` | 4 |
+| `t` | 1 |
 
 After split:
-  Compact node with skip += 1, prefix includes 'x'
-  Still 4096 keys, but each is 1 byte shorter
-  (May trigger another split if still all share next byte)
-```
 
----
+| Node | Type | Skip | Content |
+|------|------|------|---------|
+| parent | bitmask | `ca` | bitmap: {`r`, `t`}, eos_child → leaf |
+| eos_child | compact | — | `(empty)`→10 |
+| child-r | compact | — | `(empty)`→2, `d`→3, `ds`→4 |
+| child-t | compact | — | `(empty)`→1 |
 
-## 11. EOS (End-of-String) Values
+## Collapse (Erase)
 
-A key may terminate at any node in the trie. The `has_eos` flag indicates a value exists for the exact prefix at this node:
+When an erase leaves a bitmask node with too few children, the tree collapses to eliminate unnecessary branching. The goal: if a bitmask node has only one child (or only an eos_child), it can merge downward into a single compact or bitmask node with a longer skip.
 
-```
-Keys: ["foo", "foobar"]
+1. Erase the key from its compact leaf
+2. Walk back up, checking if any bitmask node is now degenerate (≤1 child + eos)
+3. If degenerate: prepend the bitmask's skip + branch byte to the surviving child's skip
+4. Free the bitmask node, promote the child
 
-Node at "foo":
-  has_eos = true, eos_value = value_of("foo")
-  children contain entry for "bar" → value_of("foobar")
-```
+Before erase (removing `cat`=1):
 
-EOS values are stored immediately after the prefix region, before the data arrays.
+| Node | Type | Skip | Content |
+|------|------|------|---------|
+| parent | bitmask | `ca` | bitmap: {`r`, `t`} |
+| child-r | compact | — | `(empty)`→2 |
+| child-t | compact | — | `(empty)`→1 |
 
----
+After erase + collapse:
 
-## 12. Memory Layout Summary
+| Node | Type | Skip | Content |
+|------|------|------|---------|
+| root | compact | `car` | `(empty)`→2 |
 
-All nodes are allocated as `uint64_t*` arrays, ensuring 8-byte alignment throughout.
+The bitmask disappeared. The surviving child absorbed the prefix `ca` + `r`.
 
-**NodeHeader (8 bytes):**
-```cpp
-struct NodeHeader {
-    uint32_t keys_bytes;  // 4B - total keys[] region size
-    uint16_t count;       // 2B - entry count (excl EOS)
-    uint8_t  skip;        // 1B - 0=none, 1-254=bytes, 255=continuation
-    uint8_t  flags;       // 1B - bit0: is_compact, bit1: has_eos
-};
-```
+## Slots
 
-**Compact node regions (in order):**
-1. Header (8 bytes)
-2. Skip prefix (0 to 254 bytes, 8-byte aligned)
-3. EOS value slot (if present)
-4. Hot array: `(ec + 1) × 16` bytes (E entries)
-5. Idx array: `ic × 16` bytes (E entries)
-6. Keys: variable, packed as `[uint16_t len][bytes...]`, 8-byte aligned
-7. Values: `N × sizeof(value_slot_type)`, 8-byte aligned
+Slots are the value/pointer storage region at the end of every node. The slot system handles two fundamentally different uses through one interface:
 
-**Bitmap node regions (in order):**
-1. Header (8 bytes)
-2. Skip prefix (0 to 254 bytes, 8-byte aligned)
-3. EOS value slot (if present)
-4. Bitmap256 (32 bytes)
-5. Child pointers: `popcount × 8` bytes
+**Compact node slots** hold values. Each slot is 8 bytes.
 
-**Continuation node (skip=255):**
-1. Header (8 bytes)
-2. Prefix (254 bytes, padded to 256 = 32 × 8)
-3. Child pointer (8 bytes)
-Total: 272 bytes per continuation node
+| VALUE sizeof | Storage | Ownership |
+|-------------|---------|-----------|
+| ≤8 bytes, trivially copyable | Inline in slot | No heap allocation |
+| >8 bytes or non-trivial | Heap pointer in slot | `new` on insert, `delete` on erase/destroy |
 
----
+For inline values (int, float, char, pointers), the value is stored directly in the 8-byte slot via `memcpy`. No indirection, no allocation. For larger values (std::string, structs >8 bytes), a heap pointer is stored. The slot owns the pointed-to value.
 
-## 13. Performance Characteristics
+**Bitmask node slots** hold child node pointers. Always 8 bytes (pointer width). No ownership semantics — the child node's lifetime is managed by the tree's destroy/erase logic.
 
-### Search: O(k + log M) where k = trie depth, M = max key length
+**Slot operations:**
 
-- Trie descent: O(k) node visits, each O(1) bitmap lookup
-- Compact node search: O(log M) Eytzinger + O(1) linear scans
-- Note: N (entry count) does not appear — search time depends on key length, not dataset size
+| Operation | Compact (value) | Bitmask (child pointer) |
+|-----------|-----------------|------------------------|
+| store | `memcpy` value or `new` + store pointer | Store raw pointer |
+| load | Cast or dereference pointer | Cast to `uint64_t*` |
+| destroy | No-op (inline) or `delete` (heap) | Not applicable |
+| copy/move | `memcpy` 8 bytes | `memcpy` 8 bytes |
 
-### Insert: O(k + log M) amortized
+Bulk operations (`copy_slots`, `move_slots`) work on raw 8-byte units via `memcpy`/`memmove`, which is correct for both inline values and pointers.
 
-- Same traversal cost as search
-- Node reallocation on insert (copy + insert in sorted position)
-- Occasional split when exceeding 4096 entries
+## Character Maps (CHARMAP)
 
-### Memory: ~20-25 bytes per entry for typical string keys
+A character map remaps input bytes before they enter the trie. This enables case-insensitive lookup, reduced alphabet tries, and custom collation — all at the type level with zero runtime cost for the identity case.
 
-- Much better than `std::map` (~40-50 bytes per entry)
-- Skip compression can dramatically reduce this for keys with common prefixes
+**Built-in maps:**
 
-### Cache Behavior
+| Map | Effect | Unique values | Bitmap size |
+|-----|--------|---------------|-------------|
+| `identity_char_map` | No remapping (1:1) | 256 | 32 bytes (4 words) |
+| `upper_char_map` | Case-insensitive (a→A, preserves digits/punct) | ~40 | 8 bytes (1 word) |
+| `reverse_lower_char_map` | Reverse alpha order (A→z, Z→a) | ~40 | 8 bytes (1 word) |
 
-| Operation | L1 Misses | L2 Misses | Branch Mispredicts |
-|-----------|-----------|-----------|-------------------|
-| Eytzinger | 0-1 | 0-1 | 0 (branchless) |
-| Idx scan | 0-1 | 0 | 0-1 |
-| Key scan | 0-2 | 0-1 | 0-1 |
-| **Total** | 1-4 | 0-2 | 0-2 |
+**How it works:** The `char_map` template takes a `std::array<uint8_t, 256>` mapping. At compile time it computes:
 
-Compare to `std::map` with N=4096: ~12 pointer chases, ~12 branch mispredicts, ~6-12 cache misses.
+| Property | Purpose |
+|----------|---------|
+| `IS_IDENTITY` | If true, skip all remapping (zero overhead) |
+| `UNIQUE_COUNT` | Number of distinct output values |
+| `BITMAP_WORDS` | Bitmap size: 1, 2, or 4 u64 words |
+| `CHAR_TO_INDEX` | Input byte → internal index |
+| `INDEX_TO_CHAR` | Internal index → output byte (for unmapping during iteration) |
 
----
+A reduced alphabet (e.g., 40 unique values for case-insensitive English) shrinks every bitmask node's bitmap from 32 bytes to 8 bytes and reduces fanout overhead proportionally.
 
-## 14. Character Mapping (char_map)
+**Identity map optimization:** When `IS_IDENTITY` is true, all remapping functions compile to no-ops. The `get_mapped()` helper returns the original pointer with no copy. Zero cost.
 
-kstrie uses compile-time character mapping to enable:
-1. **Case-insensitive keys**: "Foo" and "foo" are the same key
-2. **Restricted alphabets**: Smaller bitmaps for domain-specific keys
-3. **Custom collation**: Reverse ordering, character collapsing, etc.
+## Memory Allocation
 
-### 14.1 User-Provided Mapping
+Nodes are allocated as arrays of `uint64_t` (8-byte aligned). The allocator uses **padded size classes** to reduce fragmentation and enable in-place growth.
 
-Users provide a simple 256-byte array mapping input chars to output chars:
+**Size class progression:**
 
-```cpp
-// Case-insensitive: A-Z and a-z both map to uppercase
-constexpr std::array<uint8_t, 256> UPPER_MAP = [](){
-    std::array<uint8_t, 256> m{};
-    for (int i = 0; i < 256; ++i) m[i] = '*';  // catchall
-    for (int i = 'A'; i <= 'Z'; ++i) m[i] = i;
-    for (int i = 'a'; i <= 'z'; ++i) m[i] = 'A' + (i - 'a');
-    for (int i = '0'; i <= '9'; ++i) m[i] = i;
-    m[' '] = ' '; m[','] = ','; m['-'] = '-'; m['.'] = '.'; m['\''] = '\'';
-    m[0] = 0;
-    return m;
-}();
+| Needed (u64) | Allocated (u64) | Strategy |
+|--------------|-----------------|----------|
+| 1–4 | exact | Small nodes, no padding |
+| 5 | 6 | Midpoint between 4 and 8 |
+| 6 | 6 | Exact fit at midpoint |
+| 7–8 | 8 | Power of 2 |
+| 9 | 12 | Midpoint between 8 and 16 |
+| 13–16 | 16 | Power of 2 |
+| n | lower, mid, or upper | 1.5x geometric steps |
 
-kstrie<int, char_map<UPPER_MAP>> trie;
-```
+The pattern: for each power-of-two range [lower, upper], there's a midpoint at `lower + lower/2`. Three stop points per octave. This gives ~33% worst-case internal fragmentation (vs. 50% for pure power-of-2).
 
-### 14.2 Compile-Time Optimization
+**alloc_u64 field:** Every node's header stores its allocation size in the first 2 bytes. This is read during `free_node` to return the correct amount to the allocator. A value of 0 means sentinel (never freed).
 
-The `char_map` template computes at compile time:
+**The sentinel:** A single global `EMPTY_NODE_STORAGE` (40 bytes of zeros) serves as the "null node." Its `alloc_u64` is 0, `flags` is 0 (compact), `count` is 0. Any code that follows a missing child pointer reaches the sentinel, which returns "not found" naturally — no null checks needed anywhere in the hot path.
 
-| Condition | BITMAP_WORDS | Mapping |
-|-----------|--------------|---------|
-| IS_IDENTITY (map[i] == i for all i) | 4 (32 bytes) | No mapping needed |
-| ≤ 64 unique values | 1 (8 bytes) | Remap to 1-based dense indices |
-| ≤ 128 unique values | 2 (16 bytes) | Remap to 1-based dense indices |
-| > 128 unique values | 4 (32 bytes) | Use user map as-is |
+## Performance: kstrie vs std::map
 
-**Example**: `UPPER_MAP` has 42 unique values (26 letters + 10 digits + 5 punctuation + catchall), so BITMAP_WORDS = 1. Bitmap nodes shrink from 32 bytes to 8 bytes.
+**Algorithmic complexity:**
 
-### 14.3 Pre-defined Maps
+In the table below, **M** is the key length in bytes and **N** is the total number of entries in the container.
 
-```cpp
-using IdentityCharMap = char_map<IDENTITY_MAP>;       // Full 256-char, no transform
-using UpperCharMap = char_map<UPPER_MAP>;             // Case-insensitive
-using ReverseLowerCharMap = char_map<REVERSE_LOWER_MAP>;  // A->z, B->y, etc.
-```
+| Operation | kstrie | std::map | Notes |
+|-----------|--------|----------|-------|
+| Find | O(M) | O(M · log N) | Trie descends by key bytes. Map does log N string comparisons. |
+| Insert | O(M + K) | O(M · log N) | K = entries in the target compact node (≤4,096). Rebuild is O(K). |
+| Erase | O(M + K) | O(M · log N) | Same compact rebuild cost as insert. |
+| Iterate next | O(M) | O(1) amortized | Trie re-descends from root. Map follows one RB-tree pointer. |
+| Memory | Shared prefixes | Per-entry overhead | Trie shares prefix storage. Map stores full key per node. |
 
-With restricted alphabets, if multiple input chars map to the same output, they are considered identical keys — this is the intended behavior for case-insensitivity, etc.
+**Why kstrie reads are fast:** Each level of the trie examines exactly one byte. A bitmask node lookup is a bitmap probe + popcount — no string comparison. A compact node does a short linear scan over suffixes that share the same prefix context, so comparison lengths are short (typically ≤14 bytes). In contrast, `std::map` performs O(log N) full string comparisons, each touching O(M) bytes.
 
----
+**Where std::map wins:** Iteration. `std::map` stores explicit left/right/parent pointers, so `++iterator` follows one pointer. kstrie's iterator holds a key string and re-traverses from the root on each step, costing O(M) per advance. For iteration-heavy workloads, this is the primary tradeoff.
 
-## 15. Iterator Implementation
-
-Iterators maintain a stack of `(node, position)` frames:
-
-```cpp
-struct IterFrame {
-    uint64_t* node;
-    int position;  // -1 = at EOS, 0..count-1 = at entry
-};
-```
-
-The current key is reconstructed by accumulating:
-- Skip prefix bytes at each node
-- Dispatch byte for each bitmap descent
-- Suffix bytes at the leaf position
-
-`operator++` pops exhausted frames and advances to the next entry in sorted order.
-
----
-
-## 16. Comparison to Alternatives
-
-| Structure | Lookup | Insert | Memory | Ordered |
-|-----------|--------|--------|--------|---------|
-| `std::map` | O(log N) | O(log N) | High | Yes |
-| `std::unordered_map` | O(1) avg | O(1) avg | Medium | No |
-| Radix trie | O(M) | O(M) | Very High | Yes |
-| kstrie | O(k + log M) | O(k + log M) | Low | Yes |
-
-Where N = entry count, M = max key length, k = trie depth (reduced by skip compression).
-
-kstrie excels when:
-- Keys have common prefixes (URLs, file paths, identifiers)
-- Memory efficiency matters
-- Ordered iteration is required
-- Read-heavy workload (lookup optimized)
+**Memory advantage:** kstrie shares prefix storage across entries. For datasets with common prefixes (URLs, file paths, domain names), this compression is substantial. A compact node holding 100 entries with a 20-byte shared prefix stores those 20 bytes once, while `std::map` stores them 100 times. Additionally, bitmask nodes have no per-entry key storage at all — just a 32-byte bitmap and child pointers.
