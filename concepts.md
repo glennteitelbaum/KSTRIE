@@ -93,7 +93,7 @@ Each key entry in the index region is: 2-byte length prefix + raw key bytes. Ent
 | Field | Bytes | Bits | Range | Purpose |
 |-------|-------|------|-------|---------|
 | alloc_u64 | 0–1 | 16 | 0–65535 | Allocation size in 8-byte units |
-| count | 2–3 | 16 | 0–4096 | Number of entries |
+| count | 2–3 | 16 | 0–65535 | Number of entries |
 | keys_bytes | 4–5 | 16 | 0–65535 | Total bytes in key data |
 | skip | 6 | 8 | 0–255 | Skip prefix length |
 | flags | 7 | 8 | bit 0 | 0 = compact, 1 = bitmask |
@@ -102,13 +102,11 @@ Each key entry in the index region is: 2-byte length prefix + raw key bytes. Ent
 
 | Constraint | Value | Enforced by |
 |------------|-------|-------------|
-| Max entries | 4,096 | `COMPACT_MAX` |
-| Max allocation | 256×256 u64 | `COMPACT_MAX_ALLOC_U64` |
-| Max individual key suffix | 14 bytes | `COMPACT_MAX_KEY_LEN` |
+| Max entries | 32 | `COMPACT_MAX` |
 
 When any limit is exceeded, the node splits into a bitmask parent with compact children (see Split below).
 
-**Read (find):** Linear scan through sorted keys with early exit. Compare each key entry against the search suffix. O(K) where K is the entry count in this node (bounded by 4,096, typically much smaller).
+**Read (find):** Linear scan through sorted keys with early exit. Compare each key entry against the search suffix. O(K) where K is the entry count in this node (bounded by 32, typically much smaller).
 
 **Insert:** Check if key exists (update or return FOUND depending on mode). If new, rebuild the entire node: collect existing entries, add the new one, sort, write fresh node. O(K) rebuild.
 
@@ -312,7 +310,7 @@ In the table below, **M** is the key length in bytes and **N** is the total numb
 | Operation | kstrie | std::map | Notes |
 |-----------|--------|----------|-------|
 | Find | O(M) | O(M · log N) | Trie descends by key bytes. Map does log N string comparisons. |
-| Insert | O(M + K) | O(M · log N) | K = entries in the target compact node (≤4,096). Rebuild is O(K). |
+| Insert | O(M + K) | O(M · log N) | K = entries in the target compact node (≤32). Rebuild is O(K). |
 | Erase | O(M + K) | O(M · log N) | Same compact rebuild cost as insert. |
 | Iterate next | O(M) | O(1) amortized | Trie re-descends from root. Map follows one RB-tree pointer. |
 | Memory | Shared prefixes | Per-entry overhead | Trie shares prefix storage. Map stores full key per node. |

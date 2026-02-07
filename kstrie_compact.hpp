@@ -1,6 +1,5 @@
 #pragma once
 #include "kstrie_support.hpp"
-#include <algorithm>
 
 namespace gteitelbaum {
 
@@ -298,21 +297,31 @@ struct kstrie_compact {
         uint8_t* dst = key_buf + buf_off;
         if (new_suffix_len > 0)
             std::memcpy(dst, new_suffix, new_suffix_len);
-        entries[ei].key      = dst;
-        entries[ei].key_len  = new_suffix_len;
-        entries[ei].raw_slot = new_raw;
-        buf_off += new_suffix_len;
+
+        // Find insertion position (existing entries already sorted)
+        build_entry new_entry;
+        new_entry.key      = dst;
+        new_entry.key_len  = new_suffix_len;
+        new_entry.raw_slot = new_raw;
+
+        int pos = ei;  // default: append at end
+        for (int i = 0; i < ei; ++i) {
+            uint32_t min_len = entries[i].key_len < new_suffix_len
+                             ? entries[i].key_len : new_suffix_len;
+            int cmp = std::memcmp(entries[i].key, dst, min_len);
+            if (cmp > 0 || (cmp == 0 && entries[i].key_len > new_suffix_len)) {
+                pos = i;
+                break;
+            }
+        }
+
+        // Shift entries right and insert
+        std::memmove(&entries[pos + 1], &entries[pos],
+                     (ei - pos) * sizeof(build_entry));
+        entries[pos] = new_entry;
         ei++;
 
         assert(ei == new_count);
-
-        std::sort(entries, entries + new_count,
-                  [](const build_entry& a, const build_entry& b) {
-                      uint32_t min_len = std::min(a.key_len, b.key_len);
-                      int cmp = std::memcmp(a.key, b.key, min_len);
-                      if (cmp != 0) return cmp < 0;
-                      return a.key_len < b.key_len;
-                  });
 
         uint64_t* result = build_compact(mem, new_skip, skip_data,
                                           entries, new_count);
