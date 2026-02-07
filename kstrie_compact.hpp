@@ -63,11 +63,11 @@ struct kstrie_compact {
     // ------------------------------------------------------------------
 
     static const uint8_t* keys_ptr(const uint64_t* node, const hdr_type& h) noexcept {
-        return h.get_index(const_cast<uint64_t*>(node));
+        return h.get_compact_index(node);
     }
 
     static uint8_t* keys_ptr(uint64_t* node, const hdr_type& h) noexcept {
-        return h.get_index(node);
+        return h.get_compact_index(node);
     }
 
     // ------------------------------------------------------------------
@@ -82,17 +82,14 @@ struct kstrie_compact {
     static search_pos search(const uint8_t* keys, uint16_t N,
                              const uint8_t* suffix,
                              uint32_t suffix_len) noexcept {
-        search_pos ret = {false, N};
         const uint8_t* kp = keys;
         for (int ki = 0; ki < N; ++ki) {
             int cmp = key_cmp(kp, suffix, suffix_len);
-            if (cmp >= 0) [[unlikely]] {
-                ret = {(cmp == 0), ki};
-                break;
-            }
+            if (cmp >= 0) [[unlikely]]
+                return {(cmp == 0), ki};
             kp = key_next(kp);
         }
-        return ret;
+        return {false, N};
     }
 
     // ------------------------------------------------------------------
@@ -106,7 +103,7 @@ struct kstrie_compact {
         auto [found, pos] = search(keys, h.count, suffix, suffix_len);
         if (!found) return nullptr;
 
-        uint64_t* sb = h.get_slots(const_cast<uint64_t*>(node));
+        const uint64_t* sb = h.get_compact_slots(node);
         return slots::load_value(sb, pos);
     }
 
@@ -340,13 +337,14 @@ struct kstrie_compact {
         build_entry* all = new build_entry[N];
         collect_entries(node, h, all, key_buf);
 
-        // Zero-length key → becomes eos_child
-        uint64_t* eos_leaf = nullptr;
+        // Zero-length key → becomes inline eos value on bitmask parent
+        uint64_t eos_raw = 0;
+        bool has_eos = false;
         uint16_t data_start = 0;
 
         if (N > 0 && all[0].key_len == 0) {
-            build_entry eos_entry = all[0];
-            eos_leaf = build_compact(mem, 0, nullptr, &eos_entry, 1);
+            eos_raw = all[0].raw_slot;
+            has_eos = true;
             data_start = 1;
         }
 
@@ -404,9 +402,9 @@ struct kstrie_compact {
             bucket_bytes, children,
             static_cast<uint16_t>(n_buckets));
 
-        if (eos_leaf) {
+        if (has_eos) {
             hdr_type& ph = hdr_type::from_node(parent);
-            bitmask_ops::set_eos_child(parent, ph, eos_leaf);
+            parent = bitmask_ops::add_eos_raw(parent, ph, mem, eos_raw);
         }
 
         mem.free_node(node);

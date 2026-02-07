@@ -66,8 +66,10 @@ private:
         if (h.is_compact()) {
             slots_type::destroy_values(slot_base, 0, h.count);
         } else {
-            for (uint16_t i = 1; i <= static_cast<uint16_t>(h.count + 1); ++i)
+            for (uint16_t i = 1; i <= h.count; ++i)
                 destroy_tree(slots_type::load_child(slot_base, i));
+            if (h.has_eos())
+                slots_type::destroy_value(slot_base, h.count + 1);
         }
 
         mem_.free_node(node);
@@ -82,7 +84,7 @@ private:
 
         if (!h.is_compact()) {
             const uint64_t* slot_base = h.get_slots(node);
-            for (uint16_t i = 1; i <= static_cast<uint16_t>(h.count + 1); ++i)
+            for (uint16_t i = 1; i <= h.count; ++i)
                 total += memory_usage_impl(slots_type::load_child(slot_base, i));
         }
 
@@ -101,7 +103,7 @@ private:
         const uint64_t* node = root_;
         uint32_t consumed = 0;
 
-        hdr_type h{};
+        hdr_type h;
         for (;;) {
             h = hdr_type::from_node(node);
 
@@ -111,11 +113,10 @@ private:
             if (h.is_compact()) [[unlikely]]
                 break;
 
-            if (consumed == key_len) [[unlikely]] {
-                node = bitmask_type::eos_child(node, h);
-            } else {
-                node = bitmask_type::find_child(node, h, mapped[consumed++]);
-            }
+            if (consumed == key_len) [[unlikely]]
+                return bitmask_type::eos_value(node, h);
+
+            node = bitmask_type::find_child(node, h, mapped[consumed++]);
         }
 
         return compact_type::find(node, h, mapped + consumed,
@@ -127,12 +128,16 @@ private:
     // ------------------------------------------------------------------
 
     const VALUE* find_impl(const uint8_t* key_data, uint32_t key_len) const noexcept {
-        uint8_t stack_buf[256];
-        auto [mapped, heap_buf] = get_mapped(key_data, key_len,
-                                              stack_buf, sizeof(stack_buf));
-        const VALUE* result = find_inner(mapped, key_len);
-        delete[] heap_buf;
-        return result;
+        if constexpr (CHARMAP::IS_IDENTITY) {
+            return find_inner(key_data, key_len);
+        } else {
+            uint8_t stack_buf[256];
+            auto [mapped, heap_buf] = get_mapped(key_data, key_len,
+                                                  stack_buf, sizeof(stack_buf));
+            const VALUE* result = find_inner(mapped, key_len);
+            delete[] heap_buf;
+            return result;
+        }
     }
 
     VALUE* find_impl(const uint8_t* key_data, uint32_t key_len) noexcept {
@@ -316,8 +321,6 @@ public:
                 node, h, mem_, static_cast<uint8_t>(new_old_skip),
                 skip_copy + match_len + 1);
 
-            uint64_t* eos_leaf = add_child(key_data + key_len, 0, value);
-
             uint8_t bucket_idx[1] = {old_byte};
             uint64_t* children[1] = {old_reskipped};
             uint64_t* parent = bitmask_type::create_with_children(
@@ -325,7 +328,7 @@ public:
                 bucket_idx, children, 1);
 
             hdr_type& ph = hdr_type::from_node(parent);
-            bitmask_type::set_eos_child(parent, ph, eos_leaf);
+            parent = bitmask_type::set_eos_value(parent, ph, mem_, value);
 
             return {parent, insert_outcome::INSERTED};
         }
@@ -333,19 +336,14 @@ public:
         consumed = mr.consumed;
 
         if (consumed == key_len) {
-            uint64_t* eos = bitmask_type::eos_child(node, h);
-
-            if (eos == sentinel_ptr()) {
-                uint64_t* leaf = add_child(key_data + consumed, 0, value);
-                bitmask_type::set_eos_child(node, h, leaf);
-                return {node, insert_outcome::INSERTED};
+            if (!h.has_eos()) {
+                uint64_t* nn = bitmask_type::set_eos_value(node, h, mem_, value);
+                return {nn, insert_outcome::INSERTED};
             }
-
-            insert_result r = insert_node(eos, key_data, key_len, value,
-                                           consumed, mode);
-            if (r.node != eos)
-                bitmask_type::set_eos_child(node, h, r.node);
-            return {node, r.outcome};
+            if (mode == insert_mode::INSERT)
+                return {node, insert_outcome::FOUND};
+            bitmask_type::update_eos_value(node, h, value);
+            return {node, insert_outcome::UPDATED};
         }
 
         {

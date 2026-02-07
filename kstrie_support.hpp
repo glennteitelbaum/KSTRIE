@@ -268,6 +268,7 @@ struct node_header {
 
     [[nodiscard]] bool is_compact()      const noexcept { return !(flags & 1); }
     [[nodiscard]] bool is_bitmap()       const noexcept { return flags & 1; }
+    [[nodiscard]] bool has_eos()         const noexcept { return flags & 2; }
     [[nodiscard]] bool is_continuation() const noexcept { return skip == SKIP_CONTINUATION; }
     [[nodiscard]] bool is_sentinel()     const noexcept { return alloc_u64 == 0; }
 
@@ -277,20 +278,21 @@ struct node_header {
 
     void set_compact(bool v) noexcept { if (v) flags &= ~uint8_t(1); else flags |= 1; }
     void set_bitmask(bool v) noexcept { if (v) flags |= 1; else flags &= ~uint8_t(1); }
+    void set_has_eos(bool v) noexcept { if (v) flags |= 2; else flags &= ~uint8_t(2); }
 
     void copy_from(const node_header& src) noexcept {
         uint16_t saved = alloc_u64; *this = src; alloc_u64 = saved;
     }
 
     [[nodiscard]] uint16_t total_slots() const noexcept {
-        return is_compact() ? count : static_cast<uint16_t>(count + 2);
+        if (is_compact()) return count;
+        return static_cast<uint16_t>(count + 1 + has_eos());
     }
 
     static constexpr size_t header_size() noexcept { return 8; }
 
     [[nodiscard]] size_t skip_size() const noexcept {
-        uint32_t sb = skip_bytes();
-        return sb > 0 ? ((sb + 7) & ~size_t(7)) : 0;
+        return (skip + 7) & ~size_t(7);
     }
 
     // Write-path only: compute index size by dispatching to type
@@ -308,6 +310,8 @@ struct node_header {
         return reinterpret_cast<const uint8_t*>(node) + header_size();
     }
 
+    // --- Generic accessors (write-path, explanatory) ---
+
     [[nodiscard]] uint8_t* get_index(uint64_t* node) const noexcept {
         return reinterpret_cast<uint8_t*>(node) + header_size() + skip_size();
     }
@@ -315,11 +319,42 @@ struct node_header {
         return reinterpret_cast<const uint8_t*>(node) + header_size() + skip_size();
     }
 
-    // Fast slots access: single pointer add
     [[nodiscard]] uint64_t* get_slots(uint64_t* node) const noexcept {
         return node + slots_off;
     }
     [[nodiscard]] const uint64_t* get_slots(const uint64_t* node) const noexcept {
+        return node + slots_off;
+    }
+
+    // --- Bitmap-typed accessors (read-path: branchless) ---
+
+    static constexpr size_t BITMAP_U64 = CHARMAP::BITMAP_WORDS;
+
+    [[nodiscard]] const uint64_t* get_bitmap_index(const uint64_t* node) const noexcept {
+        return node + slots_off - BITMAP_U64;
+    }
+    [[nodiscard]] uint64_t* get_bitmap_index(uint64_t* node) const noexcept {
+        return node + slots_off - BITMAP_U64;
+    }
+    [[nodiscard]] const uint64_t* get_bitmap_slots(const uint64_t* node) const noexcept {
+        return node + slots_off;
+    }
+    [[nodiscard]] uint64_t* get_bitmap_slots(uint64_t* node) const noexcept {
+        return node + slots_off;
+    }
+
+    // --- Compact-typed accessors ---
+
+    [[nodiscard]] const uint8_t* get_compact_index(const uint64_t* node) const noexcept {
+        return reinterpret_cast<const uint8_t*>(node) + header_size() + skip_size();
+    }
+    [[nodiscard]] uint8_t* get_compact_index(uint64_t* node) const noexcept {
+        return reinterpret_cast<uint8_t*>(node) + header_size() + skip_size();
+    }
+    [[nodiscard]] const uint64_t* get_compact_slots(const uint64_t* node) const noexcept {
+        return node + slots_off;
+    }
+    [[nodiscard]] uint64_t* get_compact_slots(uint64_t* node) const noexcept {
         return node + slots_off;
     }
 
