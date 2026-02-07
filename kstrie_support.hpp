@@ -35,8 +35,6 @@ struct kstrie_bitmask;
 template <typename VALUE, typename CHARMAP, typename ALLOC>
 struct kstrie_compact;
 
-template <typename VALUE, typename CHARMAP, typename ALLOC>
-class kstrie;
 
 inline constexpr uint16_t padded_size(uint16_t needed) noexcept {
     if (needed <= 4) return needed;
