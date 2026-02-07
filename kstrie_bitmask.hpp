@@ -299,15 +299,6 @@ struct kstrie_bitmask {
         return node;
     }
 
-    static int first_child_idx(const uint64_t* node, const hdr_type& h) noexcept {
-        const bitmap_type* bm = get_bitmap(node, h);
-        return bm->find_next_set(0);
-    }
-
-    static int next_child_idx(const uint64_t* node, const hdr_type& h, int prev) noexcept {
-        const bitmap_type* bm = get_bitmap(node, h);
-        return bm->find_next_set(prev + 1);
-    }
 
     static uint64_t* child_by_slot(const uint64_t* node, const hdr_type& h,
                                    uint16_t slot) noexcept {
@@ -315,45 +306,6 @@ struct kstrie_bitmask {
         return slots::load_child(sb, slot + 1);
     }
 
-    static size_t memory_usage(const uint64_t* node) noexcept {
-        if (node == sentinel_ptr()) return 0;
-        const hdr_type& h = hdr_type::from_node(node);
-        size_t total = static_cast<size_t>(h.alloc_u64) * 8;
-        const uint64_t* sb = h.get_slots(const_cast<uint64_t*>(node));
-        for (uint16_t i = 1; i <= h.count; ++i) {
-            uint64_t* child = slots::load_child(sb, i);
-            if (child == sentinel_ptr()) continue;
-            const hdr_type& ch = hdr_type::from_node(child);
-            if (ch.is_bitmap()) total += memory_usage(child);
-            else total += static_cast<size_t>(ch.alloc_u64) * 8;
-        }
-        // eos value is inline — no extra allocation
-        return total;
-    }
-
-    static void destroy(uint64_t* node, mem_type& mem) {
-        if (node == sentinel_ptr()) return;
-        hdr_type& h = hdr_type::from_node(node);
-        uint64_t* sb = h.get_slots(node);
-        for (uint16_t i = 1; i <= h.count; ++i) {
-            uint64_t* child = slots::load_child(sb, i);
-            if (child == sentinel_ptr()) continue;
-            if (hdr_type::from_node(child).is_bitmap()) destroy(child, mem);
-            mem.free_node(child);
-        }
-        // Destroy inline eos value if present
-        if (h.has_eos())
-            slots::destroy_value(sb, h.count + 1);
-    }
-
-    static uint16_t child_count(const uint64_t* node, const hdr_type& h) noexcept {
-        return h.count;
-    }
-
-    static uint16_t popcount(const uint64_t* node, const hdr_type& h) noexcept {
-        const bitmap_type* bm = get_bitmap(node, h);
-        return static_cast<uint16_t>(bm->popcount());
-    }
 };
 
 } // namespace gteitelbaum

@@ -1,5 +1,6 @@
 #pragma once
 #include "kstrie_support.hpp"
+#include <algorithm>
 
 namespace gteitelbaum {
 

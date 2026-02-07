@@ -1,6 +1,5 @@
 #pragma once
 
-#include <algorithm>
 #include <array>
 #include <bit>
 #include <cassert>
@@ -10,13 +9,6 @@
 #include <memory>
 #include <type_traits>
 #include <utility>
-
-// Debug: assert checks condition. Release: [[assume]] informs optimizer.
-#ifdef KSTRIE_DEBUG
-  #define KSTRIE_ASSERT(cond) assert(cond)
-#else
-  #define KSTRIE_ASSERT(cond) [[assume(cond)]]
-#endif
 
 namespace gteitelbaum {
 
@@ -110,8 +102,6 @@ struct bitmap_n {
         }
     }
 };
-
-using bitmap_256 = bitmap_n<4>;
 
 inline constexpr std::array<uint8_t, 256> IDENTITY_MAP = []() {
     std::array<uint8_t, 256> m{};
@@ -465,11 +455,6 @@ struct erase_info {
 
 inline constexpr uint32_t COMPACT_COLLAPSE = COMPACT_MAX / 2;
 
-struct search_result {
-    bool     found;
-    int      pos;
-    uint32_t block_offset;
-};
 
 template <typename ALLOC>
 struct kstrie_memory {
@@ -561,15 +546,6 @@ struct kstrie_skip {
         return r;
     }
 
-    static uint32_t find_lcp(const uint8_t* a, uint32_t a_len,
-                             const uint8_t* b, uint32_t b_len) noexcept {
-        uint32_t max_cmp = std::min(a_len, b_len);
-        uint32_t ml = 0;
-        while (ml < max_cmp && a[ml] == b[ml]) ++ml;
-        return ml;
-    }
-
-    static size_t size(hdr_type h) noexcept { return h.skip_size(); }
 };
 
 // ============================================================================
