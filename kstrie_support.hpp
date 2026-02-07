@@ -577,4 +577,29 @@ struct kstrie_skip {
     static size_t size(hdr_type h) noexcept { return h.skip_size(); }
 };
 
+// ============================================================================
+// Character mapping helpers (free functions)
+// ============================================================================
+
+template <typename CHARMAP>
+inline void map_bytes_into(const uint8_t* src, uint8_t* dst,
+                           uint32_t len) noexcept {
+    for (uint32_t i = 0; i < len; ++i)
+        dst[i] = CHARMAP::to_index(src[i]);
+}
+
+template <typename CHARMAP>
+inline std::pair<const uint8_t*, uint8_t*>
+get_mapped(const uint8_t* raw, uint32_t len,
+           uint8_t* stack_buf, size_t stack_size) noexcept {
+    if constexpr (CHARMAP::IS_IDENTITY) {
+        return {raw, nullptr};
+    } else {
+        uint8_t* hb = (len <= stack_size) ? nullptr : new uint8_t[len];
+        uint8_t* buf = hb ? hb : stack_buf;
+        map_bytes_into<CHARMAP>(raw, buf, len);
+        return {buf, hb};
+    }
+}
+
 } // namespace gteitelbaum
