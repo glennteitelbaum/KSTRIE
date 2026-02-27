@@ -101,38 +101,33 @@ inline uint8_t* vk_create(uint8_t log2 = 1) {
 }
 
 // ---------------------------------------------------------------------------
-// keycmp
+// keycmp — (length, bytes) ordering: length mismatch resolves without memcmp
 // ---------------------------------------------------------------------------
 
-inline int keycmp(const uint8_t* K, uint8_t Klen,
+inline int keycmp(const uint8_t* K, const uint8_t* Kend,
                   const uint8_t* S, uint8_t Slen) {
-    int n = Klen < Slen ? Klen : Slen;
-    int r = std::memcmp(K, S, static_cast<size_t>(n));
-    return r != 0 ? r : (int)Klen - (int)Slen;
+    uint8_t Klen = static_cast<uint8_t>(Kend - K);
+    if (Klen != Slen) return static_cast<int>(Klen) - static_cast<int>(Slen);
+    return std::memcmp(K, S, Klen);
 }
 
 // ---------------------------------------------------------------------------
-// bfind — branchless binary search
-// sentinel slots are zero-length; mask advance with -(c < entries)
+// bfind — conventional binary search with early exit on match
 // ---------------------------------------------------------------------------
 
 inline int bfind(const uint8_t* node, const uint8_t* K, uint8_t Klen) {
     const uint16_t* offsets = vk_offsets(node);
-    const int       entries = vk_entries(node);
-    int             pos     = 0;
-    int             step    = 1 << (vk_log2(node) - 1);
-    do {
-        int            c     = pos + step;
-        const uint8_t* S     = node + offsets[c];
-        uint8_t        Slen  = static_cast<uint8_t>(offsets[c + 1] - offsets[c]);
-        int            cmp   = keycmp(K, Klen, S, Slen);
-        int            valid = -(c < entries);
-        pos += step & valid & -(cmp >= 0);
-    } while (step >>= 1);
-
-    const uint8_t* S    = node + offsets[pos];
-    uint8_t        Slen = static_cast<uint8_t>(offsets[pos + 1] - offsets[pos]);
-    return keycmp(K, Klen, S, Slen) == 0 ? pos : -1;
+    const uint8_t*  Kend    = K + Klen;
+    int lo = 0, hi = vk_entries(node);
+    while (lo < hi) {
+        int            mid  = lo + ((hi - lo) >> 1);
+        const uint8_t* S    = node + offsets[mid];
+        uint8_t        Slen = static_cast<uint8_t>(offsets[mid + 1] - offsets[mid]);
+        int            cmp  = keycmp(K, Kend, S, Slen);
+        if (cmp == 0) return mid;
+        if (cmp < 0) hi = mid; else lo = mid + 1;
+    }
+    return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -151,64 +146,61 @@ inline uint8_t* vk_rebuild(uint8_t* old_node);
 // vk_insert — sorted insert keeping blob in sorted order
 //
 //  1. Rebuild if full
-//  2. Find sorted insertion index
-//  3. Memmove blob tail from offsets[ins] upward by Klen (opens a slot in blob)
+//  2. Binary-search sorted insertion index (#2)
+//  3. Memmove blob tail from offsets[ins] upward by Klen
 //  4. Copy new key into opened slot
-//  5. Shift offset array right at ins; update all offsets >= ins by +Klen
-//  6. Repaint sentinel pads
+//  5. Fused offset shift + Klen addition in one backward pass (#4)
+//  6. Single sentinel write (bfind masks invalid Slen) (#3)
 //  7. Shift value array right at ins, store val
 // ---------------------------------------------------------------------------
 
 inline uint8_t* vk_insert(uint8_t* node,
                            const uint8_t* K, uint8_t Klen,
                            VALUE val) {
-    if (vk_entries(node) == vk_cap(node))
+    if (vk_entries(node) == vk_cap(node)) [[unlikely]]      // #6
         node = vk_rebuild(node);
 
     uint8_t   entries   = vk_entries(node);
-    uint16_t  cap       = vk_cap(node);
     uint16_t* offsets   = vk_offsets_mut(node);
     uint16_t  bb        = vk_blob_base(node[1]);
     uint16_t  blob_used = vk_blob_used(node);
     uint16_t  sentinel  = bb + blob_used;
 
-    // 1. sorted insertion point
-    int ins = 0;
-    while (ins < entries) {
-        const uint8_t* S    = node + offsets[ins];
-        uint8_t        Slen = static_cast<uint8_t>(offsets[ins + 1] - offsets[ins]);
-        if (keycmp(K, Klen, S, Slen) <= 0) break;
-        ++ins;
+    // #2: binary search for insertion point
+    const uint8_t* Kend = K + Klen;
+    int lo = 0, hi = entries;
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) >> 1);
+        const uint8_t* S    = node + offsets[mid];
+        uint8_t        Slen = static_cast<uint8_t>(offsets[mid + 1] - offsets[mid]);
+        if (keycmp(K, Kend, S, Slen) > 0)
+            lo = mid + 1;
+        else
+            hi = mid;
     }
+    int ins = lo;
 
     uint16_t ins_pos = offsets[ins];   // absolute blob position for new key
 
-    // 2. open space in blob at ins_pos: shift tail bytes upward by Klen
+    // 3. open space in blob at ins_pos: shift tail bytes upward by Klen
     uint16_t tail = static_cast<uint16_t>(sentinel - ins_pos);
     if (tail > 0)
         std::memmove(node + ins_pos + Klen, node + ins_pos, tail);
 
-    // 3. copy new key into opened slot
+    // 4. copy new key into opened slot
     std::memcpy(node + ins_pos, K, Klen);
 
-    // 4. update blob_used
-    *(uint16_t*)(node + 2) = blob_used + Klen;
+    // 5. update blob_used
     uint16_t new_sentinel = sentinel + Klen;
+    *(uint16_t*)(node + 2) = blob_used + Klen;
 
-    // 5. shift offset array right at ins (carry +1 for sentinel)
-    std::memmove(offsets + ins + 1, offsets + ins,
-                 static_cast<size_t>(entries - ins + 1) * sizeof(uint16_t));
-
-    // new key's offset
+    // #4: fused backward pass — shift offsets right AND add Klen in one sweep
+    for (int i = entries; i > ins; --i)
+        offsets[i] = offsets[i - 1] + Klen;
     offsets[ins] = ins_pos;
 
-    // offsets for keys after ins point into blob positions that shifted up by Klen
-    for (int i = ins + 1; i < entries + 1; ++i)
-        offsets[i] += Klen;
-
-    // 6. repaint sentinels [entries+1 .. cap]
-    for (uint16_t i = static_cast<uint16_t>(entries + 1); i <= cap; ++i)
-        offsets[i] = new_sentinel;
+    // #3: single sentinel write — bfind masks Slen for invalid slots
+    offsets[entries + 1] = new_sentinel;
 
     // 7. shift value array right at ins, store val
     VALUE* values = vk_values_mut(node);
@@ -221,7 +213,7 @@ inline uint8_t* vk_insert(uint8_t* node,
 }
 
 // ---------------------------------------------------------------------------
-// vk_rebuild — grow to next capacity; blob arrives pre-sorted (offsets are sorted)
+// vk_rebuild — grow to next capacity (#5: bulk memcpy + offset delta fixup)
 // ---------------------------------------------------------------------------
 
 inline uint8_t* vk_rebuild(uint8_t* old_node) {
@@ -231,29 +223,29 @@ inline uint8_t* vk_rebuild(uint8_t* old_node) {
     uint8_t  entries  = vk_entries(old_node);
     uint8_t* new_node = vk_create(old_log2 + 1);
 
-    const uint16_t* old_off = vk_offsets(old_node);
-    uint16_t*       new_off = vk_offsets_mut(new_node);
-    const VALUE*    old_val = vk_values(old_node);
-    uint16_t        new_cap = vk_cap(new_node);
-    uint16_t        new_bb  = vk_blob_base(old_log2 + 1);
-    uint8_t*        new_blob = new_node + new_bb;
-    uint16_t        cursor  = 0;
+    const uint16_t* old_off  = vk_offsets(old_node);
+    uint16_t*       new_off  = vk_offsets_mut(new_node);
+    uint16_t        old_bb   = vk_blob_base(old_log2);
+    uint16_t        new_bb   = vk_blob_base(old_log2 + 1);
+    uint16_t        blob_used = vk_blob_used(old_node);
 
-    for (uint8_t i = 0; i < entries; ++i) {
-        uint8_t klen  = static_cast<uint8_t>(old_off[i + 1] - old_off[i]);
-        new_off[i]    = new_bb + cursor;
-        std::memcpy(new_blob + cursor, old_node + old_off[i], klen);
-        cursor += klen;
-    }
+    // #5: single bulk copy of entire blob
+    std::memcpy(new_node + new_bb, old_node + old_bb, blob_used);
 
-    uint16_t new_sentinel = new_bb + cursor;
-    *(uint16_t*)(new_node + 2) = cursor;   // blob_used
+    // #5: delta fixup — old absolute offsets shift by (new_bb - old_bb)
+    uint16_t delta = new_bb - old_bb;
+    for (uint8_t i = 0; i < entries; ++i)
+        new_off[i] = old_off[i] + delta;
+
+    uint16_t new_sentinel = new_bb + blob_used;
+    uint16_t new_cap      = vk_cap(new_node);
+    *(uint16_t*)(new_node + 2) = blob_used;
 
     for (uint16_t i = entries; i <= new_cap; ++i)
         new_off[i] = new_sentinel;
 
     VALUE* new_val = vk_values_mut(new_node);
-    std::memcpy(new_val, old_val, entries * sizeof(VALUE));
+    std::memcpy(new_val, vk_values(old_node), entries * sizeof(VALUE));
 
     new_node[0] = entries;
     std::free(old_node);
