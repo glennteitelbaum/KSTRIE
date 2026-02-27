@@ -28,7 +28,7 @@
 
 using VALUE = void*;
 
-static constexpr uint16_t VK2_INIT_CAP    = 32;
+static constexpr uint16_t VK2_INIT_CAP    = 24;
 static constexpr uint16_t VK2_MAX_CAP     = 4096;
 static constexpr uint32_t VK2_BLOB_CAP_MULT = 128;   // blob_cap = cap * mult
 
@@ -226,7 +226,7 @@ inline uint8_t* vk2_rebuild(uint8_t* old_node) {
     auto* oh = vk2_hdr(old_node);
     assert(oh->cap < VK2_MAX_CAP);
 
-    uint16_t new_cap = oh->cap * 2;
+    uint16_t new_cap = oh->cap + (oh->cap >> 1);   // 1.5x growth
     if (new_cap > VK2_MAX_CAP) new_cap = VK2_MAX_CAP;
 
     uint8_t* new_node = vk2_create(new_cap);

@@ -274,8 +274,7 @@ int main() {
         auto keys      = gen_keys(N, 4, 32, 42);
         auto miss_keys = gen_miss_keys(N, 4, 32);
 
-        uint16_t init = VK2_INIT_CAP;
-        while (init < N && init < VK2_MAX_CAP) init *= 2;
+        uint16_t init = static_cast<uint16_t>(N < VK2_MAX_CAP ? N : VK2_MAX_CAP);
         smoke_test_vk2(keys, init);
 
         auto v2 = bench_vk2(keys, miss_keys, init);
