@@ -87,8 +87,14 @@ inline VALUE vk2_find(const uint8_t* node, const uint8_t* K, uint8_t Klen) {
     const uint8_t*  B = vk2_blob(node);
     const int       e = h->entries;
 
-    uint8_t fb   = Klen > 0 ? K[0] : 0;
-    uint8_t tail = Klen > 0 ? Klen - 1 : 0;
+    if (Klen == 0) [[unlikely]] {
+        if (L[0] == 0) return vk2_values(node)[0];
+        return nullptr;
+    }
+
+    uint8_t fb   = K[0];
+    uint8_t tail = Klen - 1;
+    const uint8_t* K2 = K + 1;
 
     int lo = 0, hi = e;
     while (lo < hi) [[likely]] {
@@ -97,7 +103,7 @@ inline VALUE vk2_find(const uint8_t* node, const uint8_t* K, uint8_t Klen) {
         if (c == 0) [[unlikely]] {
             c = static_cast<int>(fb) - static_cast<int>(F[m]);
             if (c == 0) [[unlikely]] {
-                if (tail > 0) c = std::memcmp(K + 1, B + O[m], tail);
+                c = std::memcmp(K2, B + O[m], tail);
                 if (c == 0) [[unlikely]] return vk2_values(node)[m];
             }
         }
@@ -116,7 +122,30 @@ inline uint8_t* vk2_rebuild(uint8_t* old_node);
 inline uint8_t* vk2_insert(uint8_t* node,
                             const uint8_t* K, uint8_t Klen, VALUE val) {
     auto* h = vk2_hdr(node);
-    uint8_t tail = Klen > 0 ? Klen - 1 : 0;
+
+    if (Klen == 0) [[unlikely]] {
+        // empty key: no blob data, fb=0, insert at position 0
+        if (h->entries == h->cap) [[unlikely]]
+            node = vk2_rebuild(node);
+        h = vk2_hdr(node);
+        uint16_t entries = h->entries;
+        uint8_t*  L = vk2_lengths(node);
+        uint8_t*  F = vk2_firsts(node);
+        uint32_t* O = vk2_offsets(node);
+        VALUE*    V = vk2_values(node);
+        if (entries > 0) {
+            std::memmove(L + 1, L, entries);
+            std::memmove(F + 1, F, entries);
+            std::memmove(O + 1, O, entries * sizeof(uint32_t));
+            std::memmove(V + 1, V, entries * sizeof(VALUE));
+        }
+        L[0] = 0; F[0] = 0; O[0] = 0; V[0] = val;
+        h->entries = entries + 1;
+        return node;
+    }
+
+    uint8_t fb   = K[0];
+    uint8_t tail = Klen - 1;
 
     if (h->entries == h->cap ||
         h->blob_used + tail > vk2_blob_cap(h->cap)) [[unlikely]]
@@ -135,8 +164,6 @@ inline uint8_t* vk2_insert(uint8_t* node,
     if (tail > 0) std::memcpy(B + bp, K + 1, tail);
     h->blob_used = bp + tail;
 
-    uint8_t fb = Klen > 0 ? K[0] : 0;
-
     // find insertion point in (length, first_byte, tail) order
     int lo = 0, hi = entries;
     while (lo < hi) [[likely]] {
@@ -144,7 +171,7 @@ inline uint8_t* vk2_insert(uint8_t* node,
         int c = static_cast<int>(Klen) - static_cast<int>(L[m]);
         if (c == 0) [[unlikely]] {
             c = static_cast<int>(fb) - static_cast<int>(F[m]);
-            if (c == 0 && tail > 0) [[unlikely]]
+            if (c == 0) [[unlikely]]
                 c = std::memcmp(K + 1, B + O[m], tail);
         }
         if (c > 0) lo = m + 1; else hi = m;
