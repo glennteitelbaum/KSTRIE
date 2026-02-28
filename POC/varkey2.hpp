@@ -3,190 +3,98 @@
 // ---------------------------------------------------------------------------
 // varkey2 — two-phase (length, bytes) key-value store
 //
-// Node memory layout:
+// Layout: [header][lengths[cap] u8][offsets[cap] u32][blob][values[cap]]
 //
-//   [0..1]     entries       u16  — live entry count
-//   [2..5]     blob_used     u32  — u64 slots occupied in blob
-//   [6..7]     cap           u16  — current capacity
-//   [8..]      lengths[cap]  u8   — key lengths, sorted by (length, bytes)
-//              offsets[cap]  u16  — blob positions in u64 slot units
-//              blob[blob_cap]     — keys stored as big-endian u64s, zero-padded
-//              values[cap]   VALUE — at fixed end of allocation (aligned)
-//
-// Keys are stored big-endian so lexicographic byte order == native u64 order.
-// Phase 2 compare is pure u64 integer comparison, no byte ops.
+// Keys stored unpadded in append-only blob, sorted by (length, bytes).
+// Phase 1: binary search lengths[] for matching band.
+// Phase 2: binary search band via memcmp on blob.
+// Insert: append to blob, shift arrays. No blob memmove.
 // ---------------------------------------------------------------------------
 
 #include <cassert>
-#include <bit>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 
 using VALUE = void*;
 
-static constexpr uint16_t VK2_INIT_CAP        = 24;
-static constexpr uint16_t VK2_MAX_CAP         = 4096;
-static constexpr uint16_t VK2_BLOB_SLOTS_MULT = 24;
+static constexpr uint16_t VK2_INIT_CAP      = 24;
+static constexpr uint16_t VK2_MAX_CAP       = 4096;
+static constexpr uint32_t VK2_BLOB_CAP_MULT = 128;
 
 // ---------------------------------------------------------------------------
-// endian conversion helpers
-// ---------------------------------------------------------------------------
-
-inline uint8_t vk2_u64_slots(uint8_t len) {
-    return (len + 7) >> 3;
-}
-
-// convert char key → big-endian u64 array (for storage and lookup)
-inline void vk2_to_be64(uint64_t* dst, const uint8_t* src, uint8_t len) {
-    uint8_t slots = vk2_u64_slots(len);
-    if (slots == 0) return;
-    dst[slots - 1] = 0;                    // zero last slot (clears tail)
-    std::memcpy(dst, src, len);
-    if constexpr (std::endian::native == std::endian::little) {
-        for (uint8_t i = 0; i < slots; ++i)
-            dst[i] = std::byteswap(dst[i]);
-    }
-}
-
-// convert big-endian u64 array → char key (for extraction if needed)
-inline void vk2_from_be64(uint8_t* dst, const uint64_t* src, uint8_t len) {
-    uint8_t slots = vk2_u64_slots(len);
-    if constexpr (std::endian::native == std::endian::little) {
-        uint64_t tmp[32];
-        for (uint8_t i = 0; i < slots; ++i)
-            tmp[i] = std::byteswap(src[i]);
-        std::memcpy(dst, tmp, len);
-    } else {
-        std::memcpy(dst, src, len);
-    }
-}
-
-// compare two big-endian u64 arrays — pure integer comparison
-inline int vk2_cmp64(const uint64_t* A, const uint64_t* B, uint8_t slots) {
-    for (uint8_t i = 0; i < slots; ++i) {
-        if (A[i] != B[i])
-            return A[i] < B[i] ? -1 : 1;
-    }
-    return 0;
-}
-
-// ---------------------------------------------------------------------------
-// layout helpers
+// layout
 // ---------------------------------------------------------------------------
 
 struct VK2Header {
     uint16_t entries;
-    uint32_t blob_used;    // in u64 slots
+    uint32_t blob_used;
     uint16_t cap;
 };
 
 static constexpr size_t VK2_HDR = sizeof(VK2Header);
 
-inline size_t vk2_lengths_offset(uint16_t /*cap*/) {
-    return VK2_HDR;
-}
-
-inline size_t vk2_offsets_offset(uint16_t cap) {
-    size_t raw = VK2_HDR + cap;
-    return (raw + 1) & ~size_t(1);   // u16-align
-}
-
-inline size_t vk2_blob_offset(uint16_t cap) {
-    size_t raw = vk2_offsets_offset(cap) + cap * sizeof(uint16_t);
-    return (raw + 7) & ~size_t(7);   // u64-align blob start
-}
-
-inline size_t vk2_blob_cap(uint16_t cap) {
-    return static_cast<size_t>(cap) * VK2_BLOB_SLOTS_MULT * sizeof(uint64_t);
-}
-
-inline size_t vk2_values_offset(uint16_t cap) {
-    size_t after_blob = vk2_blob_offset(cap) + vk2_blob_cap(cap);
-    return (after_blob + sizeof(VALUE) - 1) & ~(sizeof(VALUE) - 1);
-}
-
-inline size_t vk2_alloc_size(uint16_t cap) {
-    return vk2_values_offset(cap) + cap * sizeof(VALUE);
-}
+inline size_t vk2_offsets_off(uint16_t cap) { return (VK2_HDR + cap + 3) & ~size_t(3); }
+inline size_t vk2_blob_off(uint16_t cap)    { return vk2_offsets_off(cap) + cap * sizeof(uint32_t); }
+inline size_t vk2_blob_cap(uint16_t cap)    { return static_cast<size_t>(cap) * VK2_BLOB_CAP_MULT; }
+inline size_t vk2_values_off(uint16_t cap)  { return (vk2_blob_off(cap) + vk2_blob_cap(cap) + sizeof(VALUE) - 1) & ~(sizeof(VALUE) - 1); }
+inline size_t vk2_alloc_size(uint16_t cap)  { return vk2_values_off(cap) + cap * sizeof(VALUE); }
 
 // ---------------------------------------------------------------------------
 // accessors
 // ---------------------------------------------------------------------------
 
-inline VK2Header*       vk2_hdr    (uint8_t* n)       { return reinterpret_cast<VK2Header*>(n); }
-inline const VK2Header* vk2_hdr    (const uint8_t* n) { return reinterpret_cast<const VK2Header*>(n); }
-
-inline uint8_t*        vk2_lengths (uint8_t* n)       { return n + vk2_lengths_offset(vk2_hdr(n)->cap); }
-inline const uint8_t*  vk2_lengths (const uint8_t* n) { return n + vk2_lengths_offset(vk2_hdr(n)->cap); }
-
-inline uint16_t*       vk2_offsets (uint8_t* n)       { return reinterpret_cast<uint16_t*>(n + vk2_offsets_offset(vk2_hdr(n)->cap)); }
-inline const uint16_t* vk2_offsets (const uint8_t* n) { return reinterpret_cast<const uint16_t*>(n + vk2_offsets_offset(vk2_hdr(n)->cap)); }
-
-inline uint64_t*       vk2_blob   (uint8_t* n)       { return reinterpret_cast<uint64_t*>(n + vk2_blob_offset(vk2_hdr(n)->cap)); }
-inline const uint64_t* vk2_blob   (const uint8_t* n) { return reinterpret_cast<const uint64_t*>(n + vk2_blob_offset(vk2_hdr(n)->cap)); }
-
-inline VALUE*          vk2_values (uint8_t* n)       { return reinterpret_cast<VALUE*>(n + vk2_values_offset(vk2_hdr(n)->cap)); }
-inline const VALUE*    vk2_values (const uint8_t* n) { return reinterpret_cast<const VALUE*>(n + vk2_values_offset(vk2_hdr(n)->cap)); }
+inline VK2Header*       vk2_hdr(uint8_t* n)             { return reinterpret_cast<VK2Header*>(n); }
+inline const VK2Header* vk2_hdr(const uint8_t* n)       { return reinterpret_cast<const VK2Header*>(n); }
+inline uint8_t*         vk2_lengths(uint8_t* n)          { return n + VK2_HDR; }
+inline const uint8_t*   vk2_lengths(const uint8_t* n)    { return n + VK2_HDR; }
+inline uint32_t*        vk2_offsets(uint8_t* n)          { return reinterpret_cast<uint32_t*>(n + vk2_offsets_off(vk2_hdr(n)->cap)); }
+inline const uint32_t*  vk2_offsets(const uint8_t* n)    { return reinterpret_cast<const uint32_t*>(n + vk2_offsets_off(vk2_hdr(n)->cap)); }
+inline uint8_t*         vk2_blob(uint8_t* n)             { return n + vk2_blob_off(vk2_hdr(n)->cap); }
+inline const uint8_t*   vk2_blob(const uint8_t* n)       { return n + vk2_blob_off(vk2_hdr(n)->cap); }
+inline VALUE*           vk2_values(uint8_t* n)           { return reinterpret_cast<VALUE*>(n + vk2_values_off(vk2_hdr(n)->cap)); }
+inline const VALUE*     vk2_values(const uint8_t* n)     { return reinterpret_cast<const VALUE*>(n + vk2_values_off(vk2_hdr(n)->cap)); }
 
 // ---------------------------------------------------------------------------
-// vk2_create
+// create / free
 // ---------------------------------------------------------------------------
 
 inline uint8_t* vk2_create(uint16_t cap = VK2_INIT_CAP) {
     assert(cap >= 2 && cap <= VK2_MAX_CAP);
-    size_t sz = vk2_alloc_size(cap);
-    uint8_t* node = static_cast<uint8_t*>(std::calloc(1, sz));
-    assert(node);
-    auto* h = vk2_hdr(node);
-    h->entries   = 0;
-    h->blob_used = 0;
-    h->cap       = cap;
-    return node;
+    auto* n = static_cast<uint8_t*>(std::calloc(1, vk2_alloc_size(cap)));
+    assert(n);
+    vk2_hdr(n)->cap = cap;
+    return n;
 }
 
+inline void vk2_free(uint8_t* n) { std::free(n); }
+
 // ---------------------------------------------------------------------------
-// vk2_find — two-phase: lengths binary search, then u64 compare
+// find — two-phase binary search
 // ---------------------------------------------------------------------------
 
 inline VALUE vk2_find(const uint8_t* node, const uint8_t* K, uint8_t Klen) {
-    const auto*     h       = vk2_hdr(node);
-    const uint8_t*  lengths = vk2_lengths(node);
-    const uint16_t* offsets = vk2_offsets(node);
-    const uint64_t* blob    = vk2_blob(node);
-    const int       entries = h->entries;
+    const auto*     h = vk2_hdr(node);
+    const uint8_t*  L = vk2_lengths(node);
+    const uint32_t* O = vk2_offsets(node);
+    const uint8_t*  B = vk2_blob(node);
+    const int       e = h->entries;
 
-    // phase 1: lower bound for Klen
-    int lo = 0, hi = entries;
-    while (lo < hi) {
-        int mid = lo + ((hi - lo) >> 1);
-        if (lengths[mid] < Klen) lo = mid + 1; else hi = mid;
-    }
+    // phase 1: find length band [lo, hi)
+    int lo = 0, hi = e;
+    while (lo < hi) { int m = lo + ((hi - lo) >> 1); if (L[m] < Klen) lo = m + 1; else hi = m; }
     int band_lo = lo;
+    hi = e;
+    while (lo < hi) { int m = lo + ((hi - lo) >> 1); if (L[m] <= Klen) lo = m + 1; else hi = m; }
+    if (band_lo >= lo) return nullptr;
 
-    // upper bound for Klen
-    hi = entries;
+    // phase 2: binary search band with memcmp
+    int bh = lo; lo = band_lo; hi = bh;
     while (lo < hi) {
-        int mid = lo + ((hi - lo) >> 1);
-        if (lengths[mid] <= Klen) lo = mid + 1; else hi = mid;
-    }
-    int band_hi = lo;
-
-    if (band_lo >= band_hi) return nullptr;
-
-    // convert search key to big-endian u64 once
-    uint64_t Kbe[32];
-    vk2_to_be64(Kbe, K, Klen);
-    uint8_t slots = vk2_u64_slots(Klen);
-
-    // phase 2: binary search within band — pure u64 integer compare
-    lo = band_lo;
-    hi = band_hi;
-    while (lo < hi) {
-        int mid = lo + ((hi - lo) >> 1);
-        int cmp = vk2_cmp64(Kbe, blob + offsets[mid], slots);
-        if (cmp == 0) return vk2_values(node)[mid];
-        if (cmp < 0) hi = mid; else lo = mid + 1;
+        int m = lo + ((hi - lo) >> 1);
+        int c = std::memcmp(K, B + O[m], Klen);
+        if (c == 0) return vk2_values(node)[m];
+        if (c < 0) hi = m; else lo = m + 1;
     }
     return nullptr;
 }
@@ -195,77 +103,53 @@ inline VALUE vk2_find(const uint8_t* node, const uint8_t* K, uint8_t Klen) {
 inline uint8_t* vk2_rebuild(uint8_t* old_node);
 
 // ---------------------------------------------------------------------------
-// vk2_insert — convert to big-endian, append blob, shift arrays
+// insert — append blob, shift arrays
 // ---------------------------------------------------------------------------
 
 inline uint8_t* vk2_insert(uint8_t* node,
-                            const uint8_t* K, uint8_t Klen,
-                            VALUE val) {
+                            const uint8_t* K, uint8_t Klen, VALUE val) {
     auto* h = vk2_hdr(node);
     if (h->entries == h->cap) [[unlikely]]
         node = vk2_rebuild(node);
 
     h = vk2_hdr(node);
     uint16_t  entries = h->entries;
-    uint8_t*  lengths = vk2_lengths(node);
-    uint16_t* offsets = vk2_offsets(node);
-    uint64_t* blob    = vk2_blob(node);
-    VALUE*    values  = vk2_values(node);
+    uint8_t*  L = vk2_lengths(node);
+    uint32_t* O = vk2_offsets(node);
+    uint8_t*  B = vk2_blob(node);
+    VALUE*    V = vk2_values(node);
 
-    // convert key to big-endian u64s
-    uint64_t Kbe[32];
-    vk2_to_be64(Kbe, K, Klen);
-    uint8_t slots = vk2_u64_slots(Klen);
-
-    // append to blob
-    uint32_t slot_pos = h->blob_used;
-    std::memcpy(blob + slot_pos, Kbe, static_cast<size_t>(slots) * 8);
-    h->blob_used = slot_pos + slots;
+    // append key to blob
+    uint32_t bp = h->blob_used;
+    std::memcpy(B + bp, K, Klen);
+    h->blob_used = bp + Klen;
 
     // find insertion point in (length, bytes) order
     int lo = 0, hi = entries;
-    while (lo < hi) {
-        int mid = lo + ((hi - lo) >> 1);
-        if (lengths[mid] < Klen) lo = mid + 1; else hi = mid;
-    }
+    while (lo < hi) { int m = lo + ((hi - lo) >> 1); if (L[m] < Klen) lo = m + 1; else hi = m; }
     int band_lo = lo;
-
     hi = entries;
-    int band_hi = band_lo;
-    while (band_hi < hi) {
-        int mid = band_hi + ((hi - band_hi) >> 1);
-        if (lengths[mid] <= Klen) band_hi = mid + 1; else hi = mid;
-    }
-
-    lo = band_lo;
-    hi = band_hi;
-    while (lo < hi) {
-        int mid = lo + ((hi - lo) >> 1);
-        if (vk2_cmp64(Kbe, blob + offsets[mid], slots) > 0)
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
+    while (lo < hi) { int m = lo + ((hi - lo) >> 1); if (L[m] <= Klen) lo = m + 1; else hi = m; }
+    int bh = lo; lo = band_lo; hi = bh;
+    while (lo < hi) { int m = lo + ((hi - lo) >> 1); if (std::memcmp(K, B + O[m], Klen) > 0) lo = m + 1; else hi = m; }
     int ins = lo;
 
-    // shift arrays right at ins
     int tail = entries - ins;
     if (tail > 0) {
-        std::memmove(lengths + ins + 1, lengths + ins, tail);
-        std::memmove(offsets + ins + 1, offsets + ins, tail * sizeof(uint16_t));
-        std::memmove(values  + ins + 1, values  + ins, tail * sizeof(VALUE));
+        std::memmove(L + ins + 1, L + ins, tail);
+        std::memmove(O + ins + 1, O + ins, tail * sizeof(uint32_t));
+        std::memmove(V + ins + 1, V + ins, tail * sizeof(VALUE));
     }
 
-    lengths[ins] = Klen;
-    offsets[ins]  = static_cast<uint16_t>(slot_pos);
-    values[ins]   = val;
-
+    L[ins] = Klen;
+    O[ins] = bp;
+    V[ins] = val;
     h->entries = entries + 1;
     return node;
 }
 
 // ---------------------------------------------------------------------------
-// vk2_rebuild — grow capacity, compact blob
+// rebuild — grow 1.5x, compact blob
 // ---------------------------------------------------------------------------
 
 inline uint8_t* vk2_rebuild(uint8_t* old_node) {
@@ -275,42 +159,30 @@ inline uint8_t* vk2_rebuild(uint8_t* old_node) {
     uint16_t new_cap = oh->cap + (oh->cap >> 1);
     if (new_cap > VK2_MAX_CAP) new_cap = VK2_MAX_CAP;
 
-    uint8_t* new_node = vk2_create(new_cap);
-    auto* nh = vk2_hdr(new_node);
+    uint8_t* nn = vk2_create(new_cap);
+    auto* nh = vk2_hdr(nn);
 
-    uint16_t        entries     = oh->entries;
-    const uint8_t*  old_lengths = vk2_lengths(old_node);
-    const uint16_t* old_offsets = vk2_offsets(old_node);
-    const uint64_t* old_blob    = vk2_blob(old_node);
-    const VALUE*    old_values  = vk2_values(old_node);
+    uint16_t        e  = oh->entries;
+    const uint8_t*  oL = vk2_lengths(old_node);
+    const uint32_t* oO = vk2_offsets(old_node);
+    const uint8_t*  oB = vk2_blob(old_node);
 
-    uint8_t*  new_lengths = vk2_lengths(new_node);
-    uint16_t* new_offsets = vk2_offsets(new_node);
-    uint64_t* new_blob    = vk2_blob(new_node);
-    VALUE*    new_values  = vk2_values(new_node);
+    uint8_t*  nL = vk2_lengths(nn);
+    uint32_t* nO = vk2_offsets(nn);
+    uint8_t*  nB = vk2_blob(nn);
 
-    // compact blob contiguously
     uint32_t cursor = 0;
-    for (uint16_t i = 0; i < entries; ++i) {
-        uint8_t slots = vk2_u64_slots(old_lengths[i]);
-        new_lengths[i] = old_lengths[i];
-        new_offsets[i] = static_cast<uint16_t>(cursor);
-        std::memcpy(new_blob + cursor, old_blob + old_offsets[i],
-                     static_cast<size_t>(slots) * 8);
-        cursor += slots;
+    for (uint16_t i = 0; i < e; ++i) {
+        nL[i] = oL[i];
+        nO[i] = cursor;
+        std::memcpy(nB + cursor, oB + oO[i], oL[i]);
+        cursor += oL[i];
     }
+    std::memcpy(vk2_values(nn), vk2_values(old_node), e * sizeof(VALUE));
 
-    std::memcpy(new_values, old_values, entries * sizeof(VALUE));
-
-    nh->entries   = entries;
+    nh->entries   = e;
     nh->blob_used = cursor;
 
     std::free(old_node);
-    return new_node;
+    return nn;
 }
-
-// ---------------------------------------------------------------------------
-// vk2_free
-// ---------------------------------------------------------------------------
-
-inline void vk2_free(uint8_t* node) { std::free(node); }
