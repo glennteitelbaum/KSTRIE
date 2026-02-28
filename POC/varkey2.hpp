@@ -3,11 +3,12 @@
 // ---------------------------------------------------------------------------
 // varkey2 — (length, bytes) sorted key-value store
 //
-// Layout: [header][lengths[cap] u8][offsets[cap] u32][blob][values[cap]]
+// Layout: [header][lengths[cap] u8][offsets[cap] u32][blob...][values[cap]]
 //
-// Keys stored unpadded in append-only blob, sorted by (length, bytes).
-// Find: single binary search — compare length first, memcmp only on match.
-// Insert: append to blob, shift arrays. No blob memmove.
+// Total allocation = cap * BYTES_PER_ENTRY + header overhead.
+// Fixed arrays (lengths, offsets, values) take cap * 13 bytes.
+// Blob gets the remainder — naturally ~11 bytes/entry at budget=24.
+// Blob overflow triggers rebuild (grow cap 1.5x, compact blob).
 // ---------------------------------------------------------------------------
 
 #include <cassert>
@@ -17,27 +18,42 @@
 
 using VALUE = void*;
 
-static constexpr uint16_t VK2_INIT_CAP      = 24;
-static constexpr uint16_t VK2_MAX_CAP       = 4096;
-static constexpr uint32_t VK2_BLOB_CAP_MULT = 128;
+static constexpr uint16_t VK2_INIT_CAP        = 2;
+static constexpr uint16_t VK2_MAX_CAP         = 4096;
+static constexpr uint32_t VK2_BYTES_PER_ENTRY = 24;   // budget: 13 fixed + ~11 blob
 
 // ---------------------------------------------------------------------------
-// layout
+// layout — blob is the gap between offsets and values
 // ---------------------------------------------------------------------------
 
 struct VK2Header {
     uint16_t entries;
-    uint32_t blob_used;
     uint16_t cap;
+    uint32_t blob_used;
 };
 
 static constexpr size_t VK2_HDR = sizeof(VK2Header);
 
-inline size_t vk2_offsets_off(uint16_t cap) { return (VK2_HDR + cap + 3) & ~size_t(3); }
-inline size_t vk2_blob_off(uint16_t cap)    { return vk2_offsets_off(cap) + cap * sizeof(uint32_t); }
-inline size_t vk2_blob_cap(uint16_t cap)    { return static_cast<size_t>(cap) * VK2_BLOB_CAP_MULT; }
-inline size_t vk2_values_off(uint16_t cap)  { return (vk2_blob_off(cap) + vk2_blob_cap(cap) + sizeof(VALUE) - 1) & ~(sizeof(VALUE) - 1); }
-inline size_t vk2_alloc_size(uint16_t cap)  { return vk2_values_off(cap) + cap * sizeof(VALUE); }
+inline size_t vk2_offsets_off(uint16_t cap) {
+    return (VK2_HDR + cap + 3) & ~size_t(3);
+}
+
+inline size_t vk2_blob_off(uint16_t cap) {
+    return vk2_offsets_off(cap) + cap * sizeof(uint32_t);
+}
+
+inline size_t vk2_alloc_size(uint16_t cap) {
+    return static_cast<size_t>(cap) * VK2_BYTES_PER_ENTRY + VK2_HDR;
+}
+
+inline size_t vk2_values_off(uint16_t cap) {
+    // values at the end, 8-byte aligned
+    return vk2_alloc_size(cap) - cap * sizeof(VALUE);
+}
+
+inline size_t vk2_blob_cap(uint16_t cap) {
+    return vk2_values_off(cap) - vk2_blob_off(cap);
+}
 
 // ---------------------------------------------------------------------------
 // accessors
@@ -62,14 +78,15 @@ inline uint8_t* vk2_create(uint16_t cap = VK2_INIT_CAP) {
     assert(cap >= 2 && cap <= VK2_MAX_CAP);
     auto* n = static_cast<uint8_t*>(std::calloc(1, vk2_alloc_size(cap)));
     assert(n);
-    vk2_hdr(n)->cap = cap;
+    auto* h = vk2_hdr(n);
+    h->cap = cap;
     return n;
 }
 
 inline void vk2_free(uint8_t* n) { std::free(n); }
 
 // ---------------------------------------------------------------------------
-// find — two-phase binary search
+// find
 // ---------------------------------------------------------------------------
 
 inline VALUE vk2_find(const uint8_t* node, const uint8_t* K, uint8_t Klen) {
@@ -96,13 +113,14 @@ inline VALUE vk2_find(const uint8_t* node, const uint8_t* K, uint8_t Klen) {
 inline uint8_t* vk2_rebuild(uint8_t* old_node);
 
 // ---------------------------------------------------------------------------
-// insert — append blob, shift arrays
+// insert
 // ---------------------------------------------------------------------------
 
 inline uint8_t* vk2_insert(uint8_t* node,
                             const uint8_t* K, uint8_t Klen, VALUE val) {
     auto* h = vk2_hdr(node);
-    if (h->entries == h->cap) [[unlikely]]
+    if (h->entries == h->cap ||
+        h->blob_used + Klen > vk2_blob_cap(h->cap)) [[unlikely]]
         node = vk2_rebuild(node);
 
     h = vk2_hdr(node);
@@ -143,7 +161,7 @@ inline uint8_t* vk2_insert(uint8_t* node,
 }
 
 // ---------------------------------------------------------------------------
-// rebuild — grow 1.5x, compact blob
+// rebuild — grow cap 1.5x, compact blob
 // ---------------------------------------------------------------------------
 
 inline uint8_t* vk2_rebuild(uint8_t* old_node) {
@@ -174,7 +192,7 @@ inline uint8_t* vk2_rebuild(uint8_t* old_node) {
     }
     std::memcpy(vk2_values(nn), vk2_values(old_node), e * sizeof(VALUE));
 
-    nh->entries   = e;
+    nh->entries  = e;
     nh->blob_used = cursor;
 
     std::free(old_node);
