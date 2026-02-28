@@ -1,13 +1,12 @@
 #pragma once
 
 // ---------------------------------------------------------------------------
-// varkey2 — two-phase (length, bytes) key-value store
+// varkey2 — (length, bytes) sorted key-value store
 //
 // Layout: [header][lengths[cap] u8][offsets[cap] u32][blob][values[cap]]
 //
 // Keys stored unpadded in append-only blob, sorted by (length, bytes).
-// Phase 1: binary search lengths[] for matching band.
-// Phase 2: binary search band via memcmp on blob.
+// Find: single binary search — compare length first, memcmp only on match.
 // Insert: append to blob, shift arrays. No blob memmove.
 // ---------------------------------------------------------------------------
 
@@ -80,21 +79,13 @@ inline VALUE vk2_find(const uint8_t* node, const uint8_t* K, uint8_t Klen) {
     const uint8_t*  B = vk2_blob(node);
     const int       e = h->entries;
 
-    // phase 1: find length band [lo, hi)
     int lo = 0, hi = e;
-    while (lo < hi) { int m = lo + ((hi - lo) >> 1); if (L[m] < Klen) lo = m + 1; else hi = m; }
-    int band_lo = lo;
-    hi = e;
-    while (lo < hi) { int m = lo + ((hi - lo) >> 1); if (L[m] <= Klen) lo = m + 1; else hi = m; }
-    if (band_lo >= lo) return nullptr;
-
-    // phase 2: binary search band with memcmp
-    int bh = lo; lo = band_lo; hi = bh;
     while (lo < hi) {
         int m = lo + ((hi - lo) >> 1);
-        int c = std::memcmp(K, B + O[m], Klen);
+        int c = static_cast<int>(Klen) - static_cast<int>(L[m]);
+        if (c == 0) c = std::memcmp(K, B + O[m], Klen);
         if (c == 0) return vk2_values(node)[m];
-        if (c < 0) hi = m; else lo = m + 1;
+        if (c > 0) lo = m + 1; else hi = m;
     }
     return nullptr;
 }
@@ -126,12 +117,12 @@ inline uint8_t* vk2_insert(uint8_t* node,
 
     // find insertion point in (length, bytes) order
     int lo = 0, hi = entries;
-    while (lo < hi) { int m = lo + ((hi - lo) >> 1); if (L[m] < Klen) lo = m + 1; else hi = m; }
-    int band_lo = lo;
-    hi = entries;
-    while (lo < hi) { int m = lo + ((hi - lo) >> 1); if (L[m] <= Klen) lo = m + 1; else hi = m; }
-    int bh = lo; lo = band_lo; hi = bh;
-    while (lo < hi) { int m = lo + ((hi - lo) >> 1); if (std::memcmp(K, B + O[m], Klen) > 0) lo = m + 1; else hi = m; }
+    while (lo < hi) {
+        int m = lo + ((hi - lo) >> 1);
+        int c = static_cast<int>(Klen) - static_cast<int>(L[m]);
+        if (c == 0) c = std::memcmp(K, B + O[m], Klen);
+        if (c > 0) lo = m + 1; else hi = m;
+    }
     int ins = lo;
 
     int tail = entries - ins;
