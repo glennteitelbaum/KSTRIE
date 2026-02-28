@@ -80,11 +80,13 @@ inline VALUE vk2_find(const uint8_t* node, const uint8_t* K, uint8_t Klen) {
     const int       e = h->entries;
 
     int lo = 0, hi = e;
-    while (lo < hi) {
+    while (lo < hi) [[likely]] {
         int m = lo + ((hi - lo) >> 1);
         int c = static_cast<int>(Klen) - static_cast<int>(L[m]);
-        if (c == 0) c = std::memcmp(K, B + O[m], Klen);
-        if (c == 0) return vk2_values(node)[m];
+        if (c == 0) [[unlikely]] {
+            c = std::memcmp(K, B + O[m], Klen);
+            if (c == 0) [[unlikely]] return vk2_values(node)[m];
+        }
         if (c > 0) lo = m + 1; else hi = m;
     }
     return nullptr;
@@ -117,10 +119,11 @@ inline uint8_t* vk2_insert(uint8_t* node,
 
     // find insertion point in (length, bytes) order
     int lo = 0, hi = entries;
-    while (lo < hi) {
+    while (lo < hi) [[likely]] {
         int m = lo + ((hi - lo) >> 1);
         int c = static_cast<int>(Klen) - static_cast<int>(L[m]);
-        if (c == 0) c = std::memcmp(K, B + O[m], Klen);
+        if (c == 0) [[unlikely]]
+            c = std::memcmp(K, B + O[m], Klen);
         if (c > 0) lo = m + 1; else hi = m;
     }
     int ins = lo;
