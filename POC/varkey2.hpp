@@ -93,16 +93,17 @@ inline VALUE vk2_find(const uint8_t* node, const uint8_t* K, uint8_t Klen) {
         return nullptr;
     }
 
-    uint8_t fb   = K[0];
-    uint8_t tail = Klen - 1;
+    int fb    = K[0];
+    int kleni = Klen;
+    size_t tail = kleni - 1;
     const uint8_t* K2 = K + 1;
 
     int lo = 0, hi = e;
     while (lo < hi) [[likely]] {
         int m = lo + ((hi - lo) >> 1);
-        int c = static_cast<int>(fb) - static_cast<int>(F[m]);
+        int c = fb - static_cast<int>(F[m]);
         if (c == 0) [[unlikely]] {
-            c = static_cast<int>(Klen) - static_cast<int>(L[m]);
+            c = kleni - static_cast<int>(L[m]);
             if (c == 0) [[unlikely]] {
                 c = std::memcmp(K2, B + O[m], tail);
                 if (c == 0) [[unlikely]] return vk2_values(node)[m];
@@ -166,12 +167,14 @@ inline uint8_t* vk2_insert(uint8_t* node,
     h->blob_used = bp + tail;
 
     // find insertion point in (first_byte, length, tail) order — lexicographic
+    int fbi   = fb;
+    int kleni = Klen;
     int lo = 0, hi = entries;
     while (lo < hi) [[likely]] {
         int m = lo + ((hi - lo) >> 1);
-        int c = static_cast<int>(fb) - static_cast<int>(F[m]);
+        int c = fbi - static_cast<int>(F[m]);
         if (c == 0) [[unlikely]] {
-            c = static_cast<int>(Klen) - static_cast<int>(L[m]);
+            c = kleni - static_cast<int>(L[m]);
             if (c == 0) [[unlikely]]
                 c = std::memcmp(K + 1, B + O[m], tail);
         }
