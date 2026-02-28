@@ -1,7 +1,7 @@
 #pragma once
 
 // ---------------------------------------------------------------------------
-// varkey2 — (length, first_byte, tail) sorted key-value store
+// varkey2 — lexicographic sorted key-value store
 //
 // Layout: [header][lengths[cap] u8][firsts[cap] u8][offsets[cap] u32][blob...][values[cap]]
 //
@@ -10,8 +10,9 @@
 // firsts[] stores K[0] (0 for empty keys).
 // blob stores K[1..Klen-1] only — first byte stripped.
 //
-// Find: single binary search — compare length, then first byte, then
-//       memcmp on tail bytes. memcmp reached only when both match (rare).
+// Sort order: (first_byte, length, tail) — lexicographic.
+// Find: single binary search — compare first byte, then length, then
+//       memcmp on tail. Keys iterate in natural lex order.
 // ---------------------------------------------------------------------------
 
 #include <cassert>
@@ -99,9 +100,9 @@ inline VALUE vk2_find(const uint8_t* node, const uint8_t* K, uint8_t Klen) {
     int lo = 0, hi = e;
     while (lo < hi) [[likely]] {
         int m = lo + ((hi - lo) >> 1);
-        int c = static_cast<int>(Klen) - static_cast<int>(L[m]);
+        int c = static_cast<int>(fb) - static_cast<int>(F[m]);
         if (c == 0) [[unlikely]] {
-            c = static_cast<int>(fb) - static_cast<int>(F[m]);
+            c = static_cast<int>(Klen) - static_cast<int>(L[m]);
             if (c == 0) [[unlikely]] {
                 c = std::memcmp(K2, B + O[m], tail);
                 if (c == 0) [[unlikely]] return vk2_values(node)[m];
@@ -164,13 +165,13 @@ inline uint8_t* vk2_insert(uint8_t* node,
     if (tail > 0) std::memcpy(B + bp, K + 1, tail);
     h->blob_used = bp + tail;
 
-    // find insertion point in (length, first_byte, tail) order
+    // find insertion point in (first_byte, length, tail) order — lexicographic
     int lo = 0, hi = entries;
     while (lo < hi) [[likely]] {
         int m = lo + ((hi - lo) >> 1);
-        int c = static_cast<int>(Klen) - static_cast<int>(L[m]);
+        int c = static_cast<int>(fb) - static_cast<int>(F[m]);
         if (c == 0) [[unlikely]] {
-            c = static_cast<int>(fb) - static_cast<int>(F[m]);
+            c = static_cast<int>(Klen) - static_cast<int>(L[m]);
             if (c == 0) [[unlikely]]
                 c = std::memcmp(K + 1, B + O[m], tail);
         }
